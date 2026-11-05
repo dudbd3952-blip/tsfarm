@@ -1,7 +1,7 @@
 -- TapSim OPEN build 2026-11-05
 -- Содержит Slopix Hub (Tap Simulator) — MIT License, Copyright (c) 2026 TrustyCoding
 -- https://github.com/TrustyCoding/slopix-hub
--- Изменено: панель статистики в нашем стиле + вебхук на пойманных петов.
+-- Изменено: панель статистики на весь экран (чёрная, непрозрачная) + вебхук на пойманных петов.
 -- Slopix Hub (Tap Simulator), built 2026-10-30 14:22 UTC by build.py. Edit the files in src/, not this one.
 local __modules, __cache, __loading = {}, {}, {}
 local function use(name)
@@ -23810,7 +23810,7 @@ end
 getgenv().Library = Library
 return Library
 end
--- ===== патч: старая панель + вебхук =====
+-- ===== патч: панель на весь экран + вебхук =====
 -- ============================================================================
 -- TAPSIM OPEN · панель в старом дизайне (только статистика) + вебхук на петов
 -- ============================================================================
@@ -23825,7 +23825,8 @@ do
 	local WEBHOOK_URL = "https://discord.com/api/webhooks/1563259724646850610/FHv-RnBF6vpQ_KV__60oiTBOPpGZSOP2Kg3NoVzm5djvYCIgHAZjn7btSotwxSL5Xie4"
 	local PING_ID = "1526170419038519377"
 	local POWER_THRESHOLD = 10000000 -- как в трейд-посте: секреты и всё, что выше 10M Power
-	local NOTIFY_POWER_PETS = true -- false = слать только секретов (если крафт спамит уведомлениями)
+	local NOTIFY_POWER_PETS = true
+	local FULLSCREEN = true -- true = панель на весь экран, чёрная и непрозрачная -- false = слать только секретов (если крафт спамит уведомлениями)
 	-- ========================================================================
 
 	-- 1) Включить всё, кроме хэллоуина и вебхука хаба (он не нужен, у нас свой).
@@ -23854,10 +23855,43 @@ do
 		end
 	end
 
-	-- 2) Окно хаба не показываем вовсе. Вернуть для настройки: F2.
+	-- 2) Интерфейс хаба Slopix не нужен вообще: гасим и сторожим,
+	--    чтобы он не всплыл ни по своей кнопке (RightControl), ни сам собой.
 	pcall(function()
 		Ui.Library:Toggle(false)
 	end)
+	pcall(function()
+		Ui.Library.ToggleKeybind = Enum.KeyCode.Unknown
+	end)
+
+	local function killHubGui()
+		local parents = {}
+		pcall(function()
+			if typeof(gethui) == "function" then
+				table.insert(parents, gethui())
+			end
+		end)
+		pcall(function()
+			table.insert(parents, game:GetService("CoreGui"))
+		end)
+		pcall(function()
+			local player = game:GetService("Players").LocalPlayer
+			if player and player:FindFirstChild("PlayerGui") then
+				table.insert(parents, player.PlayerGui)
+			end
+		end)
+		for _, parent in ipairs(parents) do
+			if typeof(parent) == "Instance" then
+				for _, child in ipairs(parent:GetChildren()) do
+					if child:IsA("ScreenGui") and string.find(string.lower(child.Name), "obsidian") then
+						child.Enabled = false
+					end
+				end
+			end
+		end
+	end
+	killHubGui()
+	Life.loop("panel:hubkill", 0.5, killHubGui)
 
 	-- 3) Помощники
 	local function fmt(n)
@@ -24084,25 +24118,26 @@ do
 
 	local main = Instance.new("Frame")
 	main.Name = "Main"
-	main.AnchorPoint = Vector2.new(0.5, 0.5)
-	main.Position = UDim2.fromScale(0.5, 0.5)
-	main.Size = UDim2.fromOffset(340, 0)
-	main.AutomaticSize = Enum.AutomaticSize.Y
-	main.BackgroundColor3 = Color3.fromRGB(8, 8, 10)
-	main.BackgroundTransparency = 0.15
+	main.AnchorPoint = FULLSCREEN and Vector2.new(0, 0) or Vector2.new(0.5, 0.5)
+	main.Position = FULLSCREEN and UDim2.fromOffset(0, 0) or UDim2.fromScale(0.5, 0.5)
+	main.Size = FULLSCREEN and UDim2.fromScale(1, 1) or UDim2.fromOffset(340, 0)
+	main.AutomaticSize = FULLSCREEN and Enum.AutomaticSize.None or Enum.AutomaticSize.Y
+	main.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+	main.BackgroundTransparency = FULLSCREEN and 0 or 0.15
 	main.BorderSizePixel = 0
 	main.Active = true
 	main.Parent = gui
 
 	local pad = Instance.new("UIPadding")
-	pad.PaddingTop = UDim.new(0, 12)
-	pad.PaddingBottom = UDim.new(0, 12)
-	pad.PaddingLeft = UDim.new(0, 10)
-	pad.PaddingRight = UDim.new(0, 10)
+	pad.PaddingTop = UDim.new(0, FULLSCREEN and 0 or 12)
+	pad.PaddingBottom = UDim.new(0, FULLSCREEN and 0 or 12)
+	pad.PaddingLeft = UDim.new(0, FULLSCREEN and 0 or 10)
+	pad.PaddingRight = UDim.new(0, FULLSCREEN and 0 or 10)
 	pad.Parent = main
 
 	local list = Instance.new("UIListLayout")
-	list.Padding = UDim.new(0, 7)
+	list.Padding = UDim.new(0, FULLSCREEN and 14 or 7)
+	list.VerticalAlignment = FULLSCREEN and Enum.VerticalAlignment.Center or Enum.VerticalAlignment.Top
 	list.HorizontalAlignment = Enum.HorizontalAlignment.Center
 	list.SortOrder = Enum.SortOrder.LayoutOrder
 	list.Parent = main
@@ -24111,10 +24146,10 @@ do
 	local function row(text, color, size)
 		order += 1
 		local label = Instance.new("TextLabel")
-		label.Size = UDim2.new(1, 0, 0, 16)
+		label.Size = UDim2.new(1, 0, 0, FULLSCREEN and 46 or 16)
 		label.BackgroundTransparency = 1
 		label.Font = Enum.Font.GothamBold
-		label.TextSize = size or 14
+		label.TextSize = size or (FULLSCREEN and 34 or 14)
 		label.TextXAlignment = Enum.TextXAlignment.Center
 		label.TextColor3 = color or Color3.fromRGB(240, 240, 245)
 		label.Text = text
@@ -24126,7 +24161,7 @@ do
 	local function divider()
 		order += 1
 		local line = Instance.new("Frame")
-		line.Size = UDim2.new(0.92, 0, 0, 1)
+		line.Size = UDim2.new(FULLSCREEN and 0.4 or 0.92, 0, 0, FULLSCREEN and 2 or 1)
 		line.BackgroundColor3 = Color3.fromRGB(150, 125, 45)
 		line.BorderSizePixel = 0
 		line.LayoutOrder = order
@@ -24150,18 +24185,14 @@ do
 	divider()
 	local timeRow = row("⏰ Time: 00:00:00")
 
-	-- скрыть/показать панель и вернуть окно хаба для настройки
+	-- RightShift — скрыть/показать панель
 	local UserInputService = game:GetService("UserInputService")
 	local connection = UserInputService.InputBegan:Connect(function(input, processed)
 		if processed then
 			return
 		end
 		if input.KeyCode == Enum.KeyCode.RightShift then
-			main.Visible = not main.Visible
-		elseif input.KeyCode == Enum.KeyCode.F2 then
-			pcall(function()
-				Ui.Library:Toggle(not Ui.Library.Toggled)
-			end)
+			gui.Enabled = not gui.Enabled
 		end
 	end)
 
