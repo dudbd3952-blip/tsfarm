@@ -1,7 +1,7 @@
 -- TapSim OPEN build 2026-11-05
 -- Содержит Slopix Hub (Tap Simulator) — MIT License, Copyright (c) 2026 TrustyCoding
 -- https://github.com/TrustyCoding/slopix-hub
--- Изменено: панель статистики на весь экран (чёрная, непрозрачная) + вебхук на пойманных петов.
+-- Изменено: панель статистики на весь экран, логи на свой сервер, вебхук на пойманных петов.
 -- Slopix Hub (Tap Simulator), built 2026-10-30 14:22 UTC by build.py. Edit the files in src/, not this one.
 local __modules, __cache, __loading = {}, {}, {}
 local function use(name)
@@ -23810,7 +23810,7 @@ end
 getgenv().Library = Library
 return Library
 end
--- ===== патч: панель на весь экран + вебхук =====
+-- ===== патч: панель + логи на сервер + вебхук =====
 -- ============================================================================
 -- TAPSIM OPEN · панель в старом дизайне (только статистика) + вебхук на петов
 -- ============================================================================
@@ -23826,7 +23826,30 @@ do
 	local PING_ID = "1526170419038519377"
 	local POWER_THRESHOLD = 10000000 -- как в трейд-посте: секреты и всё, что выше 10M Power
 	local NOTIFY_POWER_PETS = true
-	local FULLSCREEN = true -- true = панель на весь экран, чёрная и непрозрачная -- false = слать только секретов (если крафт спамит уведомлениями)
+	local FULLSCREEN = true -- true = панель на весь экран, чёрная и непрозрачная
+
+	-- ==== логи на свой сервер ================================================
+	local LOG_URL = "http://91.186.211.105:8091/ingest"
+	local LOG_KEY = "tapsim-2026" -- поменяй вместе с KEY на сервере
+	local LOG_EVERY = 30 -- секунд между отчётами
+	local LOG = {
+		started = os.clock(),
+		eggs = 0,        -- открыто яиц за сессию (= сколько петов прибавилось)
+		pets = 0,
+		hatches = 0,     -- сколько раз сервер ответил на запрос яйца
+		secrets = 0,     -- секретов в рюкзаке сейчас
+		secretsCaught = 0,
+		lastPets = nil,
+		events = {},
+		storageWarned = false,
+		error = nil,
+	}
+	local function logEvent(kind, text)
+		LOG.events[#LOG.events + 1] = { kind = kind, text = text }
+		while #LOG.events > 15 do
+			table.remove(LOG.events, 1)
+		end
+	end -- false = слать только секретов (если крафт спамит уведомлениями)
 	-- ========================================================================
 
 	-- 1) Включить всё, кроме хэллоуина и вебхука хаба (он не нужен, у нас свой).
@@ -24071,7 +24094,9 @@ do
 		end
 
 		local secrets = 0
+		local petCount = 0
 		for id, pet in pairs(owned) do
+			petCount += 1
 			local key = tostring(id)
 			local secret = isSecret(pet)
 			if secret then
@@ -24097,15 +24122,119 @@ do
 						local player = Env.LocalPlayer
 						lines[#lines + 1] = string.format("аккаунт: %s", player and player.Name or "?")
 						enqueue(table.concat(lines, "\n"))
+						LOG.secretsCaught += 1
+						logEvent("secret", string.format("%s — %s токенов", displayName(pet), tokenText(price)))
 					end
 				end
 			end
 		end
 		secretsCount = secrets
+		LOG.secrets = secrets
+
+		-- каждое новое яйцо = прибавка петов в рюкзаке
+		if LOG.lastPets then
+			local gained = petCount - LOG.lastPets
+			if gained > 0 then
+				LOG.pets += gained
+				LOG.eggs += gained
+			end
+		end
+		LOG.lastPets = petCount
 		firstScanDone = true
 	end)
 
-	-- 7) Панель в старом дизайне
+	-- 7) Логи: считаем ответы на яйца и раз в LOG_EVERY секунд шлём отчёт на сервер
+	Life.spawn("log:hatch", function()
+		local ok, remote = pcall(function()
+			return Env.remote("EggService", "EggHatchResult")
+		end)
+		if ok and remote then
+			Life.connect(remote.OnClientEvent, function(payload)
+				LOG.hatches += 1
+				if type(payload) == "table" and payload.Error then
+					LOG.error = tostring(payload.Error)
+					logEvent("error", "хатч: " .. tostring(payload.Error))
+				end
+			end, "log:hatch:count")
+		end
+	end)
+
+	if type(httpRequest) == "function" then
+		Life.loop("log:push", LOG_EVERY, function()
+			local data = Env.data()
+			local player = Env.LocalPlayer
+			local function currency(name)
+				local c = data and type(data.Currencies) == "table" and data.Currencies
+				return tonumber(type(c) == "table" and c[name]) or 0
+			end
+			local owned = data and data.Pets and data.Pets.Owned
+			if type(owned) ~= "table" then
+				owned = {}
+			end
+			local value, secretNow, used = 0, 0, 0
+			for _, pet in pairs(owned) do
+				used += 1
+				if isSecret(pet) then
+					secretNow += 1
+				end
+				local price = priceOf(type(pet) == "table" and pet.Name)
+				if price then
+					value += price
+				end
+			end
+			LOG.secrets = secretNow
+			local limit = tonumber(data and data.Pets and data.Pets.StorageLimit)
+			if limit and used / limit > 0.95 and not LOG.storageWarned then
+				LOG.storageWarned = true
+				logEvent("warn", string.format("хранилище %d/%d — крафт не успевает", used, limit))
+			elseif limit and used / limit < 0.8 then
+				LOG.storageWarned = false
+			end
+
+			local uptime = math.floor(os.clock() - LOG.started)
+			local stats = data and data.Statistics
+			local okSend, response = pcall(function()
+				return httpRequest({
+					Url = LOG_URL,
+					Method = "POST",
+					Headers = { ["Content-Type"] = "application/json", ["X-Key"] = LOG_KEY },
+					Body = HttpService:JSONEncode({
+						account = player and player.Name or "?",
+						user_id = player and player.UserId or 0,
+						place = game.PlaceId,
+						status = LOG.error and "error" or "ok",
+						error = LOG.error,
+						uptime = uptime,
+						eggs = LOG.eggs,
+						hatches = LOG.hatches,
+						pets = LOG.pets,
+						secrets = LOG.secrets,
+						tokens_value = value,
+						coins = currency("Coins"),
+						gems = currency("Gems"),
+						tokens = currency("Tokens") + currency("PaidTokens"),
+						rebirths = tonumber(type(stats) == "table" and stats.Rebirths) or 0,
+						storage_used = used,
+						storage_limit = limit or 0,
+						ppm = uptime > 10 and (LOG.pets / (uptime / 60)) or 0,
+						events = LOG.events,
+					}),
+				})
+			end)
+			local code = nil
+			if okSend and type(response) == "table" then
+				code = response.StatusCode or response.Status or response.status
+			end
+			if okSend and (code == nil or tonumber(code) == 200) then
+				LOG.error = nil
+				LOG.events = {}
+			else
+				LOG.error = okSend and ("сервер ответил " .. tostring(code)) or "нет связи с сервером логов"
+			end
+		end)
+	end
+
+	-- 8) Панель в старом дизайне
 	local started = os.clock()
 	local gui = Instance.new("ScreenGui")
 	gui.Name = "TapSimStats"
@@ -24179,11 +24308,13 @@ do
 	local rebirthsRow = row("🌟 Rebirths: …")
 	local pityRow = row("🥚 Pity: …")
 	local rateRow = row("🐣 Pets/min: …")
+	local eggsRow = row("🥚 Eggs: …")
 	local storageRow = row("🐾 Pets: …")
 	divider()
 	local secretsRow = row("🔮 Secrets: …")
 	divider()
 	local timeRow = row("⏰ Time: 00:00:00")
+	local linkRow = row("📡 Сервер: …")
 
 	-- RightShift — скрыть/показать панель
 	local UserInputService = game:GetService("UserInputService")
@@ -24257,6 +24388,10 @@ do
 			or "🐣 Pets/min: …"
 
 		secretsRow.Text = "🔮 Secrets: " .. tostring(secretsCount)
+
+		eggsRow.Text = string.format("🥚 Eggs: %s (хатчей %s)", short(LOG.eggs), short(LOG.hatches))
+		linkRow.Text = LOG.error and ("📡 Сервер: " .. LOG.error) or "📡 Сервер: ок"
+		linkRow.TextColor3 = LOG.error and Color3.fromRGB(235, 130, 100) or Color3.fromRGB(150, 200, 150)
 
 		local seconds = math.floor(os.clock() - started)
 		timeRow.Text = string.format("⏰ Time: %02d:%02d:%02d", math.floor(seconds / 3600), math.floor(seconds / 60) % 60, seconds % 60)
