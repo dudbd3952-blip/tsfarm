@@ -24637,6 +24637,89 @@ do
 		end
 	end
 
+	local CLEAN_LADDER = { "Legendary", "Mythical" } -- до чего поднимаем порог удаления (Epic уже стоит по умолчанию)
+	local CLEAN_TIERS = { "Golden", "Diamond" }             -- что разрешаем удалять дополнительно
+	local CLEAN_KEEP_BEST = 0                                -- "best of every pet" -> 0
+
+	-- Игра пишет "Nothing to sell", когда план пуст: все петы выше порога удаления.
+	-- Поэтому перед отказом поднимаем порог, разрешаем голд/даймонд и пробуем снова.
+	local function cleanTry(mod, names, ...)
+		if type(mod) ~= "table" then
+			return nil
+		end
+		for _, name in ipairs(names) do
+			local fn = mod[name]
+			if type(fn) == "function" then
+				local ok = pcall(fn, ...)
+				if ok then
+					return name
+				end
+			end
+		end
+		return nil
+	end
+
+	local function cleanApply(clean, rules, step)
+		local cutoff = CLEAN_LADDER[math.clamp(step, 1, #CLEAN_LADDER)]
+		local done = {}
+		local function note(name)
+			if name then
+				done[#done + 1] = name
+			end
+		end
+		note(cleanTry(clean, { "SetCutoff", "SetThreshold", "SetRarity", "SetDefaultCutoff" }, cutoff))
+		note(cleanTry(rules, { "SetCutoff", "SetDefaultCutoff", "SetThreshold" }, cutoff))
+		for _, tier in ipairs(CLEAN_TIERS) do
+			note(cleanTry(clean, { "SetTier", "ToggleTier", "SetDeleteTier" }, tier, true))
+			note(cleanTry(rules, { "SetTier", "ToggleTier" }, tier, true))
+		end
+		note(cleanTry(rules, { "SetKeepBest", "SetBest" }, CLEAN_KEEP_BEST))
+		note(cleanTry(clean, { "SetKeepBest" }, CLEAN_KEEP_BEST))
+		note(cleanTry(clean, { "Refresh", "Rebuild", "Update" }))
+		return cutoff, done
+	end
+
+	-- Если у модуля нет сеттеров, жмём кнопки прямо в панели игры.
+	local function clickByText(words)
+		local ok, hits = pcall(function()
+			local player = game:GetService("Players").LocalPlayer
+			local gui = player and player:FindFirstChild("PlayerGui")
+			if not gui then
+				return 0
+			end
+			local count = 0
+			for _, child in ipairs(gui:GetDescendants()) do
+				local isButton = child:IsA("TextButton") or child:IsA("ImageButton") or child:IsA("TextLabel")
+				if isButton and child.Visible then
+					local text = string.lower(tostring(child.Text or ""))
+					if text ~= "" then
+						for _, word in ipairs(words) do
+							if string.find(text, string.lower(word), 1, true) then
+								if firesignal then
+									pcall(firesignal, child.MouseButton1Click)
+								end
+								if getconnections then
+									local okc, conns = pcall(getconnections, child.MouseButton1Click)
+									if okc and type(conns) == "table" then
+										for _, conn in ipairs(conns) do
+											pcall(function()
+												conn:Fire()
+											end)
+										end
+									end
+								end
+								count += 1
+								break
+							end
+						end
+					end
+				end
+			end
+			return count
+		end)
+		return ok and (hits or 0) > 0, hits
+	end
+
 	local purgeShapes = nil
 
 	local function purge()
@@ -24676,7 +24759,47 @@ do
 			end
 		end
 		if #ids == 0 then
-			return false, "план пустой"
+			-- план пуст -> "Nothing to sell". Поднимаем порог по лестнице и планируем заново.
+			local rules = requirePet("CleanUpRules")
+			for step = 1, #CLEAN_LADDER do
+				local cutoff, done = cleanApply(clean, rules, step)
+				if #done > 0 then
+					CLEAN.note = "чистка: порог " .. cutoff .. " (" .. table.concat(done, ",") .. ")"
+				else
+					local clicked = clickByText({ "Legendary", "Mythical", "Golden", "Diamond", "Best of every pet" })
+					CLEAN.note = clicked and "чистка: жму кнопки в панели игры" or "чистка: API молчит"
+				end
+				Life.wait(0.6)
+				local okRe, planRe = pcall(function()
+					return clean.GetPlan()
+				end)
+				if okRe and type(planRe) == "table" then
+					raw, ids, seen = {}, {}, {}
+					collectIds(planRe, raw, 0, owned)
+					for _, id in ipairs(raw) do
+						local key = tostring(id)
+						if not seen[key] and owned[id] ~= nil then
+							seen[key] = true
+							ids[#ids + 1] = id
+						end
+					end
+					if #ids > 0 then
+						logEvent("clean", "порог поднят до " .. cutoff .. ", в план попало " .. tostring(#ids))
+						break
+					end
+				end
+				pcall(function()
+					clean.Close()
+				end)
+				Life.wait(0.3)
+				pcall(function()
+					clean.Open()
+				end)
+				Life.wait(0.5)
+			end
+			if #ids == 0 then
+				return false, "чистить нечего: всё защищено (locked/equipped/team/мутации)"
+			end
 		end
 
 		-- режем не больше, чем нужно до 80%
