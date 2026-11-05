@@ -4,8 +4,6 @@
 -- Изменено: панель, логи в консоль и на сервер, разгрузка рюкзака, автоудалёнт 50%, вебхук.
 -- Slopix Hub (Tap Simulator), built 2026-10-30 14:22 UTC by build.py. Edit the files in src/, not this one.
 local __modules, __cache, __loading = {}, {}, {}
--- Без интерфейса: панель не создаётся вообще. Всё остальное работает как обычно.
-local __NO_GUI = true
 local function use(name)
     local cached = __cache[name]
     if cached ~= nil then
@@ -12364,9 +12362,6 @@ Instance.Parent = PlayerGui
 end
 end
 local function ParentUI(UI: Instance, SkipHiddenUI: boolean?)
-if __NO_GUI then
-return
-end
 if SkipHiddenUI then
 SafeParentUI(UI, CoreGui)
 return
@@ -24042,7 +24037,8 @@ do
 		-- клики (гемы и монеты, персонажа никуда не уводят)
 		AutoTap = true,
 		AutoClicker = true,
-		-- мелочь, которая не мешает: награда за вход, анти-афк, апгрейды хранилища
+		-- мелочь, которая не мешает: награда за вход, анти-афк, апгрейды
+		-- (их всего шесть, и среди них HatchSpeed, FreeAutoClicker и Teleport)
 		AutoClaimOffline = true,
 		AntiAfk = true,
 		AutoUpgrade = true,
@@ -24082,6 +24078,15 @@ do
 			hatch:SetValue(values[1])
 		end
 		logEvent("farm", "режим яйца: " .. tostring(hatch and hatch.Value))
+	end)
+	-- Апгрейды: покупаем все шесть, ничего не вычёркиваем.
+	pcall(function()
+		local picks = Ui.Options and Ui.Options.UpgradePicks
+		local values = picks and picks.Values
+		if type(values) == "table" and #values > 0 then
+			picks:SetValue(values)
+			logEvent("farm", "апгрейды: " .. table.concat(values, ", "))
+		end
 	end)
 	-- Крафт: только золотые и алмазные, радугу не собираем.
 	pcall(function()
@@ -25426,59 +25431,5 @@ do
 		storageRow.TextColor3 = (limit and petCount / limit > 0.9) and Color3.fromRGB(235, 130, 100)
 			or Color3.fromRGB(240, 240, 245)
 	end)
-end
--- ===== отчёт без панели: что включено и что фармится =====
-do
-	local okUi, UiX = pcall(use, "core/ui")
-	if okUi and type(UiX) == "table" and UiX.Library then
-		task.delay(20, function()
-			local toggles = UiX.Library.Toggles or {}
-			local on, off = {}, {}
-			for name, toggle in pairs(toggles) do
-				local okv, value = pcall(function()
-					return toggle.Value
-				end)
-				if okv and value == true then
-					on[#on + 1] = tostring(name)
-				else
-					off[#off + 1] = tostring(name)
-				end
-			end
-			table.sort(on)
-			table.sort(off)
-			print(string.format("[TAPSIM] без панели | включено %d из %d", #on, #on + #off))
-			local line = {}
-			for index = 1, #on do
-				line[#line + 1] = on[index]
-				if #line == 6 or index == #on then
-					print("[TAPSIM]   вкл: " .. table.concat(line, ", "))
-					line = {}
-				end
-			end
-			if #off > 0 then
-				local tail = {}
-				for index = 1, #off do
-					tail[#tail + 1] = off[index]
-					if #tail == 8 or index == #off then
-						print("[TAPSIM]   выкл: " .. table.concat(tail, ", "))
-						tail = {}
-					end
-				end
-			end
-		end)
-		local okLife, Life = pcall(use, "shared/life")
-		if okLife and type(Life) == "table" and Life.loop then
-			Life.loop("console:farm", 180, function()
-				local player = game:GetService("Players").LocalPlayer
-				if not player then
-					return
-				end
-				print(string.format("[TAPSIM] фарм | остров=%s яйцо=%s открыто яиц=%s",
-					tostring(player:GetAttribute("CurrentIsland")),
-					tostring(player:GetAttribute("TAPSIM_Egg")),
-					tostring(player:GetAttribute("TS2EggsOpened"))))
-			end)
-		end
-	end
 end
 return Hub
