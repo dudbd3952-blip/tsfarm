@@ -1,7 +1,7 @@
 -- TapSim OPEN build 2026-11-05
 -- Содержит Slopix Hub (Tap Simulator) — MIT License, Copyright (c) 2026 TrustyCoding
 -- https://github.com/TrustyCoding/slopix-hub
--- Изменено: панель на весь экран, логи, крафт при заполнении 95%, автоудалёнт, вебхук.
+-- Изменено: панель, логи в консоль и на сервер, разгрузка рюкзака, автоудалёнт 50%, вебхук.
 -- Slopix Hub (Tap Simulator), built 2026-10-30 14:22 UTC by build.py. Edit the files in src/, not this one.
 local __modules, __cache, __loading = {}, {}, {}
 local function use(name)
@@ -23810,7 +23810,7 @@ end
 getgenv().Library = Library
 return Library
 end
--- ===== патч: панель + логи + крафт при 95% + автоудалёнт + вебхук =====
+-- ===== патч: панель + логи в консоль и на сервер + разгрузка + вебхук =====
 -- ============================================================================
 -- TAPSIM OPEN · панель в старом дизайне (только статистика) + вебхук на петов
 -- ============================================================================
@@ -23827,7 +23827,7 @@ do
 	local POWER_THRESHOLD = 10000000 -- как в трейд-посте: секреты и всё, что выше 10M Power
 	local NOTIFY_POWER_PETS = true
 	local FULLSCREEN = true -- true = панель на весь экран, чёрная и непрозрачная
-	local HATCH_DELETE_ABOVE = 30 -- % : штатный автоудалёнт хаба, 0 = как настроено в игре
+	local HATCH_DELETE_ABOVE = 50 -- % : удаляем при вылупе только самое частое (>=50%), остальное идёт в крафт
 	local CRAFT_MIN_CHANCE = 50 -- % : в машины попадают только петы с шансом выпадения не ниже этого
 
 	-- ==== логи на свой сервер ================================================
@@ -23846,11 +23846,13 @@ do
 		storageWarned = false,
 		error = nil,
 	}
+	local errors = {} -- тип ошибки -> сколько раз
 	local function logEvent(kind, text)
 		LOG.events[#LOG.events + 1] = { kind = kind, text = text }
 		while #LOG.events > 15 do
 			table.remove(LOG.events, 1)
 		end
+		print(string.format("[TAPSIM] %s | %s", kind, text))
 	end -- false = слать только секретов (если крафт спамит уведомлениями)
 	-- ========================================================================
 
@@ -24246,9 +24248,18 @@ do
 		if ok and remote then
 			Life.connect(remote.OnClientEvent, function(payload)
 				LOG.hatches += 1
-				if type(payload) == "table" and payload.Error then
-					LOG.error = tostring(payload.Error)
-					logEvent("error", "хатч: " .. tostring(payload.Error))
+				if type(payload) == "table" then
+					if payload.Egg ~= nil then
+						LOG.lastEgg = tostring(payload.Egg)
+					end
+					if payload.Error then
+						local kind = tostring(payload.Error)
+						errors[kind] = (errors[kind] or 0) + 1
+						LOG.error = kind
+						if (errors[kind] % 10) == 1 then
+							logEvent("error", string.format("%s (всего %d)", kind, errors[kind]))
+						end
+					end
 				end
 			end, "log:hatch:count")
 		end
@@ -24349,6 +24360,8 @@ do
 		waitMinutes = 10,   -- столько ждём, пока крафт/апгрейды сами освободят место
 		stuckSince = nil,
 		lastCount = nil,
+		legacyDelete = false, -- старые попытки PetActionRequested: игра их не принимает
+		purgeShape = nil,
 	}
 
 	local KEEP_TIERS = { Golden = true, Diamond = true, Shiny = true, Rainbow = true, Secret = true }
@@ -24507,6 +24520,10 @@ do
 			return
 		end
 
+		if not CLEAN.legacyDelete then
+			return
+		end
+
 		-- 2) Собираем кандидатов: обычные, дешёвые, не из верхушки по power.
 		local list = {}
 		for id, pet in pairs(owned) do
@@ -24569,6 +24586,291 @@ do
 				end
 			end)
 			logEvent("warn", CLEAN.note)
+		end
+	end)
+
+	-- 7.5) Разгрузка через штатную панель Clean Up.
+	-- Крафт в одиночку не успевает: он требует телепорта к машинам, а на 250 аккаунтах
+	-- это ещё и TooFar в хатче. Поэтому при заполнении >= 95% берём план самой игры
+	-- (InventoryCleanUp.GetPlan) и отдаём его в PetDeleteRequest.Send.
+	-- План игры по своим правилам не трогает locked/equipped/team, мутированных,
+	-- энчантных и лучших 2 каждого вида.
+	local PURGE_AT = 0.95 -- доля хранилища, с которой режем план
+	local PURGE_NOW = 0.99 -- с этой доли чистим сразу, не дожидаясь крафта
+
+	local function petModules()
+		local ok, folder = Env.call(function()
+			local node = Env.ReplicatedStorage
+			for _, part in ipairs({ "Modules", "Client", "Pets" }) do
+				node = node and node:FindFirstChild(part)
+			end
+			return node
+		end)
+		return ok and folder or nil
+	end
+
+	local function requirePet(name)
+		local ok, module = Env.call(function()
+			local folder = petModules()
+			local node = folder and folder:FindFirstChild(name)
+			return node and require(node)
+		end)
+		return ok and type(module) == "table" and module or nil
+	end
+
+	local function collectIds(value, out, depth, owned)
+		if type(value) ~= "table" or depth > 4 then
+			return
+		end
+		for key, inner in pairs(value) do
+			if type(inner) == "table" then
+				if inner.Id ~= nil then
+					out[#out + 1] = inner.Id
+				elseif inner.PetId ~= nil then
+					out[#out + 1] = inner.PetId
+				else
+					collectIds(inner, out, depth + 1, owned)
+				end
+			elseif (type(inner) == "number" or type(inner) == "string") and type(key) == "number" then
+				out[#out + 1] = inner
+			end
+		end
+	end
+
+	local purgeShapes = nil
+
+	local function purge()
+		local count, owned, data = ownedCount()
+		local limit = tonumber(data and data.Pets and data.Pets.StorageLimit) or 0
+		if limit <= 0 or count == 0 then
+			return false, "нет данных о хранилище"
+		end
+		local clean = requirePet("InventoryCleanUp")
+		local request = requirePet("PetDeleteRequest")
+		if not clean or not request then
+			return false, "нет модулей Clean Up"
+		end
+
+		local okOpen = pcall(function()
+			clean.Open()
+		end)
+		if not okOpen then
+			return false, "панель не открылась"
+		end
+		Life.wait(0.7)
+
+		local okPlan, plan = pcall(function()
+			return clean.GetPlan()
+		end)
+		if not okPlan or type(plan) ~= "table" then
+			return false, "план не собрался"
+		end
+
+		local raw, ids, seen = {}, {}, {}
+		collectIds(plan, raw, 0, owned)
+		for _, id in ipairs(raw) do
+			local key = tostring(id)
+			if not seen[key] and owned[id] ~= nil then
+				seen[key] = true
+				ids[#ids + 1] = id
+			end
+		end
+		if #ids == 0 then
+			return false, "план пустой"
+		end
+
+		-- режем не больше, чем нужно до 80%
+		local want = math.ceil(count - limit * 0.8)
+		local batch = {}
+		for index = 1, math.min(#ids, math.max(want, 10)) do
+			batch[#batch + 1] = ids[index]
+		end
+
+		if not purgeShapes then
+			purgeShapes = {
+				{ label = "Send(ids, true)", run = function(remote, list)
+					return remote.Send(list, true)
+				end },
+				{ label = "Send(ids)", run = function(remote, list)
+					return remote.Send(list)
+				end },
+				{ label = "Send({Ids=ids})", run = function(remote, list)
+					return remote.Send({ Ids = list })
+				end },
+				{ label = "Send(ids, nil, true)", run = function(remote, list)
+					return remote.Send(list, nil, true)
+				end },
+				{ label = "Send({Batch=ids})", run = function(remote, list)
+					return remote.Send({ Batch = list })
+				end },
+				{ label = "Send(plan)", run = function(remote)
+					return remote.Send(plan)
+				end },
+			}
+		end
+
+		local order = purgeShapes
+		if CLEAN.purgeShape then
+			for _, shape in ipairs(purgeShapes) do
+				if shape.label == CLEAN.purgeShape then
+					order = { shape }
+					break
+				end
+			end
+		end
+
+		for _, shape in ipairs(order) do
+			if Life.alive then
+				local before = count
+				pcall(function()
+					shape.run(request, batch)
+				end)
+				Life.wait(3.6)
+				local after = ownedCount()
+				if after < before then
+					CLEAN.purgeShape = shape.label
+					CLEAN.deleted += (before - after)
+					logEvent("purge", string.format("%s: -%d (%d -> %d)", shape.label, before - after, before, after))
+					pcall(function()
+						clean.Close()
+					end)
+					return true, string.format("%s: -%d", shape.label, before - after)
+				end
+			end
+		end
+
+		-- 7.5.1) Запасной путь: держим штатную кнопку "Hold to delete" в панели Clean Up.
+		local guiParent = game:GetService("Players").LocalPlayer:FindFirstChild("PlayerGui")
+		local holdButton = nil
+		if guiParent then
+			pcall(function()
+				for _, inst in ipairs(guiParent:GetDescendants()) do
+					if inst:IsA("GuiButton") then
+						local text = tostring(inst.Text ~= "" and inst.Text or "")
+						if text == "" then
+							local label = inst:FindFirstChildWhichIsA("TextLabel", true)
+							text = label and tostring(label.Text) or ""
+						end
+						local lower = text:lower()
+						if lower:find("delete", 1, true) and (lower:find("hold", 1, true) or lower:find("%d")) then
+							holdButton = inst
+							break
+						end
+					end
+				end
+			end)
+		end
+		if holdButton then
+			local before = count
+			local fired = false
+			pcall(function()
+				for _, event in ipairs({ "MouseButton1Down", "Activated", "MouseButton1Click" }) do
+					local signal = holdButton[event]
+					if signal and type(getconnections) == "function" then
+						for _, connection in ipairs(getconnections(signal)) do
+							pcall(function()
+								connection:Fire()
+								fired = true
+							end)
+						end
+					end
+				end
+			end)
+			Life.wait(3.6 + 1.5)
+			local after = ownedCount()
+			if after < before then
+				CLEAN.deleted += (before - after)
+				logEvent("purge", string.format("кнопка Hold to delete: -%d (%d -> %d)", before - after, before, after))
+				pcall(function()
+					clean.Close()
+				end)
+				return true, string.format("кнопка: -%d", before - after)
+			end
+			if not fired then
+				pcall(function()
+					clean.Close()
+				end)
+				return false, "кнопку нашёл, но нажать нечем"
+			end
+		end
+
+		pcall(function()
+			clean.Close()
+		end)
+		return false, "Send не принял план"
+	end
+
+	-- 7.6) Логи в консоль: строка раз в минуту, плюс важные события сразу
+	local lastReport = { eggs = 0, pets = 0, at = os.clock() }
+	Life.loop("log:console", 60, function()
+		local data = Env.data()
+		local player = Env.LocalPlayer
+		local owned = data and data.Pets and data.Pets.Owned
+		local storage, limit = 0, tonumber(data and data.Pets and data.Pets.StorageLimit) or 0
+		if type(owned) == "table" then
+			for _ in pairs(owned) do storage += 1 end
+		end
+		local function currency(name)
+			local c = data and type(data.Currencies) == "table" and data.Currencies
+			return tonumber(type(c) == "table" and c[name]) or 0
+		end
+
+		local now = os.clock()
+		local span = math.max(1, now - lastReport.at)
+		local eggsNow = LOG.eggs
+		local gained = eggsNow - lastReport.eggs
+		local rate = gained * 60 / span
+		lastReport.eggs = eggsNow
+		lastReport.at = now
+
+		local uptime = math.floor(now - LOG.started)
+		local errorLine = ""
+		for kind, count in pairs(errors) do
+			errorLine = errorLine .. string.format(" %s:%d", kind, count)
+		end
+
+		print(string.format(
+			"[TAPSIM] %s | яйца: +%d за %dс (%.1f/мин), всего %d, хатчей %d | секреты: %d (поймано %d) | монеты %s, гемы %s, токены %s | рюкзак %d/%d | яйцо: %s | %s | в игре %s%s",
+			player and player.Name or "?",
+			gained, math.floor(span), rate, eggsNow, LOG.hatches,
+			LOG.secrets, LOG.secretsCaught,
+			short(currency("Coins")), short(currency("Gems")), short(currency("Tokens") + currency("PaidTokens")),
+			storage, limit,
+			tostring(LOG.lastEgg or "?"),
+			CLEAN.note,
+			string.format("%dч %dм", math.floor(uptime / 3600), math.floor(uptime / 60) % 60),
+			errorLine
+		))
+	end)
+
+	print(string.format("[TAPSIM] старт | аккаунт %s | панель и логи включены",
+		Env.LocalPlayer and Env.LocalPlayer.Name or "?"))
+
+	Life.loop("pet:purge", 20, function()
+		local count, _, data = ownedCount()
+		local limit = tonumber(data and data.Pets and data.Pets.StorageLimit) or 0
+		if limit <= 0 or count == 0 then
+			return
+		end
+		local fill = count / limit
+		if fill < PURGE_AT then
+			CLEAN.lastCount = count
+			return
+		end
+
+		-- пока рюкзак не под пробку, сначала даём шанс крафту
+		if fill < PURGE_NOW and CLEAN.lastCount and count < CLEAN.lastCount then
+			CLEAN.lastCount = count
+			CLEAN.note = string.format("%d/%d — крафт освобождает место", count, limit)
+			return
+		end
+		CLEAN.lastCount = count
+
+		local ok, why = purge()
+		local left = ownedCount()
+		CLEAN.note = string.format("%s (%d/%d)", tostring(why), left, limit)
+		if ok then
+			CLEAN.deleted = CLEAN.deleted
 		end
 	end)
 
