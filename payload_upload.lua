@@ -1,7 +1,7 @@
 -- TapSim OPEN build 2026-11-05
 -- Содержит Slopix Hub (Tap Simulator) — MIT License, Copyright (c) 2026 TrustyCoding
 -- https://github.com/TrustyCoding/slopix-hub
--- Изменено: панель статистики на весь экран, логи на свой сервер, вебхук на пойманных петов.
+-- Изменено: панель на весь экран, логи, крафт при заполнении 95%, автоудалёнт, вебхук.
 -- Slopix Hub (Tap Simulator), built 2026-10-30 14:22 UTC by build.py. Edit the files in src/, not this one.
 local __modules, __cache, __loading = {}, {}, {}
 local function use(name)
@@ -23810,7 +23810,7 @@ end
 getgenv().Library = Library
 return Library
 end
--- ===== патч: панель + логи на сервер + вебхук =====
+-- ===== патч: панель + логи + крафт при 95% + автоудалёнт + вебхук =====
 -- ============================================================================
 -- TAPSIM OPEN · панель в старом дизайне (только статистика) + вебхук на петов
 -- ============================================================================
@@ -23827,6 +23827,8 @@ do
 	local POWER_THRESHOLD = 10000000 -- как в трейд-посте: секреты и всё, что выше 10M Power
 	local NOTIFY_POWER_PETS = true
 	local FULLSCREEN = true -- true = панель на весь экран, чёрная и непрозрачная
+	local HATCH_DELETE_ABOVE = 30 -- % : штатный автоудалёнт хаба, 0 = как настроено в игре
+	local CRAFT_MIN_CHANCE = 50 -- % : в машины попадают только петы с шансом выпадения не ниже этого
 
 	-- ==== логи на свой сервер ================================================
 	local LOG_URL = "http://91.186.211.105:8091/ingest"
@@ -23915,6 +23917,99 @@ do
 	end
 	killHubGui()
 	Life.loop("panel:hubkill", 0.5, killHubGui)
+
+	-- Крафт только из мусора: белый список — петы, у которых шанс выпадения >= CRAFT_MIN_CHANCE.
+	-- Всё остальное уходит в "Never craft", поэтому секреты и редкие в машины не попадают.
+	local craftableNames = nil
+	local function buildCraftWhitelist()
+		if craftableNames then
+			return craftableNames
+		end
+		craftableNames = {}
+		local ok, cfg = Env.call(function()
+			return require(Env.ReplicatedStorage.Shared.Pets.LaunchEggConfig)
+		end)
+		if ok and type(cfg) == "table" then
+			for _, def in pairs(cfg) do
+				local list = type(def) == "table" and def.Pets or nil
+				if type(list) == "table" then
+					for petName, chance in pairs(list) do
+						local value = tonumber(chance)
+						if value and value >= CRAFT_MIN_CHANCE then
+							craftableNames[petName] = true
+						end
+					end
+				end
+			end
+		end
+		return craftableNames
+	end
+
+	local function applyCraftFilter()
+		local allowed = buildCraftWhitelist()
+		if next(allowed) == nil then
+			return
+		end
+		pcall(function()
+			local equipped = Ui.Library.Toggles and Ui.Library.Toggles.CraftKeepEquipped
+			if equipped and equipped.Value ~= true then
+				equipped:SetValue(true)
+			end
+			local mutated = Ui.Library.Toggles and Ui.Library.Toggles.CraftKeepMutated
+			if mutated and mutated.Value ~= true then
+				mutated:SetValue(true)
+			end
+		end)
+		-- инвертируем: в "Never craft" — все имена, которых нет в белом списке
+		pcall(function()
+			local ok, cfg = Env.call(function()
+				return require(Env.ReplicatedStorage.Shared.Pets.LaunchEggConfig)
+			end)
+			if not ok or type(cfg) ~= "table" then
+				return
+			end
+			local never = {}
+			for _, def in pairs(cfg) do
+				local list = type(def) == "table" and def.Pets or nil
+				if type(list) == "table" then
+					for petName in pairs(list) do
+						if not allowed[petName] then
+							never[petName] = true
+						end
+					end
+				end
+			end
+			local dropdown = Ui.Options and Ui.Options.CraftNever
+			if dropdown then
+				local okSet = pcall(function()
+					dropdown:SetValue(never)
+				end)
+				if not okSet then
+					pcall(function()
+						dropdown.Value = never
+					end)
+				end
+			end
+		end)
+	end
+	applyCraftFilter()
+	Life.loop("panel:craftfilter", 30, applyCraftFilter)
+
+	-- Штатный автоудалёнт игры: всё, у чего шанс выпадения не ниже порога,
+	-- удаляется прямо при вылупе и в рюкзак не попадает.
+	local function applyHatchDelete()
+		if HATCH_DELETE_ABOVE <= 0 then
+			return
+		end
+		pcall(function()
+			local slider = Ui.Options and Ui.Options.HatchDeleteAbove
+			if slider and slider.Value ~= HATCH_DELETE_ABOVE then
+				slider:SetValue(HATCH_DELETE_ABOVE)
+			end
+		end)
+	end
+	applyHatchDelete()
+	Life.loop("panel:hatchdelete", 20, applyHatchDelete)
 
 	-- 3) Помощники
 	local function fmt(n)
@@ -24234,6 +24329,249 @@ do
 		end)
 	end
 
+	-- ==== авто-очистка рюкзака ===============================================
+	-- Рюкзак полный -> игра останавливает хатч ("Storage full: needed N slots").
+	-- Чистим сами, но трогаем только дешёвых обычных петов: секреты, голд/даймонд/радуги,
+	-- мутированные, залоченные, экипированные и всё дороже minPriceToKeep остаются.
+	local CLEAN = {
+		enabled = true,
+		startAt = 0.95,        -- с какой доли хранилища начинать крафт-разгрузку
+		targetAt = 0.72,       -- до какой доли чистить
+		maxPerCycle = 30,      -- сколько петов за один заход
+		minPriceToKeep = 20,   -- пет дороже этого в токенах неприкосновенен
+		keepTopPower = 20,     -- столько лучших по power не трогаем
+		tries = 0,
+		deleted = 0,
+		method = nil,          -- определится сама: "CleanUp" или "Delete"
+		failed = {},
+		probed = false,
+		note = "ждёт",
+		waitMinutes = 10,   -- столько ждём, пока крафт/апгрейды сами освободят место
+		stuckSince = nil,
+		lastCount = nil,
+	}
+
+	local KEEP_TIERS = { Golden = true, Diamond = true, Shiny = true, Rainbow = true, Secret = true }
+
+	local function petTier(pet)
+		return tostring(type(pet) == "table" and (pet.Tier or "") or "")
+	end
+
+	local function petProtected(pet, rankFromTop)
+		if type(pet) ~= "table" then
+			return true
+		end
+		if isSecret(pet) then
+			return true
+		end
+		if KEEP_TIERS[petTier(pet)] or KEEP_TIERS[tostring(pet.Rarity or "")] then
+			return true
+		end
+		if type(pet.Mutation) == "string" and pet.Mutation ~= "" then
+			return true
+		end
+		if pet.Locked == true or pet.Signed == true or pet.Enchanted == true or pet.Equipped == true then
+			return true
+		end
+		local price = priceOf(pet.Name)
+		if price and price >= CLEAN.minPriceToKeep then
+			return true
+		end
+		if rankFromTop and rankFromTop <= CLEAN.keepTopPower then
+			return true
+		end
+		return false
+	end
+
+	local function ownedCount()
+		local data = Env.data()
+		local owned = data and data.Pets and data.Pets.Owned
+		if type(owned) ~= "table" then
+			return 0, {}, data
+		end
+		local count = 0
+		for _ in pairs(owned) do
+			count += 1
+		end
+		return count, owned, data
+	end
+
+	-- Один раз за сессию: пишем в лог, какие вообще штуки есть у PetService,
+	-- чтобы в панели было видно, чем игра чистит рюкзак.
+	local function probePetService()
+		if CLEAN.probed then
+			return
+		end
+		CLEAN.probed = true
+		local ok, names = Env.call(function()
+			local folder = Env.ReplicatedStorage:FindFirstChild("RemoteServices")
+			local service = folder and folder:FindFirstChild("PetService")
+			local out = {}
+			if service then
+				for _, child in ipairs(service:GetChildren()) do
+					out[#out + 1] = child.Name
+				end
+			end
+			return table.concat(out, ", ")
+		end)
+		if ok and names then
+			logEvent("probe", "PetService: " .. tostring(names):sub(1, 300))
+		end
+	end
+
+	-- Хранилище можно растить, а не чистить: если в дереве апгрейдов есть что-то
+	-- про хранение, покупаем это гемами (сервер сам откажет, если рано или дорого).
+	local storageUpgrades = nil
+	local function readUpgrades()
+		if storageUpgrades then
+			return storageUpgrades
+		end
+		storageUpgrades = {}
+		pcall(function()
+			local cfg = require(Env.ReplicatedStorage.Shared.Progression.UpgradeConfig)
+			if type(cfg) == "table" and type(cfg.Order) == "table" then
+				for _, name in ipairs(cfg.Order) do
+					if string.find(string.lower(tostring(name)), "stor") then
+						storageUpgrades[#storageUpgrades + 1] = name
+					end
+				end
+			end
+		end)
+		logEvent("probe", "апгрейды: " .. (#storageUpgrades > 0
+			and table.concat(storageUpgrades, ", ")
+			or "про хранение ничего нет"))
+		return storageUpgrades
+	end
+
+	local function tryClean(method, ids, before)
+		local payload
+		if method == "CleanUp" then
+			payload = { Action = "CleanUp", Rarity = "Normal" }
+		elseif method == "Delete" then
+			payload = { Action = "Delete", Pets = ids }
+		elseif method == "Trash" then
+			payload = { Action = "Trash", Pets = ids }
+		else
+			payload = { Action = "Sell", Pets = ids }
+		end
+		pcall(Env.fire, "PetService", "PetActionRequested", payload)
+		Life.wait(1.5)
+		local now = ownedCount()
+		return before - now
+	end
+
+	Life.loop("pet:cleanup", 12, function()
+		if not CLEAN.enabled then
+			return
+		end
+		local count, owned, data = ownedCount()
+		local limit = tonumber(data and data.Pets and data.Pets.StorageLimit) or 0
+		if limit <= 0 or count == 0 then
+			return
+		end
+		if count / limit < CLEAN.startAt then
+			CLEAN.note = string.format("%d/%d — запас есть", count, limit)
+			return
+		end
+		probePetService()
+		CLEAN.tries += 1
+
+		-- 1) Сначала бесплатные способы: крафт и апгрейды хранилища.
+		pcall(function()
+			local craft = Ui.Library.Toggles and Ui.Library.Toggles.AutoCraft
+			if craft and craft.Value ~= true then
+				craft:SetValue(true)
+			end
+			local upgrade = Ui.Library.Toggles and Ui.Library.Toggles.AutoUpgrade
+			if upgrade and upgrade.Value ~= true then
+				upgrade:SetValue(true)
+			end
+		end)
+		for _, name in ipairs(readUpgrades()) do
+			pcall(Env.invoke, "UpgradeService", "Purchase", { Name = name })
+		end
+
+		-- 2) Крафт реально освобождает слоты? Смотрим на счётчик, а не на слова.
+		if CLEAN.lastCount and count < CLEAN.lastCount then
+			CLEAN.stuckSince = nil
+			CLEAN.lastCount = count
+			CLEAN.note = string.format("%d/%d — крафт освобождает место, не трогаем", count, limit)
+			return
+		end
+		CLEAN.lastCount = count
+		CLEAN.stuckSince = CLEAN.stuckSince or os.clock()
+		local stuck = os.clock() - CLEAN.stuckSince
+		if stuck < CLEAN.waitMinutes * 60 then
+			CLEAN.note = string.format("%d/%d — ждём крафт ещё %d мин", count, limit,
+				math.ceil((CLEAN.waitMinutes * 60 - stuck) / 60))
+			return
+		end
+
+		-- 2) Собираем кандидатов: обычные, дешёвые, не из верхушки по power.
+		local list = {}
+		for id, pet in pairs(owned) do
+			list[#list + 1] = {
+				id = id,
+				pet = pet,
+				power = tonumber(type(pet) == "table" and pet.Power) or 0,
+			}
+		end
+		table.sort(list, function(a, b)
+			return a.power < b.power
+		end)
+
+		local targets = {}
+		local total = #list
+		for index, entry in ipairs(list) do
+			if not petProtected(entry.pet, total - index + 1) then
+				targets[#targets + 1] = entry
+			end
+		end
+		if #targets == 0 then
+			CLEAN.note = "чистить нечего: всё защищено"
+			return
+		end
+
+		local want = math.max(1, math.ceil((count - limit * CLEAN.targetAt)))
+		want = math.min(want, CLEAN.maxPerCycle, #targets)
+
+		local ids = {}
+		for index = 1, want do
+			ids[#ids + 1] = targets[index].id
+		end
+
+		local before = count
+		local order = CLEAN.method and { CLEAN.method } or { "CleanUp", "Delete", "Trash" }
+		for _, method in ipairs(order) do
+			if not CLEAN.failed[method] then
+				local removed = tryClean(method, ids, before)
+				if removed > 0 then
+					CLEAN.method = method
+					CLEAN.deleted += removed
+					local after = ownedCount()
+					CLEAN.note = string.format("%s: -%d (%d/%d -> %d/%d)", method, removed, before, limit, after, limit)
+					logEvent("clean", CLEAN.note)
+					return
+				end
+				if CLEAN.method == nil then
+					CLEAN.failed[method] = true
+				end
+			end
+		end
+
+		-- 3) Ничего не сработало: хотя бы не даём мусору копиться дальше.
+		CLEAN.note = "удаление не принято, включено авто-удаление при хатче"
+		if not CLEAN.fallback then
+			CLEAN.fallback = true
+			pcall(function()
+				if Ui.Options.HatchDeleteAbove then
+					Ui.Options.HatchDeleteAbove:SetValue(25)
+				end
+			end)
+			logEvent("warn", CLEAN.note)
+		end
+	end)
+
 	-- 8) Панель в старом дизайне
 	local started = os.clock()
 	local gui = Instance.new("ScreenGui")
@@ -24315,6 +24653,9 @@ do
 	divider()
 	local timeRow = row("⏰ Time: 00:00:00")
 	local linkRow = row("📡 Сервер: …")
+	local cleanRow = row("🧹 Cleanup: …")
+	local autoDeleteRow = row("🗑 Автоудалёнт: …")
+	local craftRow = row("🧪 Крафт: …")
 
 	-- RightShift — скрыть/показать панель
 	local UserInputService = game:GetService("UserInputService")
@@ -24390,6 +24731,17 @@ do
 		secretsRow.Text = "🔮 Secrets: " .. tostring(secretsCount)
 
 		eggsRow.Text = string.format("🥚 Eggs: %s (хатчей %s)", short(LOG.eggs), short(LOG.hatches))
+		cleanRow.Text = string.format("🧹 Cleanup: удалено %s · %s", short(CLEAN.deleted), CLEAN.note)
+		do
+			local allowed = 0
+			for _ in pairs(craftableNames or {}) do
+				allowed += 1
+			end
+			craftRow.Text = string.format("🧪 Крафт: только шанс ≥%d%% (%d видов)", CRAFT_MIN_CHANCE, allowed)
+		end
+		autoDeleteRow.Text = HATCH_DELETE_ABOVE > 0
+			and string.format("🗑 Автоудалёнт: обычные от %d%% шанса", HATCH_DELETE_ABOVE)
+			or "🗑 Автоудалёнт: выключен (как в игре)"
 		linkRow.Text = LOG.error and ("📡 Сервер: " .. LOG.error) or "📡 Сервер: ок"
 		linkRow.TextColor3 = LOG.error and Color3.fromRGB(235, 130, 100) or Color3.fromRGB(150, 200, 150)
 
