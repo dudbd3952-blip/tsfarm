@@ -4,6 +4,8 @@
 -- Изменено: панель, логи в консоль и на сервер, разгрузка рюкзака, автоудалёнт 50%, вебхук.
 -- Slopix Hub (Tap Simulator), built 2026-10-30 14:22 UTC by build.py. Edit the files in src/, not this one.
 local __modules, __cache, __loading = {}, {}, {}
+-- Без интерфейса: панель не создаётся вообще. Всё остальное работает как обычно.
+local __NO_GUI = true
 local function use(name)
     local cached = __cache[name]
     if cached ~= nil then
@@ -4496,6 +4498,7 @@ do
                     price = tonumber(def.Price) or 0,
                     island = def.Island,
                     pets = type(def.Pets) == "table" and def.Pets or {},
+                    secrets = type(def.Secrets) == "table" and def.Secrets or {},
                 }
             end
         end
@@ -4665,10 +4668,125 @@ local function hatchable(data, egg)
     return island == nil or island == "Spawn" or (type(islands) == "table" and islands[island] == true)
 end
 
+-- Почему яйцо пропускается: раз в 5 минут пишем в консоль, чтобы не гадать.
+local function whySkipped(data)
+    local out = {}
+    local unlocked = type(data.Eggs) == "table" and data.Eggs.Unlocked
+    for egg in pairs(EGGS) do
+        local reason = nil
+        if type(unlocked) ~= "table" or unlocked[egg] ~= true then
+            reason = "не открыто"
+        elseif not eggPosition(egg) then
+            reason = "нет координат"
+        elseif not hatchable(data, egg) then
+            reason = "остров закрыт"
+        end
+        if reason then
+            out[#out + 1] = egg .. "=" .. reason
+        end
+    end
+    table.sort(out)
+    return out
+end
+
+Life.loop("hatch:why", 300, function()
+    local ok, data = pcall(Env.data)
+    if not ok or type(data) ~= "table" then
+        return
+    end
+    local parts = whySkipped(data)
+    if #parts == 0 then
+        return
+    end
+    local shown = {}
+    for index = 1, math.min(#parts, 6) do
+        shown[index] = parts[index]
+    end
+    print("[TAPSIM] пропуск яиц | " .. table.concat(shown, " | "))
+end)
+
 -- Choosing the egg -----------------------------------------------------------------------------
 
 local BEST, CHOSEN, ISLAND = "Best egg I can afford", "Chosen egg", "Egg on my island"
-local UPGRADE_BUFFER = 5 -- move up to a pricier egg only with this many full batches of it in the bank
+local UPGRADE_BUFFER = 5
+
+-- ЗАМОК ЯЙЦА. Имя здесь = хатчить только его и никогда не менять. Пустая строка = выбирать
+-- самому по выгоде (см. ниже). Смена яйца обнуляет засуху (Eggs.SecretDroughtSeconds).
+local LOCK_EGG = ""
+local lockNote = nil
+local function logEgg(text)
+    print("[TAPSIM] яйцо | " .. text)
+end
+
+-- Во сколько токенов оценивается секрет на demand.gg, снято 5 ноября 2026.
+-- Цены падают каждый день: если правишь, правь здесь, иначе выбор яйца устареет.
+local SECRET_TOKENS = {
+    ["Dark Cat"] = 12000, ["Sanguine Heart"] = 12000,
+    ["Neon Cat"] = 7250, ["Malevolent Treat"] = 7250,
+    ["Hallow Lord"] = 7000, ["Nevermore"] = 7000,
+    ["King Of Hell"] = 4000, ["Phantom Mirror"] = 3500, ["Enigma"] = 3250,
+    ["Witches Hat"] = 2400, ["King Kraken"] = 2000,
+    ["30M Candycorn Dragon"] = 1250, ["Vanguard"] = 1200,
+    ["30M Imperfection"] = 350, ["Orca Dominator"] = 325,
+    ["First Light"] = 200, ["Helfire Spirit"] = 200,
+    ["30M Vampire Coffin"] = 175, ["Crystalline Colossus"] = 160,
+    ["Angelus"] = 150, ["Sand Sovereign"] = 150, ["Party Doggy"] = 150, ["Party Kitty"] = 150,
+    ["Soul Hunter"] = 130, ["Forsaken Knight"] = 120, ["Reanimation"] = 115,
+    ["Arch Angel"] = 110, ["Dragon Tamer"] = 110,
+    ["Eternal Emerald"] = 100, ["King Shroomie"] = 100, ["Shinigami"] = 100,
+    ["Void Overseer"] = 95, ["Anubis"] = 90, ["Inferno Dragon"] = 90, ["Sharkie"] = 90,
+    ["Nameless Diety"] = 80, ["30M Cursed Gift"] = 75, ["Infernal Lord"] = 70,
+    ["Count Batula"] = 65, ["Cinder Eye"] = 60,
+    ["Void Wraith"] = 35,
+    ["Autumn Warden"] = 30, ["Crystal Guardian"] = 30, ["Diamond Piercer"] = 30,
+    ["Flame Fungi"] = 30, ["Oaisis Spirit"] = 30,
+    ["30M Phantom Serpent"] = 1, ["30M Midnight Cat"] = 0.5,
+}
+
+-- Сколько токенов приносит одно яйцо в среднем: цена секрета × шанс, сумма по всем.
+local EGG_VALUE = {}
+local function buildEggValues()
+    for egg, def in pairs(EGGS) do
+        local expected = 0
+        for pet, odds in pairs(def.secrets or {}) do
+            local price = SECRET_TOKENS[pet]
+            local chance = tonumber(odds)
+            if price and chance and chance > 1 then
+                expected = expected + (1 / chance) * price
+            end
+        end
+        for pet, pct in pairs(def.pets or {}) do
+            local price = SECRET_TOKENS[pet]
+            local chance = tonumber(pct)
+            if price and chance and chance > 0 then
+                expected = expected + (chance / 100) * price
+            end
+        end
+        if expected > 0 then
+            EGG_VALUE[egg] = expected
+        end
+    end
+end
+buildEggValues()
+
+do
+    local rows = {}
+    for egg, ev in pairs(EGG_VALUE) do
+        rows[#rows + 1] = { egg = egg, ev = ev }
+    end
+    table.sort(rows, function(a, b)
+        return a.ev > b.ev
+    end)
+    local parts = {}
+    for index = 1, math.min(#rows, 10) do
+        parts[#parts + 1] = string.format("%s %.3f", rows[index].egg, rows[index].ev * 1000)
+    end
+    logEgg("токенов за 1000 яиц: " .. table.concat(parts, " | "))
+end
+
+-- Насколько выгоднее должно быть яйцо, чтобы бросить текущее. Бросить = обнулить засуху,
+-- поэтому держимся за старое, пока разница меньше этой доли.
+local SWITCH_MARGIN = 1.15 -- новое яйцо берём, только если оно выгоднее на 15% и больше
 
 local current -- the egg being hatched now
 local refused = {} -- egg -> os.clock() until which it is skipped (NotEnoughCoins, IslandLocked)
@@ -4686,7 +4804,49 @@ local function eggsByPrice(data)
     return list
 end
 
+local function chooseByValue(data)
+    local best, bestValue = nil, 0
+    for _, egg in ipairs(eggsByPrice(data)) do
+        local value = EGG_VALUE[egg]
+        if value and value > bestValue and hatchCount(data, egg) then
+            best, bestValue = egg, value
+        end
+    end
+    if not best then
+        return nil
+    end
+    if current and EGG_VALUE[current] and hatchable(data, current) and hatchCount(data, current)
+        and EGG_VALUE[current] * SWITCH_MARGIN >= bestValue then
+        return current
+    end
+    return best
+end
+
 local function chooseEgg(data)
+    if LOCK_EGG ~= "" then
+        local egg = LOCK_EGG
+        if EGGS[egg] and hatchable(data, egg) and hatchCount(data, egg) then
+            return egg
+        end
+        local reason
+        if not EGGS[egg] then
+            reason = "нет такого яйца в таблице EGGS"
+        elseif not hatchable(data, egg) then
+            reason = "яйцо или остров закрыт"
+        else
+            local coins = tonumber(type(data.Currencies) == "table" and data.Currencies.Coins) or 0
+            reason = string.format("не хватает монет: нужно %s за одно яйцо, есть %s",
+                tostring(EGGS[egg].price), tostring(math.floor(coins)))
+        end
+        if lockNote ~= reason then
+            lockNote = reason
+            logEgg("замок не сработал: " .. egg .. " — " .. reason)
+        end
+    end
+    local byValue = chooseByValue(data)
+    if byValue then
+        return byValue
+    end
     local mode = Options.HatchMode.Value
     if mode == CHOSEN then
         local egg = Options.HatchEgg.Value
@@ -4982,6 +5142,11 @@ Life.spawn("hatch:auto", function()
         end
         if egg ~= current then
             current, tooFar = egg, 0
+            pcall(function()
+                Env.LocalPlayer:SetAttribute("TAPSIM_Egg", egg)
+            end)
+            logEgg(string.format("теперь хатчу %s (цена %s, за раз %d)",
+                egg, tostring(EGGS[egg] and EGGS[egg].price), hatchCount(data, egg) or 0))
         end
         local count = hatchCount(data, egg)
         if not count then
@@ -12199,6 +12364,9 @@ Instance.Parent = PlayerGui
 end
 end
 local function ParentUI(UI: Instance, SkipHiddenUI: boolean?)
+if __NO_GUI then
+return
+end
 if SkipHiddenUI then
 SafeParentUI(UI, CoreGui)
 return
@@ -23856,31 +24024,165 @@ do
 	end -- false = слать только секретов (если крафт спамит уведомлениями)
 	-- ========================================================================
 
-	-- 1) Включить всё, кроме хэллоуина и вебхука хаба (он не нужен, у нас свой).
-	local OFF = {
-		AutoHallowBoss = true,
-		AutoTrickOrTreat = true,
-		AutoCandyShop = true,
-		AutoCandyWitch = true,
+	-- 1) ФЕРМА ЯИЦ: включаем только то, что нужно яйцам, всё остальное глушим.
+	-- Приоритет времени — яйцам, поэтому из крафта остаются только золото и алмазы,
+	-- а всё, что уводит персонажа с яйца (рыбалка, подземелья, боссы, ивенты, шахта,
+	-- шары, пчёлы, зелья, квесты, колесо, ребёрс, тотемы и т.д.), выключено.
+	local FARM_ON = {
+		-- яйца
+		AutoHatch = true,
+		HatchTeleport = true,
+		-- команда: лучшие петы по удаче
+		AutoEquipBest = true,
+		-- крафт: золотые и алмазные (радугу не делаем — она отнимает время у яиц)
+		AutoCraft = true,
+		CraftKeepEquipped = true,
+		CraftKeepMutated = true,
+		CraftReturn = true,
+		-- клики (гемы и монеты, персонажа никуда не уводят)
+		AutoTap = true,
+		AutoClicker = true,
+		-- мелочь, которая не мешает: награда за вход, анти-афк, апгрейды хранилища
+		AutoClaimOffline = true,
+		AntiAfk = true,
+		AutoUpgrade = true,
+		-- производительность: чем меньше рисуем, тем больше яиц успеваем открыть
+		PerfMode = true,
+		PerfGameSettings = true,
+		PerfHideHatching = true,
+		PerfNoRender = true,
+		-- свой вебхук об отключении оставляем
 		WebhookDisconnect = true,
 	}
 	local allCount = 0
 	for name, toggle in pairs(Ui.Library.Toggles) do
 		allCount += 1
-		if OFF[name] then
+		local want = FARM_ON[name] == true
+		if toggle.Value ~= want then
 			pcall(function()
-				if toggle.Value == true then
-					toggle:SetValue(false)
-				end
+				toggle:SetValue(want)
 			end)
-		else
-			if toggle.Value ~= true then
-				pcall(function()
-					toggle:SetValue(true)
-				end)
-			end
 		end
 	end
+	do
+		local onNames = {}
+		for name, toggle in pairs(Ui.Library.Toggles) do
+			if toggle.Value == true then
+				onNames[#onNames + 1] = name
+			end
+		end
+		table.sort(onNames)
+		logEvent("farm", string.format("включено %d из %d: %s", #onNames, allCount, table.concat(onNames, ", ")))
+	end
+	-- Яйцо: всегда самое дорогое, которое можем себе позволить.
+	pcall(function()
+		local hatch = Ui.Options and Ui.Options.HatchMode
+		local values = hatch and hatch.Values
+		if type(values) == "table" and type(values[1]) == "string" and hatch.Value ~= values[1] then
+			hatch:SetValue(values[1])
+		end
+		logEvent("farm", "режим яйца: " .. tostring(hatch and hatch.Value))
+	end)
+	-- Крафт: только золотые и алмазные, радугу не собираем.
+	pcall(function()
+		local machines = Ui.Options and Ui.Options.CraftMachines
+		if machines then
+			machines:SetValue({ "Golden", "Diamond" })
+			local picked = {}
+			for name, active in pairs(machines.Value or {}) do
+				if active == true then
+					picked[#picked + 1] = tostring(name)
+				end
+			end
+			logEvent("farm", "крафт: " .. table.concat(picked, ", "))
+		end
+	end)
+
+	-- 1.5) КОМАНДА: лучшие петы по удаче.
+	-- У кнопки "Equip Best" в игре есть режим: удача / клики / гемы. Он лежит в настройках
+	-- игрока на сервере (SettingsService.UpdateSetting { Name, Value }). Ищем этот режим сам,
+	-- ставим "удача" и проверяем, что сервер принял. По кнопкам в интерфейсе не кликаем.
+	local EQUIP = { mode = "Luck", name = nil, ok = false, note = "ждёт" }
+
+	local function settingsOf()
+		local data = Env.data()
+		return data and type(data.Settings) == "table" and data.Settings or nil
+	end
+
+	local function looksLikeModeSetting(name, value)
+		local key = string.lower(tostring(name))
+		if not (string.find(key, "best", 1, true) or string.find(key, "equip", 1, true)
+			or string.find(key, "team", 1, true)) then
+			return false
+		end
+		if type(value) == "string" then
+			local lowered = string.lower(value)
+			return lowered == "luck" or lowered == "clicks" or lowered == "gems"
+		end
+		return type(value) == "number"
+	end
+
+	local function applyEquipMode()
+		local settings = settingsOf()
+		if not settings then
+			EQUIP.note = "настройки игрока ещё не пришли"
+			return false
+		end
+		local found = EQUIP.name
+		if not found or settings[found] == nil then
+			found = nil
+			for name, value in pairs(settings) do
+				if looksLikeModeSetting(name, value) then
+					found = name
+					break
+				end
+			end
+		end
+		if not found then
+			local names = {}
+			for name in pairs(settings) do
+				names[#names + 1] = tostring(name)
+			end
+			table.sort(names)
+			logEvent("warn", "настройка режима Equip Best не найдена, ключи настроек: " .. table.concat(names, ", "))
+			EQUIP.note = "режим не найден"
+			return false
+		end
+		EQUIP.name = found
+		local current = settings[found]
+		if tostring(current) == EQUIP.mode then
+			EQUIP.ok = true
+			EQUIP.note = string.format("%s = %s", found, EQUIP.mode)
+			return true
+		end
+		local value = EQUIP.mode
+		if type(current) == "number" then
+			value = 3 -- PetAffinity.Values: 1 клики, 2 гемы, 3 удача
+		end
+		local ok, result = Env.invoke("SettingsService", "UpdateSetting", { Name = found, Value = value })
+		EQUIP.note = string.format("%s -> %s (%s)", found, tostring(value),
+			ok and "запрос ушёл" or ("ошибка: " .. tostring(result)))
+		logEvent("equip", EQUIP.note)
+		return ok
+	end
+
+	local function equipBestNow()
+		applyEquipMode()
+		pcall(function()
+			Ui.set("AutoEquipBest", true)
+		end)
+		local ok = pcall(Env.fire, "PetService", "PetActionRequested", { Action = "EquipBest" })
+		logEvent("equip", "EquipBest отправлен: " .. tostring(ok))
+	end
+	equipBestNow()
+	Life.loop("equip:mode", 120, function()
+		if not EQUIP.ok then
+			applyEquipMode()
+		end
+		if EQUIP.ok then
+			pcall(Env.fire, "PetService", "PetActionRequested", { Action = "EquipBest" })
+		end
+	end)
 
 	-- 2) Интерфейс хаба Slopix не нужен вообще: гасим и сторожим,
 	--    чтобы он не всплыл ни по своей кнопке (RightControl), ни сам собой.
@@ -23911,7 +24213,13 @@ do
 			if typeof(parent) == "Instance" then
 				for _, child in ipairs(parent:GetChildren()) do
 					if child:IsA("ScreenGui") and string.find(string.lower(child.Name), "obsidian") then
-						child.Enabled = false
+						if __NO_GUI then
+							pcall(function()
+								child:Destroy()
+							end)
+						else
+							child.Enabled = false
+						end
 					end
 				end
 			end
@@ -24340,67 +24648,37 @@ do
 		end)
 	end
 
-	-- ==== авто-очистка рюкзака ===============================================
-	-- Рюкзак полный -> игра останавливает хатч ("Storage full: needed N slots").
-	-- Чистим сами, но трогаем только дешёвых обычных петов: секреты, голд/даймонд/радуги,
-	-- мутированные, залоченные, экипированные и всё дороже minPriceToKeep остаются.
+	-- ==== очистка рюкзака (та же механика, что в tapsim_multi_delete.lua) =====
+	-- Рюкзак полный -> игра перестаёт открывать яйца. Чистим сами, мультивыбором в инвентаре.
+	-- Не трогаем: залоченных, стоящих в команде, секретов, тех, кого можно продать за токены,
+	-- и 10 лучших по удаче. Порядок по удаче берём у самой игры: PetBest.Rank(list, "Luck"),
+	-- своей формулы не выдумываем. Никакого ожидания "может, крафт сам разгрузит" —
+	-- как только рюкзак под заполнение, чистим сразу.
 	local CLEAN = {
 		enabled = true,
-		startAt = 0.95,        -- с какой доли хранилища начинать крафт-разгрузку
-		targetAt = 0.72,       -- до какой доли чистить
-		maxPerCycle = 30,      -- сколько петов за один заход
-		minPriceToKeep = 20,   -- пет дороже этого в токенах неприкосновенен
-		keepTopPower = 20,     -- столько лучших по power не трогаем
+		startAt = 0.90,   -- с какой доли хранилища начинаем чистку (раньше ждали 10 минут — ждём больше не надо)
+		targetAt = 0.80,  -- до какой доли чистим за один заход
+		keepTopLuck = 10, -- столько лучших по удаче неприкосновенны
+		keepLocked = true,
+		keepEquipped = true,
+		keepSecrets = true,
+		keepPriced = true, -- есть цена на demand.gg -> можно продать за токены
+		minTokenKeep = 1,
+		stepPause = 0.25,  -- пауза после клика по карточке
+		maxSteps = 400,
 		tries = 0,
 		deleted = 0,
-		method = nil,          -- определится сама: "CleanUp" или "Delete"
-		failed = {},
-		probed = false,
+		running = false,
 		note = "ждёт",
-		waitMinutes = 10,   -- столько ждём, пока крафт/апгрейды сами освободят место
-		stuckSince = nil,
-		lastCount = nil,
-		legacyDelete = false, -- старые попытки PetActionRequested: игра их не принимает
-		purgeShape = nil,
+		rankOrder = nil,
 	}
-
-	local KEEP_TIERS = { Golden = true, Diamond = true, Shiny = true, Rainbow = true, Secret = true }
-
-	local function petTier(pet)
-		return tostring(type(pet) == "table" and (pet.Tier or "") or "")
-	end
-
-	local function petProtected(pet, rankFromTop)
-		if type(pet) ~= "table" then
-			return true
-		end
-		if isSecret(pet) then
-			return true
-		end
-		if KEEP_TIERS[petTier(pet)] or KEEP_TIERS[tostring(pet.Rarity or "")] then
-			return true
-		end
-		if type(pet.Mutation) == "string" and pet.Mutation ~= "" then
-			return true
-		end
-		if pet.Locked == true or pet.Signed == true or pet.Enchanted == true or pet.Equipped == true then
-			return true
-		end
-		local price = priceOf(pet.Name)
-		if price and price >= CLEAN.minPriceToKeep then
-			return true
-		end
-		if rankFromTop and rankFromTop <= CLEAN.keepTopPower then
-			return true
-		end
-		return false
-	end
+	local VIM = game:GetService("VirtualInputManager")
 
 	local function ownedCount()
 		local data = Env.data()
-		local owned = data and data.Pets and data.Pets.Owned
+		local owned = data and type(data.Pets) == "table" and data.Pets.Owned or nil
 		if type(owned) ~= "table" then
-			return 0, {}, data
+			return 0, {}, nil
 		end
 		local count = 0
 		for _ in pairs(owned) do
@@ -24409,75 +24687,485 @@ do
 		return count, owned, data
 	end
 
-	-- Один раз за сессию: пишем в лог, какие вообще штуки есть у PetService,
-	-- чтобы в панели было видно, чем игра чистит рюкзак.
-	local function probePetService()
-		if CLEAN.probed then
-			return
+	-- секреты берём из справочника яиц: у них в данных пет только "Rarity", а в справочнике
+	-- есть готовый список по каждому яйцу
+	local secretNames = nil
+	local function secretSet()
+		if secretNames then
+			return secretNames
 		end
-		CLEAN.probed = true
-		local ok, names = Env.call(function()
-			local folder = Env.ReplicatedStorage:FindFirstChild("RemoteServices")
-			local service = folder and folder:FindFirstChild("PetService")
-			local out = {}
-			if service then
-				for _, child in ipairs(service:GetChildren()) do
-					out[#out + 1] = child.Name
+		secretNames = {}
+		local ok, config = Env.call(function()
+			return require(Env.ReplicatedStorage.Shared.Pets.LaunchEggConfig)
+		end)
+		if ok and type(config) == "table" then
+			for _, egg in pairs(config) do
+				local list = type(egg) == "table" and egg.Secrets or nil
+				if type(list) == "table" then
+					for name in pairs(list) do
+						secretNames[name] = true
+					end
 				end
 			end
-			return table.concat(out, ", ")
-		end)
-		if ok and names then
-			logEvent("probe", "PetService: " .. tostring(names):sub(1, 300))
 		end
+		local total = 0
+		for _ in pairs(secretNames) do
+			total += 1
+		end
+		logEvent("clean", string.format("справочник секретов: %d имён", total))
+		return secretNames
 	end
 
-	-- Хранилище можно растить, а не чистить: если в дереве апгрейдов есть что-то
-	-- про хранение, покупаем это гемами (сервер сам откажет, если рано или дорого).
-	local storageUpgrades = nil
-	local function readUpgrades()
-		if storageUpgrades then
-			return storageUpgrades
+	local function mutationOf(pet)
+		if type(pet) ~= "table" then
+			return nil
 		end
-		storageUpgrades = {}
+		if type(pet.Mutation) == "string" and pet.Mutation ~= "" then
+			return pet.Mutation
+		end
+		for key, value in pairs(pet) do
+			if type(key) == "string" and string.find(string.lower(key), "mut", 1, true) then
+				if type(value) == "string" and value ~= "" then
+					return value
+				end
+				if type(value) == "table" and next(value) ~= nil then
+					return "table"
+				end
+			end
+		end
+		return nil
+	end
+
+	-- место в рейтинге удачи: 1 = лучший по удаче, 1e9 = в рейтинг не попал
+	local function refreshRank(owned)
+		local ok, PetBest = Env.call(function()
+			return require(Env.ReplicatedStorage.Shared.Pets.PetBest)
+		end)
+		if not ok or type(PetBest) ~= "table" or type(PetBest.Rank) ~= "function" then
+			CLEAN.rankOrder = nil
+			return false
+		end
+		local array = {}
+		for _, pet in pairs(owned) do
+			if type(pet) == "table" then
+				array[#array + 1] = pet
+			end
+		end
+		local okRank, ranked = Env.call(PetBest.Rank, array, "Luck")
+		if not okRank or type(ranked) ~= "table" then
+			CLEAN.rankOrder = nil
+			return false
+		end
+		local order = {}
+		for index = 1, #ranked do
+			local entry = ranked[index]
+			local pet = type(entry) == "table" and entry.Data or nil
+			if type(pet) == "table" and pet.Id ~= nil then
+				order[tostring(pet.Id)] = index
+			end
+		end
+		CLEAN.rankOrder = order
+		return true
+	end
+
+	-- nil -> пет уходит под нож, строка -> причина, по которой он остаётся
+	local function keepReason(pet, data, topLuck)
+		if type(pet) ~= "table" then
+			return "нет записи"
+		end
+		if CLEAN.keepLocked and pet.Locked == true then
+			return "залочен"
+		end
+		if CLEAN.keepEquipped then
+			local id = tostring(pet.Id)
+			if pet.Equip == true then
+				return "в команде"
+			end
+			local equipped = data.Pets.Equipped
+			if type(equipped) == "table" then
+				for _, value in pairs(equipped) do
+					local ref = type(value) == "table" and (value.Id or value.PetId) or value
+					if ref ~= nil and tostring(ref) == id then
+						return "в команде"
+					end
+				end
+			end
+		end
+		if CLEAN.keepSecrets then
+			local name = tostring(pet.Name or "")
+			if secretSet()[name] == true or isSecret(pet) then
+				return "секрет"
+			end
+		end
+		if CLEAN.keepPriced then
+			local price = priceOf(pet.Name)
+			if price and price >= CLEAN.minTokenKeep then
+				return string.format("продаётся за %s токенов", tostring(price))
+			end
+		end
+		if topLuck then
+			return "лучший по удаче #" .. tostring(topLuck)
+		end
+		return nil
+	end
+
+	-- план на удаление: самые слабые по мощи первыми, ровно want штук
+	local function buildPlan(data, want)
+		local owned = data.Pets.Owned
+		if not refreshRank(owned) or type(CLEAN.rankOrder) ~= "table" then
+			return nil, {}, "рейтинг удачи недоступен, чистить не рискую"
+		end
+		local order = CLEAN.rankOrder
+		local entries = {}
+		for key, pet in pairs(owned) do
+			if type(pet) == "table" then
+				entries[#entries + 1] = { id = tostring(pet.Id or key), pet = pet }
+			end
+		end
+		local byLuck = {}
+		for _, entry in ipairs(entries) do
+			byLuck[#byLuck + 1] = entry
+		end
+		table.sort(byLuck, function(a, b)
+			return (order[a.id] or 1e9) < (order[b.id] or 1e9)
+		end)
+		local topLuck = {}
+		for index = 1, math.min(CLEAN.keepTopLuck, #byLuck) do
+			topLuck[byLuck[index].id] = index
+		end
+		table.sort(entries, function(a, b)
+			return (tonumber(a.pet.Power) or 0) < (tonumber(b.pet.Power) or 0)
+		end)
+		local plan, reasons = {}, {}
+		for _, entry in ipairs(entries) do
+			local reason = keepReason(entry.pet, data, topLuck[entry.id])
+			if reason then
+				reasons[reason] = (reasons[reason] or 0) + 1
+			elseif #plan < want then
+				plan[#plan + 1] = entry
+			end
+		end
+		return plan, reasons
+	end
+
+	local function clickObject(obj)
+		if not obj then
+			return false
+		end
+		return (pcall(function()
+			local abs, size = obj.AbsolutePosition, obj.AbsoluteSize
+			local x, y = abs.X + size.X / 2, abs.Y + size.Y / 2
+			VIM:SendMouseButtonEvent(x, y, 0, true, game, 1)
+			task.wait(0.03)
+			VIM:SendMouseButtonEvent(x, y, 0, false, game, 1)
+		end))
+	end
+
+	local function anyButton(parent)
+		if not parent then
+			return nil
+		end
+		if parent:IsA("GuiButton") then
+			return parent
+		end
+		for _, node in ipairs(parent:GetDescendants()) do
+			if node:IsA("GuiButton") then
+				return node
+			end
+		end
+		return nil
+	end
+
+	-- Нажимаем кнопку игры её же обработчиком (getconnections), а не мышкой:
+	-- мышка по кнопкам этой игры уже не срабатывала, а обработчик зовётся напрямую.
+	local function pressButton(button)
+		if not button then
+			return false
+		end
+		if type(getconnections) == "function" then
+			for _, signal in ipairs({ button.Activated, button.MouseButton1Click }) do
+				local ok, connections = pcall(getconnections, signal)
+				if ok and type(connections) == "table" then
+					for _, connection in ipairs(connections) do
+						local fired = pcall(function()
+							connection:Fire()
+						end)
+						if fired then
+							return true
+						end
+					end
+				end
+			end
+		end
+		return clickObject(button)
+	end
+
+	local function petsTab()
+		local player = Env.LocalPlayer
+		local gui = player and player:FindFirstChild("PlayerGui")
+		local tabs = gui and gui:FindFirstChild("Tabs")
+		local inventory = tabs and tabs:FindFirstChild("Inventory")
+		local menu = inventory and inventory:FindFirstChild("Menu")
+		local categories = menu and menu:FindFirstChild("Categories")
+		return categories and categories:FindFirstChild("Pets"), inventory
+	end
+
+	local function deleteCounter(tab)
+		local multi = tab:FindFirstChild("MultiDelete")
+		local title = multi and multi:FindFirstChild("Title")
+		local ok, text = pcall(function()
+			return title.Text
+		end)
+		if not ok or type(text) ~= "string" then
+			return -1
+		end
+		return tonumber(string.match(text, "Deleting%s+(%d+)")) or -1
+	end
+
+	-- Вход в инвентарь: сначала пробуем показать вкладку, потом кнопки в интерфейсе игры.
+	local function openInventory()
+		if petsTab() then
+			return true
+		end
+		local player = Env.LocalPlayer
+		local gui = player and player:FindFirstChild("PlayerGui")
+		local tabs = gui and gui:FindFirstChild("Tabs")
+		local nodes = {}
+		if tabs then
+			table.insert(nodes, tabs)
+			local inventory = tabs:FindFirstChild("Inventory")
+			if inventory then
+				table.insert(nodes, inventory)
+				local menu = inventory:FindFirstChild("Menu")
+				if menu then
+					table.insert(nodes, menu)
+				end
+			end
+		end
+		for _, node in ipairs(nodes) do
+			pcall(function()
+				node.Enabled = true
+			end)
+			pcall(function()
+				node.Visible = true
+			end)
+		end
+		Life.wait(0.8)
+		if petsTab() then
+			return true
+		end
+		local candidates = {}
 		pcall(function()
-			local cfg = require(Env.ReplicatedStorage.Shared.Progression.UpgradeConfig)
-			if type(cfg) == "table" and type(cfg.Order) == "table" then
-				for _, name in ipairs(cfg.Order) do
-					if string.find(string.lower(tostring(name)), "stor") then
-						storageUpgrades[#storageUpgrades + 1] = name
+			for _, node in ipairs(gui:GetDescendants()) do
+				if node:IsA("GuiButton") then
+					local name = string.lower(node.Name)
+					if string.find(name, "invent", 1, true) or string.find(name, "pets", 1, true)
+						or string.find(name, "bag", 1, true) or string.find(name, "backpack", 1, true) then
+						candidates[#candidates + 1] = node
 					end
 				end
 			end
 		end)
-		logEvent("probe", "апгрейды: " .. (#storageUpgrades > 0
-			and table.concat(storageUpgrades, ", ")
-			or "про хранение ничего нет"))
-		return storageUpgrades
-	end
-
-	local function tryClean(method, ids, before)
-		local payload
-		if method == "CleanUp" then
-			payload = { Action = "CleanUp", Rarity = "Normal" }
-		elseif method == "Delete" then
-			payload = { Action = "Delete", Pets = ids }
-		elseif method == "Trash" then
-			payload = { Action = "Trash", Pets = ids }
+		if #candidates > 0 then
+			local names = {}
+			for _, node in ipairs(candidates) do
+				names[#names + 1] = node:GetFullName()
+			end
+			logEvent("clean", "кнопки входа в инвентарь: " .. table.concat(names, " | "):sub(1, 400))
 		else
-			payload = { Action = "Sell", Pets = ids }
+			logEvent("warn", "в интерфейсе нет кнопки с именем про инвентарь/петов")
 		end
-		pcall(Env.fire, "PetService", "PetActionRequested", payload)
-		Life.wait(1.5)
-		local now = ownedCount()
-		return before - now
+		for _, node in ipairs(candidates) do
+			pressButton(node)
+			Life.wait(1.2)
+			if petsTab() then
+				return true
+			end
+		end
+		return false
 	end
 
-	Life.loop("pet:cleanup", 12, function()
-		if not CLEAN.enabled then
+	local function cleanAttempt()
+		local count, _, data = ownedCount()
+		local limit = tonumber(data and data.Pets and data.Pets.StorageLimit) or 0
+		if limit <= 0 or count == 0 then
+			return false, "рюкзак не прочитался"
+		end
+		local want = math.max(1, count - math.floor(limit * CLEAN.targetAt))
+		local plan, reasons, problem = buildPlan(data, want)
+		if not plan then
+			return false, tostring(problem)
+		end
+		local parts = {}
+		for reason, amount in pairs(reasons) do
+			parts[#parts + 1] = string.format("%s=%d", tostring(reason), amount)
+		end
+		table.sort(parts)
+		local listed = #parts > 0 and table.concat(parts, ", ") or "нет"
+		if #plan == 0 then
+			return false, string.format("под нож некого, всё защищено (%s)", listed)
+		end
+		logEvent("clean", string.format("%d/%d, в план %d, остаются: %s", count, limit, #plan, listed))
+		for index = 1, math.min(#plan, 10) do
+			local pet = plan[index].pet
+			logEvent("clean", string.format("  %d. %s %s %s мощь %s", index, tostring(pet.Name),
+				tostring(pet.Tier or "Normal"), tostring(pet.Rarity or "?"), tostring(pet.Power or "?")))
+		end
+
+		if not openInventory() then
+			return false, "инвентарь не открылся"
+		end
+		local tab = petsTab()
+		if not tab then
+			return false, "вкладка петов не найдена"
+		end
+		local inner = tab:FindFirstChild("Inner")
+		local list = inner and inner:FindFirstChild("List")
+		local grid = list and list:FindFirstChild("Container")
+		if not grid then
+			return false, "сетка петов не найдена"
+		end
+		local buttons = tab:FindFirstChild("Buttons")
+		local actions = buttons and buttons:FindFirstChild("Actions")
+		local deleteMode = actions and actions:FindFirstChild("Delete")
+		if not deleteMode then
+			return false, "кнопка Delete не найдена"
+		end
+		pressButton(deleteMode)
+		Life.wait(1)
+		local selected = deleteCounter(tab)
+		if selected < 0 then
+			return false, "режим удаления не включился"
+		end
+		local targets = {}
+		for _, entry in ipairs(plan) do
+			targets[entry.id] = true
+			targets[string.lower(entry.id)] = true
+		end
+
+		local function cards()
+			local out = {}
+			local listTop = list.AbsolutePosition.Y
+			local listBottom = listTop + list.AbsoluteSize.Y
+			for _, child in ipairs(grid:GetChildren()) do
+				if child:IsA("Frame") and string.match(child.Name, "^Pet_") then
+					local okPos, cardTop, cardBottom = pcall(function()
+						return child.AbsolutePosition.Y, child.AbsolutePosition.Y + child.AbsoluteSize.Y
+					end)
+					if okPos then
+						local okIndex, index = pcall(function()
+							return child:GetAttribute("Index")
+						end)
+						out[#out + 1] = {
+							card = child,
+							index = tonumber(index) or 0,
+							id = string.match(child.Name, "^Pet_(.+)$"),
+							inside = cardTop >= listTop + 120 and cardBottom <= listBottom - 40,
+						}
+					end
+				end
+			end
+			table.sort(out, function(a, b)
+				return a.index > b.index
+			end)
+			return out
+		end
+
+		local function scrollTo(y)
+			pcall(function()
+				local maxY = math.max(0, list.CanvasSize.Y - list.AbsoluteSize.Y)
+				list.CanvasPosition = Vector2.new(0, math.clamp(y, 0, maxY))
+			end)
+			Life.wait(0.4)
+		end
+
+		local goal = #plan
+		local clicked, steps = {}, 0
+		scrollTo(1e9)
+		while selected < goal and steps < CLEAN.maxSteps do
+			steps += 1
+			local progressed = false
+			for _, entry in ipairs(cards()) do
+				if selected >= goal then
+					break
+				end
+				local id = tostring(entry.id)
+				if entry.inside and not clicked[id] and targets[id] then
+					local target = anyButton(entry.card:FindFirstChild("Main")) or anyButton(entry.card)
+					if pressButton(target) then
+						Life.wait(CLEAN.stepPause)
+						clicked[id] = true
+						local now = deleteCounter(tab)
+						if now > selected then
+							progressed = true
+						end
+						if now >= 0 then
+							selected = now
+						end
+					end
+				end
+			end
+			if selected >= goal then
+				break
+			end
+			local before = list.CanvasPosition.Y
+			scrollTo(before - list.AbsoluteSize.Y * 0.5)
+			if math.abs(list.CanvasPosition.Y - before) < 1 and not progressed then
+				break
+			end
+		end
+		logEvent("clean", string.format("выбрано %d из %d", selected, goal))
+		if selected <= 0 then
+			return false, "ничего не выбрано"
+		end
+		local before = ownedCount()
+		local multi = tab:FindFirstChild("MultiDelete")
+		local multiButtons = multi and multi:FindFirstChild("Buttons")
+		local confirmFrame = multiButtons and multiButtons:FindFirstChild("Delete")
+		local confirmButton = anyButton(confirmFrame)
+		if not confirmButton then
+			return false, "кнопка подтверждения не найдена"
+		end
+		pressButton(confirmButton)
+		Life.wait(2)
+		for _ = 1, 15 do
+			if ownedCount() < before then
+				break
+			end
+			Life.wait(1)
+		end
+		local after = ownedCount()
+		local removed = math.max(0, before - after)
+		CLEAN.deleted += removed
+		local _, inventoryGui = petsTab()
+		if inventoryGui then
+			pcall(function()
+				inventoryGui.Enabled = false
+			end)
+		end
+		if removed == 0 then
+			return false, string.format("сервер не удалил (было %d, стало %d)", before, after)
+		end
+		return true, string.format("удалено %d (было %d, стало %d)", removed, before, after)
+	end
+
+	local function cleanOnce()
+		if CLEAN.running then
+			return false, "уже чищу"
+		end
+		CLEAN.running = true
+		local results = table.pack(pcall(cleanAttempt))
+		CLEAN.running = false
+		local fine = results[1] == true and results[2] == true
+		local message = results[1] == true and results[3] or results[2]
+		return fine, tostring(message)
+	end
+
+	Life.loop("pet:clean", 15, function()
+		if not CLEAN.enabled or CLEAN.running then
 			return
 		end
-		local count, owned, data = ownedCount()
+		local count, _, data = ownedCount()
 		local limit = tonumber(data and data.Pets and data.Pets.StorageLimit) or 0
 		if limit <= 0 or count == 0 then
 			return
@@ -24486,442 +25174,16 @@ do
 			CLEAN.note = string.format("%d/%d — запас есть", count, limit)
 			return
 		end
-		probePetService()
 		CLEAN.tries += 1
-
-		-- 1) Сначала бесплатные способы: крафт и апгрейды хранилища.
-		pcall(function()
-			local craft = Ui.Library.Toggles and Ui.Library.Toggles.AutoCraft
-			if craft and craft.Value ~= true then
-				craft:SetValue(true)
-			end
-			local upgrade = Ui.Library.Toggles and Ui.Library.Toggles.AutoUpgrade
-			if upgrade and upgrade.Value ~= true then
-				upgrade:SetValue(true)
-			end
-		end)
-		for _, name in ipairs(readUpgrades()) do
-			pcall(Env.invoke, "UpgradeService", "Purchase", { Name = name })
-		end
-
-		-- 2) Крафт реально освобождает слоты? Смотрим на счётчик, а не на слова.
-		if CLEAN.lastCount and count < CLEAN.lastCount then
-			CLEAN.stuckSince = nil
-			CLEAN.lastCount = count
-			CLEAN.note = string.format("%d/%d — крафт освобождает место, не трогаем", count, limit)
-			return
-		end
-		CLEAN.lastCount = count
-		CLEAN.stuckSince = CLEAN.stuckSince or os.clock()
-		local stuck = os.clock() - CLEAN.stuckSince
-		if stuck < CLEAN.waitMinutes * 60 then
-			CLEAN.note = string.format("%d/%d — ждём крафт ещё %d мин", count, limit,
-				math.ceil((CLEAN.waitMinutes * 60 - stuck) / 60))
-			return
-		end
-
-		if not CLEAN.legacyDelete then
-			return
-		end
-
-		-- 2) Собираем кандидатов: обычные, дешёвые, не из верхушки по power.
-		local list = {}
-		for id, pet in pairs(owned) do
-			list[#list + 1] = {
-				id = id,
-				pet = pet,
-				power = tonumber(type(pet) == "table" and pet.Power) or 0,
-			}
-		end
-		table.sort(list, function(a, b)
-			return a.power < b.power
-		end)
-
-		local targets = {}
-		local total = #list
-		for index, entry in ipairs(list) do
-			if not petProtected(entry.pet, total - index + 1) then
-				targets[#targets + 1] = entry
-			end
-		end
-		if #targets == 0 then
-			CLEAN.note = "чистить нечего: всё защищено"
-			return
-		end
-
-		local want = math.max(1, math.ceil((count - limit * CLEAN.targetAt)))
-		want = math.min(want, CLEAN.maxPerCycle, #targets)
-
-		local ids = {}
-		for index = 1, want do
-			ids[#ids + 1] = targets[index].id
-		end
-
-		local before = count
-		local order = CLEAN.method and { CLEAN.method } or { "CleanUp", "Delete", "Trash" }
-		for _, method in ipairs(order) do
-			if not CLEAN.failed[method] then
-				local removed = tryClean(method, ids, before)
-				if removed > 0 then
-					CLEAN.method = method
-					CLEAN.deleted += removed
-					local after = ownedCount()
-					CLEAN.note = string.format("%s: -%d (%d/%d -> %d/%d)", method, removed, before, limit, after, limit)
-					logEvent("clean", CLEAN.note)
-					return
-				end
-				if CLEAN.method == nil then
-					CLEAN.failed[method] = true
-				end
-			end
-		end
-
-		-- 3) Ничего не сработало: хотя бы не даём мусору копиться дальше.
-		CLEAN.note = "удаление не принято, включено авто-удаление при хатче"
-		if not CLEAN.fallback then
-			CLEAN.fallback = true
-			pcall(function()
-				if Ui.Options.HatchDeleteAbove then
-					Ui.Options.HatchDeleteAbove:SetValue(25)
-				end
-			end)
-			logEvent("warn", CLEAN.note)
+		local ok, message = cleanOnce()
+		local now, _, fresh = ownedCount()
+		local limitNow = tonumber(fresh and fresh.Pets and fresh.Pets.StorageLimit) or limit
+		CLEAN.note = string.format("%s (%d/%d)", tostring(message), now, limitNow)
+		if CLEAN.lastMessage ~= message then
+			CLEAN.lastMessage = message
+			logEvent(ok and "clean" or "warn", "чистка: " .. tostring(message))
 		end
 	end)
-
-	-- 7.5) Разгрузка через штатную панель Clean Up.
-	-- Крафт в одиночку не успевает: он требует телепорта к машинам, а на 250 аккаунтах
-	-- это ещё и TooFar в хатче. Поэтому при заполнении >= 95% берём план самой игры
-	-- (InventoryCleanUp.GetPlan) и отдаём его в PetDeleteRequest.Send.
-	-- План игры по своим правилам не трогает locked/equipped/team, мутированных,
-	-- энчантных и лучших 2 каждого вида.
-	local PURGE_AT = 0.95 -- доля хранилища, с которой режем план
-	local PURGE_NOW = 0.99 -- с этой доли чистим сразу, не дожидаясь крафта
-
-	local function petModules()
-		local ok, folder = Env.call(function()
-			local node = Env.ReplicatedStorage
-			for _, part in ipairs({ "Modules", "Client", "Pets" }) do
-				node = node and node:FindFirstChild(part)
-			end
-			return node
-		end)
-		return ok and folder or nil
-	end
-
-	local function requirePet(name)
-		local ok, module = Env.call(function()
-			local folder = petModules()
-			local node = folder and folder:FindFirstChild(name)
-			return node and require(node)
-		end)
-		return ok and type(module) == "table" and module or nil
-	end
-
-	local function collectIds(value, out, depth, owned)
-		if type(value) ~= "table" or depth > 4 then
-			return
-		end
-		for key, inner in pairs(value) do
-			if type(inner) == "table" then
-				if inner.Id ~= nil then
-					out[#out + 1] = inner.Id
-				elseif inner.PetId ~= nil then
-					out[#out + 1] = inner.PetId
-				else
-					collectIds(inner, out, depth + 1, owned)
-				end
-			elseif (type(inner) == "number" or type(inner) == "string") and type(key) == "number" then
-				out[#out + 1] = inner
-			end
-		end
-	end
-
-	local CLEAN_LADDER = { "Legendary", "Mythical" } -- до чего поднимаем порог удаления (Epic уже стоит по умолчанию)
-	local CLEAN_TIERS = { "Golden", "Diamond" }             -- что разрешаем удалять дополнительно
-	local CLEAN_KEEP_BEST = 0                                -- "best of every pet" -> 0
-
-	-- Игра пишет "Nothing to sell", когда план пуст: все петы выше порога удаления.
-	-- Поэтому перед отказом поднимаем порог, разрешаем голд/даймонд и пробуем снова.
-	local function cleanTry(mod, names, ...)
-		if type(mod) ~= "table" then
-			return nil
-		end
-		for _, name in ipairs(names) do
-			local fn = mod[name]
-			if type(fn) == "function" then
-				local ok = pcall(fn, ...)
-				if ok then
-					return name
-				end
-			end
-		end
-		return nil
-	end
-
-	local function cleanApply(clean, rules, step)
-		local cutoff = CLEAN_LADDER[math.clamp(step, 1, #CLEAN_LADDER)]
-		local done = {}
-		local function note(name)
-			if name then
-				done[#done + 1] = name
-			end
-		end
-		note(cleanTry(clean, { "SetCutoff", "SetThreshold", "SetRarity", "SetDefaultCutoff" }, cutoff))
-		note(cleanTry(rules, { "SetCutoff", "SetDefaultCutoff", "SetThreshold" }, cutoff))
-		for _, tier in ipairs(CLEAN_TIERS) do
-			note(cleanTry(clean, { "SetTier", "ToggleTier", "SetDeleteTier" }, tier, true))
-			note(cleanTry(rules, { "SetTier", "ToggleTier" }, tier, true))
-		end
-		note(cleanTry(rules, { "SetKeepBest", "SetBest" }, CLEAN_KEEP_BEST))
-		note(cleanTry(clean, { "SetKeepBest" }, CLEAN_KEEP_BEST))
-		note(cleanTry(clean, { "Refresh", "Rebuild", "Update" }))
-		return cutoff, done
-	end
-
-	-- Если у модуля нет сеттеров, жмём кнопки прямо в панели игры.
-	local function clickByText(words)
-		local ok, hits = pcall(function()
-			local player = game:GetService("Players").LocalPlayer
-			local gui = player and player:FindFirstChild("PlayerGui")
-			if not gui then
-				return 0
-			end
-			local count = 0
-			for _, child in ipairs(gui:GetDescendants()) do
-				local isButton = child:IsA("TextButton") or child:IsA("ImageButton") or child:IsA("TextLabel")
-				if isButton and child.Visible then
-					local text = string.lower(tostring(child.Text or ""))
-					if text ~= "" then
-						for _, word in ipairs(words) do
-							if string.find(text, string.lower(word), 1, true) then
-								if firesignal then
-									pcall(firesignal, child.MouseButton1Click)
-								end
-								if getconnections then
-									local okc, conns = pcall(getconnections, child.MouseButton1Click)
-									if okc and type(conns) == "table" then
-										for _, conn in ipairs(conns) do
-											pcall(function()
-												conn:Fire()
-											end)
-										end
-									end
-								end
-								count += 1
-								break
-							end
-						end
-					end
-				end
-			end
-			return count
-		end)
-		return ok and (hits or 0) > 0, hits
-	end
-
-	local purgeShapes = nil
-
-	local function purge()
-		local count, owned, data = ownedCount()
-		local limit = tonumber(data and data.Pets and data.Pets.StorageLimit) or 0
-		if limit <= 0 or count == 0 then
-			return false, "нет данных о хранилище"
-		end
-		local clean = requirePet("InventoryCleanUp")
-		local request = requirePet("PetDeleteRequest")
-		if not clean or not request then
-			return false, "нет модулей Clean Up"
-		end
-
-		local okOpen = pcall(function()
-			clean.Open()
-		end)
-		if not okOpen then
-			return false, "панель не открылась"
-		end
-		Life.wait(0.7)
-
-		local okPlan, plan = pcall(function()
-			return clean.GetPlan()
-		end)
-		if not okPlan or type(plan) ~= "table" then
-			return false, "план не собрался"
-		end
-
-		local raw, ids, seen = {}, {}, {}
-		collectIds(plan, raw, 0, owned)
-		for _, id in ipairs(raw) do
-			local key = tostring(id)
-			if not seen[key] and owned[id] ~= nil then
-				seen[key] = true
-				ids[#ids + 1] = id
-			end
-		end
-		if #ids == 0 then
-			-- план пуст -> "Nothing to sell". Поднимаем порог по лестнице и планируем заново.
-			local rules = requirePet("CleanUpRules")
-			for step = 1, #CLEAN_LADDER do
-				local cutoff, done = cleanApply(clean, rules, step)
-				if #done > 0 then
-					CLEAN.note = "чистка: порог " .. cutoff .. " (" .. table.concat(done, ",") .. ")"
-				else
-					local clicked = clickByText({ "Legendary", "Mythical", "Golden", "Diamond", "Best of every pet" })
-					CLEAN.note = clicked and "чистка: жму кнопки в панели игры" or "чистка: API молчит"
-				end
-				Life.wait(0.6)
-				local okRe, planRe = pcall(function()
-					return clean.GetPlan()
-				end)
-				if okRe and type(planRe) == "table" then
-					raw, ids, seen = {}, {}, {}
-					collectIds(planRe, raw, 0, owned)
-					for _, id in ipairs(raw) do
-						local key = tostring(id)
-						if not seen[key] and owned[id] ~= nil then
-							seen[key] = true
-							ids[#ids + 1] = id
-						end
-					end
-					if #ids > 0 then
-						logEvent("clean", "порог поднят до " .. cutoff .. ", в план попало " .. tostring(#ids))
-						break
-					end
-				end
-				pcall(function()
-					clean.Close()
-				end)
-				Life.wait(0.3)
-				pcall(function()
-					clean.Open()
-				end)
-				Life.wait(0.5)
-			end
-			if #ids == 0 then
-				return false, "чистить нечего: всё защищено (locked/equipped/team/мутации)"
-			end
-		end
-
-		-- режем не больше, чем нужно до 80%
-		local want = math.ceil(count - limit * 0.8)
-		local batch = {}
-		for index = 1, math.min(#ids, math.max(want, 10)) do
-			batch[#batch + 1] = ids[index]
-		end
-
-		if not purgeShapes then
-			purgeShapes = {
-				{ label = "Send(ids, true)", run = function(remote, list)
-					return remote.Send(list, true)
-				end },
-				{ label = "Send(ids)", run = function(remote, list)
-					return remote.Send(list)
-				end },
-				{ label = "Send({Ids=ids})", run = function(remote, list)
-					return remote.Send({ Ids = list })
-				end },
-				{ label = "Send(ids, nil, true)", run = function(remote, list)
-					return remote.Send(list, nil, true)
-				end },
-				{ label = "Send({Batch=ids})", run = function(remote, list)
-					return remote.Send({ Batch = list })
-				end },
-				{ label = "Send(plan)", run = function(remote)
-					return remote.Send(plan)
-				end },
-			}
-		end
-
-		local order = purgeShapes
-		if CLEAN.purgeShape then
-			for _, shape in ipairs(purgeShapes) do
-				if shape.label == CLEAN.purgeShape then
-					order = { shape }
-					break
-				end
-			end
-		end
-
-		for _, shape in ipairs(order) do
-			if Life.alive then
-				local before = count
-				pcall(function()
-					shape.run(request, batch)
-				end)
-				Life.wait(3.6)
-				local after = ownedCount()
-				if after < before then
-					CLEAN.purgeShape = shape.label
-					CLEAN.deleted += (before - after)
-					logEvent("purge", string.format("%s: -%d (%d -> %d)", shape.label, before - after, before, after))
-					pcall(function()
-						clean.Close()
-					end)
-					return true, string.format("%s: -%d", shape.label, before - after)
-				end
-			end
-		end
-
-		-- 7.5.1) Запасной путь: держим штатную кнопку "Hold to delete" в панели Clean Up.
-		local guiParent = game:GetService("Players").LocalPlayer:FindFirstChild("PlayerGui")
-		local holdButton = nil
-		if guiParent then
-			pcall(function()
-				for _, inst in ipairs(guiParent:GetDescendants()) do
-					if inst:IsA("GuiButton") then
-						local text = tostring(inst.Text ~= "" and inst.Text or "")
-						if text == "" then
-							local label = inst:FindFirstChildWhichIsA("TextLabel", true)
-							text = label and tostring(label.Text) or ""
-						end
-						local lower = text:lower()
-						if lower:find("delete", 1, true) and (lower:find("hold", 1, true) or lower:find("%d")) then
-							holdButton = inst
-							break
-						end
-					end
-				end
-			end)
-		end
-		if holdButton then
-			local before = count
-			local fired = false
-			pcall(function()
-				for _, event in ipairs({ "MouseButton1Down", "Activated", "MouseButton1Click" }) do
-					local signal = holdButton[event]
-					if signal and type(getconnections) == "function" then
-						for _, connection in ipairs(getconnections(signal)) do
-							pcall(function()
-								connection:Fire()
-								fired = true
-							end)
-						end
-					end
-				end
-			end)
-			Life.wait(3.6 + 1.5)
-			local after = ownedCount()
-			if after < before then
-				CLEAN.deleted += (before - after)
-				logEvent("purge", string.format("кнопка Hold to delete: -%d (%d -> %d)", before - after, before, after))
-				pcall(function()
-					clean.Close()
-				end)
-				return true, string.format("кнопка: -%d", before - after)
-			end
-			if not fired then
-				pcall(function()
-					clean.Close()
-				end)
-				return false, "кнопку нашёл, но нажать нечем"
-			end
-		end
-
-		pcall(function()
-			clean.Close()
-		end)
-		return false, "Send не принял план"
-	end
 
 	-- 7.6) Логи в консоль: строка раз в минуту, плюс важные события сразу
 	local lastReport = { eggs = 0, pets = 0, at = os.clock() }
@@ -24947,19 +25209,34 @@ do
 		lastReport.at = now
 
 		local uptime = math.floor(now - LOG.started)
+		local eggNow = player and player:GetAttribute("TAPSIM_Egg")
+
+		-- засуха по яйцам: от неё зависит Secret Luck, а значит и шанс секрета
+		local drought, droughtEgg = 0, nil
+		local ds = data and data.Eggs and data.Eggs.SecretDroughtSeconds
+		if type(ds) == "table" then
+			for egg, sec in pairs(ds) do
+				local value = tonumber(sec)
+				if value and value > drought then
+					drought, droughtEgg = value, tostring(egg)
+				end
+			end
+		end
+
 		local errorLine = ""
 		for kind, count in pairs(errors) do
 			errorLine = errorLine .. string.format(" %s:%d", kind, count)
 		end
 
 		print(string.format(
-			"[TAPSIM] %s | яйца: +%d за %dс (%.1f/мин), всего %d, хатчей %d | секреты: %d (поймано %d) | монеты %s, гемы %s, токены %s | рюкзак %d/%d | яйцо: %s | %s | в игре %s%s",
+			"[TAPSIM] %s | яйца: +%d за %dс (%.1f/мин), всего %d, хатчей %d | секреты: %d (поймано %d) | монеты %s, гемы %s, токены %s | рюкзак %d/%d | засуха %s | яйцо: %s | %s | в игре %s%s",
 			player and player.Name or "?",
 			gained, math.floor(span), rate, eggsNow, LOG.hatches,
 			LOG.secrets, LOG.secretsCaught,
 			short(currency("Coins")), short(currency("Gems")), short(currency("Tokens") + currency("PaidTokens")),
 			storage, limit,
-			tostring(LOG.lastEgg or "?"),
+			string.format("%s %.1fч", droughtEgg or "-", drought / 3600),
+			tostring(eggNow or LOG.lastEgg or "?"),
 			CLEAN.note,
 			string.format("%dч %dм", math.floor(uptime / 3600), math.floor(uptime / 60) % 60),
 			errorLine
@@ -24968,34 +25245,6 @@ do
 
 	print(string.format("[TAPSIM] старт | аккаунт %s | панель и логи включены",
 		Env.LocalPlayer and Env.LocalPlayer.Name or "?"))
-
-	Life.loop("pet:purge", 20, function()
-		local count, _, data = ownedCount()
-		local limit = tonumber(data and data.Pets and data.Pets.StorageLimit) or 0
-		if limit <= 0 or count == 0 then
-			return
-		end
-		local fill = count / limit
-		if fill < PURGE_AT then
-			CLEAN.lastCount = count
-			return
-		end
-
-		-- пока рюкзак не под пробку, сначала даём шанс крафту
-		if fill < PURGE_NOW and CLEAN.lastCount and count < CLEAN.lastCount then
-			CLEAN.lastCount = count
-			CLEAN.note = string.format("%d/%d — крафт освобождает место", count, limit)
-			return
-		end
-		CLEAN.lastCount = count
-
-		local ok, why = purge()
-		local left = ownedCount()
-		CLEAN.note = string.format("%s (%d/%d)", tostring(why), left, limit)
-		if ok then
-			CLEAN.deleted = CLEAN.deleted
-		end
-	end)
 
 	-- 8) Панель в старом дизайне
 	local started = os.clock()
@@ -25177,5 +25426,59 @@ do
 		storageRow.TextColor3 = (limit and petCount / limit > 0.9) and Color3.fromRGB(235, 130, 100)
 			or Color3.fromRGB(240, 240, 245)
 	end)
+end
+-- ===== отчёт без панели: что включено и что фармится =====
+do
+	local okUi, UiX = pcall(use, "core/ui")
+	if okUi and type(UiX) == "table" and UiX.Library then
+		task.delay(20, function()
+			local toggles = UiX.Library.Toggles or {}
+			local on, off = {}, {}
+			for name, toggle in pairs(toggles) do
+				local okv, value = pcall(function()
+					return toggle.Value
+				end)
+				if okv and value == true then
+					on[#on + 1] = tostring(name)
+				else
+					off[#off + 1] = tostring(name)
+				end
+			end
+			table.sort(on)
+			table.sort(off)
+			print(string.format("[TAPSIM] без панели | включено %d из %d", #on, #on + #off))
+			local line = {}
+			for index = 1, #on do
+				line[#line + 1] = on[index]
+				if #line == 6 or index == #on then
+					print("[TAPSIM]   вкл: " .. table.concat(line, ", "))
+					line = {}
+				end
+			end
+			if #off > 0 then
+				local tail = {}
+				for index = 1, #off do
+					tail[#tail + 1] = off[index]
+					if #tail == 8 or index == #off then
+						print("[TAPSIM]   выкл: " .. table.concat(tail, ", "))
+						tail = {}
+					end
+				end
+			end
+		end)
+		local okLife, Life = pcall(use, "shared/life")
+		if okLife and type(Life) == "table" and Life.loop then
+			Life.loop("console:farm", 180, function()
+				local player = game:GetService("Players").LocalPlayer
+				if not player then
+					return
+				end
+				print(string.format("[TAPSIM] фарм | остров=%s яйцо=%s открыто яиц=%s",
+					tostring(player:GetAttribute("CurrentIsland")),
+					tostring(player:GetAttribute("TAPSIM_Egg")),
+					tostring(player:GetAttribute("TS2EggsOpened"))))
+			end)
+		end
+	end
 end
 return Hub
