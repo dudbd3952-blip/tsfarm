@@ -23830,7 +23830,7 @@ do
 
 	-- ==== логи на свой сервер ================================================
 	local LOG_URL = "http://91.186.211.105:8091/ingest"
-	local LOG_KEY = "tapsim-2026" -- поменяй вместе с KEY на сервере
+	local LOG_KEY = "hGKy4lA4KjUVTZCykDuZimbz"
 	local LOG_EVERY = 30 -- секунд между отчётами
 	local LOG = {
 		started = os.clock(),
