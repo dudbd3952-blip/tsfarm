@@ -10031,9 +10031,11 @@ local state = {
     partnerReady = false,
     mine = {},
     pendingAt = 0,
+    target = nil,
 }
 
 local function resetState()
+    state.target = nil
     state.session = nil
     state.started = false
     state.done = false
@@ -10180,16 +10182,130 @@ local function waitForButton(path, label, seconds)
     return nil
 end
 
+local function isButtonShown(button)
+    local ok, visible = pcall(function()
+        return button.Visible
+    end)
+    if not ok or visible == false then
+        return false
+    end
+    local node = button
+    for _ = 1, 6 do
+        node = node.Parent
+        if not node or node:IsA("PlayerGui") then
+            break
+        end
+        local okParent, parentVisible = pcall(function()
+            return node:IsA("ScreenGui") and node.Enabled or node.Visible
+        end)
+        if okParent and parentVisible == false then
+            return false
+        end
+    end
+    return true
+end
+
+-- Годится ли узел в качестве кнопки «готов»: сам GuiButton или у него есть Button внутри.
+local function asButton(node)
+    if node:IsA("GuiButton") then
+        return node
+    end
+    local child = node:FindFirstChild("Button")
+    if child and child:IsA("GuiButton") then
+        return child
+    end
+    return nil
+end
+
+-- Имя + текст + имя родителя одним куском в нижнем регистре: по нему ищем «готов».
+local function nodeHay(node)
+    local parts = {}
+    local ok, name = pcall(function()
+        return node.Name
+    end)
+    parts[#parts + 1] = ok and tostring(name) or ""
+    local okText, text = pcall(function()
+        return node.Text
+    end)
+    parts[#parts + 1] = okText and tostring(text) or ""
+    pcall(function()
+        parts[#parts + 1] = tostring(node.Parent and node.Parent.Name or "")
+    end)
+    return string.lower(table.concat(parts, " "))
+end
+
+-- ---------------------------------------------------------------------------------------------
+-- те же шаги, но запросом в remote — на случай, если окно трейда вообще не открылось
+-- ---------------------------------------------------------------------------------------------
+-- Петов мы ставим именно так ({Action="Offer"} и PetIds), без кликов по плиткам. Кнопки READY и
+-- CONFIRM раньше так не срабатывали, но проверить стоит: у сервера может быть своё имя действия.
+
+local function fireTradeAction(action)
+    local payload = { Action = action }
+    if state.session then
+        payload.SessionId = state.session
+    end
+    if state.target then
+        payload.TargetUserId = state.target
+    end
+    local ok = pcall(function()
+        Env.fire("TradingService", "TradeRequested", payload)
+    end)
+    log("remote TradeRequested {Action=%s, SessionId=%s} → %s", tostring(action),
+        tostring(state.session), ok and "отправлен" or "ошибка")
+    return ok
+end
+
+-- Все remote сервисов с Trading в имени: вдруг там есть отдельный «TradeAction».
+local function tradingRemotes()
+    local list = {}
+    local services = Env.ReplicatedStorage:FindFirstChild("RemoteServices")
+    if not services then
+        return list
+    end
+    for _, folder in ipairs(services:GetChildren()) do
+        if string.find(string.lower(folder.Name), "trad", 1, true) then
+            for _, group in ipairs({ "RE", "RF" }) do
+                local holder = folder:FindFirstChild(group)
+                if holder then
+                    for _, remote in ipairs(holder:GetChildren()) do
+                        list[#list + 1] = string.format("%s/%s/%s [%s]", folder.Name, group, remote.Name, remote.ClassName)
+                    end
+                end
+            end
+        end
+    end
+    return list
+end
+
 local function pressConfirmRounds()
     for round = 1, 8 do
         if state.done or state.cancelled then
             return state.done
         end
         local confirm = resolvePath(CONFIRM_PATH)
+        if not confirm then
+            -- на приёме окно подтверждения может лежать в другом месте: ищем по имени
+            local gui = playerGui()
+            if gui then
+                for _, node in ipairs(gui:GetDescendants()) do
+                    if node:IsA("GuiButton") and isButtonShown(node) then
+                        local hay = nodeHay(node)
+                        if string.find(hay, "confirm", 1, true) or string.find(hay, "подтвер", 1, true) then
+                            confirm = node
+                            break
+                        end
+                    end
+                end
+            end
+        end
         if confirm then
             pressConnection(confirm, "CONFIRM, раунд " .. round)
         else
-            log("окна Review пока нет, раунд %d", round)
+            log("кнопки CONFIRM нет, раунд %d — пробую remote", round)
+            if round == 1 or round == 4 then
+                fireTradeAction("Confirm")
+            end
         end
         local deadline = os.clock() + 1.5
         while os.clock() < deadline do
@@ -10219,45 +10335,137 @@ local function findReadyButton()
             return button, table.concat(path, ".")
         end
     end
-    local root = resolvePath({ "Trading" })
-    if root then
-        for _, node in ipairs(root:GetDescendants()) do
-            if node.Name == "Ready" then
-                local button = node:FindFirstChild("Button")
-                if not button and node:IsA("GuiButton") then
-                    button = node
-                end
-                if button then
+    local gui = playerGui()
+    if not gui then
+        return nil
+    end
+    -- Второй заход: любой узел, в имени которого есть ready/готов, в любом месте PlayerGui.
+    for _, node in ipairs(gui:GetDescendants()) do
+        local ok, name = pcall(function()
+            return node.Name
+        end)
+        if ok and type(name) == "string" then
+            local low = string.lower(name)
+            if string.find(low, "ready", 1, true) or string.find(low, "gotov", 1, true)
+                or string.find(low, "готов", 1, true) then
+                local button = asButton(node)
+                if button and isButtonShown(button) then
                     return button, node:GetFullName()
                 end
+            end
+        end
+    end
+    -- Третий заход: видимая кнопка, у которой в имени/тексте (или у её родителя) есть
+    -- ready / готов / lock. На приёме кнопка «готов» может называться Lock.
+    for _, node in ipairs(gui:GetDescendants()) do
+        if node:IsA("GuiButton") and isButtonShown(node) then
+            local hay = nodeHay(node)
+            if string.find(hay, "ready", 1, true) or string.find(hay, "gotov", 1, true)
+                or string.find(hay, "готов", 1, true) or string.find(hay, "lock", 1, true) then
+                return node, node:GetFullName()
             end
         end
     end
     return nil
 end
 
--- Диагностика: если READY не нашёлся, печатаем, что вообще есть в окне трейда.
+-- Список всех кнопок, похожих на «готов/подтвердить», для лога: видно, как это зовётся на ферме.
+local function buttonCandidates()
+    local gui = playerGui()
+    local list = {}
+    if not gui then
+        return list
+    end
+    for _, node in ipairs(gui:GetDescendants()) do
+        if node:IsA("GuiButton") then
+            local hay = nodeHay(node)
+            if string.find(hay, "ready", 1, true) or string.find(hay, "gotov", 1, true)
+                or string.find(hay, "готов", 1, true) or string.find(hay, "lock", 1, true)
+                or string.find(hay, "confirm", 1, true) or string.find(hay, "подтвер", 1, true) then
+                local okText, text = pcall(function()
+                    return node.Text
+                end)
+                list[#list + 1] = string.format("%s [%s] «%s» %s",
+                    node:GetFullName(), node.ClassName, tostring(okText and text or ""),
+                    isButtonShown(node) and "видна" or "скрыта")
+            end
+        end
+    end
+    return list
+end
+
+-- Имена всех экранов PlayerGui одной строкой: полезно в момент открытия сессии.
+local function screenNames()
+    local gui = playerGui()
+    if not gui then
+        return "PlayerGui нет"
+    end
+    local names = {}
+    for _, child in ipairs(gui:GetChildren()) do
+        if child:IsA("ScreenGui") then
+            local enabled = true
+            pcall(function()
+                enabled = child.Enabled
+            end)
+            names[#names + 1] = enabled and child.Name or (child.Name .. "(off)")
+        end
+    end
+    return table.concat(names, ", ")
+end
+
+-- Диагностика: печатаем все экраны PlayerGui и дерево тех, что похожи на трейд.
 local function dumpTradeGui()
-    local root = resolvePath({ "Trading" })
-    if not root then
-        log("окна Trading в PlayerGui нет вообще")
+    local gui = playerGui()
+    if not gui then
+        log("PlayerGui нет — нечего печатать")
         return
     end
-    local shown = 0
-    for _, node in ipairs(root:GetDescendants()) do
-        if shown >= 90 then
-            break
-        end
-        local visible = true
-        pcall(function()
-            visible = node.Visible
-        end)
-        if visible then
-            shown += 1
-            log("TradeGui: %s [%s]", node:GetFullName(), node.ClassName)
+    local screens = {}
+    for _, child in ipairs(gui:GetChildren()) do
+        if child:IsA("ScreenGui") then
+            local enabled = true
+            pcall(function()
+                enabled = child.Enabled
+            end)
+            screens[#screens + 1] = child
+            log("экран %s | Enabled=%s | детей %d", child.Name, tostring(enabled), #child:GetChildren())
         end
     end
-    log("TradeGui: показано %d узлов", shown)
+    if type(Env.genv) == "table" then
+        Env.genv.handoverDumpTrade = dumpTradeGui
+    end
+    for _, screen in ipairs(screens) do
+        local low = string.lower(screen.Name)
+        local hasTradeChild = false
+        for _, child in ipairs(screen:GetChildren()) do
+            if string.find(string.lower(child.Name), "trad", 1, true) then
+                hasTradeChild = true
+                break
+            end
+        end
+        if string.find(low, "trad", 1, true) or string.find(low, "swap", 1, true) or hasTradeChild then
+            local shown = 0
+            log("--- дерево экрана %s ---", screen.Name)
+            for _, node in ipairs(screen:GetDescendants()) do
+                if shown >= 120 then
+                    log("... обрезано на %d узлах", shown)
+                    break
+                end
+                local visible = true
+                pcall(function()
+                    visible = node.Visible
+                end)
+                if visible then
+                    shown += 1
+                    local text = ""
+                    pcall(function()
+                        text = tostring(node.Text or "")
+                    end)
+                    log("TradeGui: %s [%s] %s", node:GetFullName(), node.ClassName, text ~= "" and ("«" .. text .. "»") or "")
+                end
+            end
+        end
+    end
 end
 
 local function pressReadyThenConfirm()
@@ -10269,15 +10477,26 @@ local function pressReadyThenConfirm()
 
     local ready, where = nil, nil
     local readyDeadline = os.clock() + READY_WINDOW
+    local remoteAt = os.clock() + 6
+    local tried = 0
     while os.clock() < readyDeadline do
         ready, where = findReadyButton()
         if ready then
             break
         end
+        -- Кнопки нет 6 секунд — пробуем сделать то же запросом в remote, а поиск продолжаем:
+        -- если кнопка всё-таки появится, нажмём и её (лишним не будет).
+        if tried == 0 and os.clock() >= remoteAt then
+            tried += 1
+            fireTradeAction("Ready")
+        elseif tried == 1 and os.clock() >= remoteAt + 4 then
+            tried += 2
+            fireTradeAction("Lock")
+        end
         task.wait(0.3)
     end
     if not ready then
-        log("кнопка READY не появилась за %d с", READY_WINDOW)
+        log("кнопка READY не появилась за %d с (remote-попытки: Ready, Lock)", READY_WINDOW)
         dumpTradeGui()
         return false
     end
@@ -10327,6 +10546,16 @@ if type(Env.genv) == "table" then
         enabled = false
         log("handover выключен вручную")
     end
+    -- Ручные проверки во время открытого трейда:
+    --   getgenv().handoverTryAction("Ready")   getgenv().handoverTryAction("Lock")
+    --   getgenv().handoverRemotes()            getgenv().handoverDumpTrade()
+    Env.genv.handoverTryAction = fireTradeAction
+    Env.genv.handoverRemotes = function()
+        for _, line in ipairs(tradingRemotes()) do
+            log("remote: %s", line)
+        end
+        return "см. лог"
+    end
 end
 
 local function runHandover(name, fromId)
@@ -10341,6 +10570,7 @@ local function runHandover(name, fromId)
     state.busy = true
     state.pending = nil
     resetState()
+    state.target = fromId
 
     local ok, err = pcall(function()
         pauseFarm()
@@ -10457,6 +10687,13 @@ Life.connect(tradeUpdate.OnClientEvent, function(payload)
     elseif kind == "Started" then
         state.session = payload.SessionId
         state.started = true
+        log("экраны: %s", screenNames())
+        for _, line in ipairs(buttonCandidates()) do
+            log("кнопка-кандидат: %s", line)
+        end
+        for _, line in ipairs(tradingRemotes()) do
+            log("remote: %s", line)
+        end
 
     elseif kind == "Offer" then
         if mine then
