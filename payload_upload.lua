@@ -9720,7 +9720,9 @@ local TAKE_RARITY = { "Godly", "Secret" }
 local MAX_PETS = 12
 local ACCEPT_WINDOW = 35        -- seconds to wait for the session after pressing Accept
                                 -- (игрок может 10+ с держать карточку «Hold to Reveal» сам)
-local READY_DELAY = 4.5         -- pause before READY, as the owner described for the bank
+local READY_DELAY = 3           -- пауза перед READY (по просьбе: ровно 3 секунды)
+local LOCK_WINDOW = 25          -- сколько после своего READY ждём отметку банка (Lock) перед CONFIRM
+local READY_WINDOW = 20         -- сколько ищем саму кнопку READY
 local POLL_SECONDS = 2          -- how often a pending request is looked for
 
 local tab = Ui.Tabs.Home
@@ -10200,16 +10202,90 @@ local function pressConfirmRounds()
     return state.done
 end
 
+-- Кнопка READY на стороне получателя может лежать по другому пути, чем на стороне банка,
+-- поэтому пробуем несколько вариантов и, в крайнем случае, ищем узел с именем Ready.
+local READY_ALTERNATIVES = {
+    READY_PATH,
+    { "Trading", "Trading", "Actions", "Ready", "Button" },
+    { "Trading", "Actions", "Ready", "Button" },
+    { "Trading", "Trading", "Build", "Ready", "Button" },
+    { "Trading", "Trading", "Build", "Actions", "Ready" },
+}
+
+local function findReadyButton()
+    for _, path in ipairs(READY_ALTERNATIVES) do
+        local button = resolvePath(path)
+        if button then
+            return button, table.concat(path, ".")
+        end
+    end
+    local root = resolvePath({ "Trading" })
+    if root then
+        for _, node in ipairs(root:GetDescendants()) do
+            if node.Name == "Ready" then
+                local button = node:FindFirstChild("Button")
+                if not button and node:IsA("GuiButton") then
+                    button = node
+                end
+                if button then
+                    return button, node:GetFullName()
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- Диагностика: если READY не нашёлся, печатаем, что вообще есть в окне трейда.
+local function dumpTradeGui()
+    local root = resolvePath({ "Trading" })
+    if not root then
+        log("окна Trading в PlayerGui нет вообще")
+        return
+    end
+    local shown = 0
+    for _, node in ipairs(root:GetDescendants()) do
+        if shown >= 90 then
+            break
+        end
+        local visible = true
+        pcall(function()
+            visible = node.Visible
+        end)
+        if visible then
+            shown += 1
+            log("TradeGui: %s [%s]", node:GetFullName(), node.ClassName)
+        end
+    end
+    log("TradeGui: показано %d узлов", shown)
+end
+
 local function pressReadyThenConfirm()
+    -- Порядок такой: ферма положила петов -> 3 секунды -> READY, и подтверждает именно ферма
+    -- первой. Банк после этого видит нашу отметку (Lock) и подтверждает уже сам. Ждать Lock
+    -- перед своим READY нельзя: тогда обе стороны ждут друг друга и сделка стоит.
+    log("петов добавил — жду %s с и жму READY первым", tostring(READY_DELAY))
     Life.wait(READY_DELAY)
-    local ready = waitForButton(READY_PATH, "READY", 15)
+
+    local ready, where = nil, nil
+    local readyDeadline = os.clock() + READY_WINDOW
+    while os.clock() < readyDeadline do
+        ready, where = findReadyButton()
+        if ready then
+            break
+        end
+        task.wait(0.3)
+    end
     if not ready then
+        log("кнопка READY не появилась за %d с", READY_WINDOW)
+        dumpTradeGui()
         return false
     end
+    log("READY найден: %s", tostring(where))
     if pressConnection(ready, "READY") == 0 then
         return false
     end
-    local limit = os.clock() + 25
+    local limit = os.clock() + LOCK_WINDOW
     while os.clock() < limit do
         if state.done or state.cancelled or state.partnerReady then
             break
