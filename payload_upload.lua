@@ -4,6 +4,8 @@
 -- Изменено: панель, логи в консоль и на сервер, разгрузка рюкзака, автоудалёнт 50%, вебхук.
 -- Slopix Hub (Tap Simulator), built 2026-10-30 14:22 UTC by build.py. Edit the files in src/, not this one.
 local __modules, __cache, __loading = {}, {}, {}
+-- Без интерфейса: панель не создаётся вообще. Всё остальное работает как обычно.
+local __NO_GUI = true
 local function use(name)
     local cached = __cache[name]
     if cached ~= nil then
@@ -9728,6 +9730,13 @@ local box = tab:AddGroupbox({ Side = "Right", Name = "Handover", IconName = "pac
 box:AddToggle("Handover", {
     Text = "Отдавать секретов и Godly банку",
     Default = true,
+    Callback = function(state)
+        -- the switch keeps its own flag: the hub window is torn down by this build,
+        -- and a toggle that no longer exists must not silently switch the module off
+        if Env.genv then
+            Env.genv.__handoverEnabled = state
+        end
+    end,
     Tooltip = "Ждёт трейд от банка: пауза фарма, снятие петов с команды, приём, оффер, READY и CONFIRM. После сделки возвращает лучших петов и продолжает фарм.",
 })
 local statusLabel = box:AddLabel("Handover: ждём запрос от банка", true)
@@ -10217,13 +10226,26 @@ end
 -- the whole handover
 -- ---------------------------------------------------------------------------------------------
 
+-- Отдельный флаг, а не тумблер панели: в этой сборке окно хаба гасится
+-- (killHubGui), и пропавший тумблер раньше молча выключал весь модуль.
+if type(Env.genv) == "table" and Env.genv.__handoverEnabled == nil then
+    Env.genv.__handoverEnabled = true
+end
+
+local function moduleEnabled()
+    if type(Env.genv) == "table" and Env.genv.__handoverEnabled == false then
+        return false
+    end
+    return true
+end
+
 local function runHandover(name, fromId)
     if state.busy then
         log("уже в сделке — пропускаю")
         return
     end
-    if not Ui.on("Handover") then
-        log("модуль выключен в панели — трейд не отвечаю")
+    if not moduleEnabled() then
+        log("handover выключен — трейд не отвечаю (getgenv().__handoverEnabled = true)")
         return
     end
     state.busy = true
@@ -10284,9 +10306,33 @@ Life.connect(tradeUpdate.OnClientEvent, function(payload)
     end
     local kind = tostring(payload.Type)
     local mine = payload.UserId == Env.LocalPlayer.UserId
+    if kind ~= "Offer" then
+        -- тихая телеметрия: по ней видно, дошёл ли трейд до фермы вообще
+        log("TradeUpdate: %s", kind)
+    end
 
     if kind == "Request" then
         local name, fromId = payload.FromName, tonumber(payload.FromUserId)
+        if not fromId and type(name) == "string" and name ~= "" then
+            pcall(function()
+                local found = Env.Players and Env.Players:FindFirstChild(name)
+                if found then
+                    fromId = found.UserId
+                end
+            end)
+        end
+        if not name and fromId then
+            pcall(function()
+                local found = Env.Players and Env.Players:GetPlayerByUserId(fromId)
+                if found then
+                    name = found.Name
+                end
+            end)
+        end
+        if not name and not fromId then
+            log("пришёл Request без отправителя — не трогаю")
+            return
+        end
         if not senderAllowed(name, fromId) then
             log("запрос от %s — это не банк, отказ", tostring(name))
             local decline = resolvePath(DECLINE_PATH)
@@ -10337,39 +10383,57 @@ end, "handover:trade")
 
 -- Safety net for a request that arrived before this module was loaded, or while the hub was
 -- busy: the request window stays on screen until it is answered.
-local function requestWindowOpen()
+-- Окно Tabs.TradeQuest висит постоянно и видимо всегда, поэтому смотреть надо
+-- не на него, а на надпись с именем отправителя: она появляется только тогда,
+-- когда запрос реально пришёл.
+local function requestSender()
     local gui = playerGui()
     local tabs = gui and gui:FindFirstChild("Tabs")
     local quest = tabs and tabs:FindFirstChild("TradeQuest")
     if not quest then
-        return false
+        return nil
     end
-    local visible = true
-    pcall(function()
-        visible = quest.Visible
-    end)
-    return visible == true
-end
-
-function checkPanelNowResponse()
-    if state.busy or not requestWindowOpen() then
-        setStatus("окна запроса нет")
-        return
-    end
-    local quest = playerGui():FindFirstChild("Tabs"):FindFirstChild("TradeQuest")
     local sent = quest:FindFirstChild("PlayerSent")
     local text = ""
     pcall(function()
         text = tostring(sent and sent.Text or "")
     end)
-    log("окно запроса на экране: %s", text)
-    local name = string.match(text, "^(%S+)")
-    if name and senderAllowed(name, nil) then
+    text = text:gsub("\n", " ")
+    if text == "" then
+        return nil
+    end
+    local lowered = string.lower(text)
+    if not string.find(lowered, "sent", 1, true)
+        and not string.find(lowered, "запрос", 1, true) then
+        return nil
+    end
+    return string.match(text, "^(%S+)"), text
+end
+
+local lastPanelNote = ""
+
+function checkPanelNowResponse()
+    if state.busy then
+        return
+    end
+    local name, text = requestSender()
+    if not name then
+        if lastPanelNote ~= "none" then
+            lastPanelNote = "none"
+            setStatus("ждём запрос от банка")
+        end
+        return
+    end
+    if lastPanelNote ~= text then
+        lastPanelNote = text
+        log("на экране запрос: %s", text)
+    end
+    if senderAllowed(name, nil) then
         task.spawn(function()
             runHandover(name, nil)
         end)
     else
-        setStatus("запрос не от банка")
+        setStatus("запрос не от банка: " .. name)
     end
 end
 
@@ -10377,18 +10441,23 @@ Life.loop("handover:poll", POLL_SECONDS, function()
     if state.busy then
         return
     end
-    -- the request window stays on screen until it is answered, so this catches a request
-    -- that arrived before the module was loaded or while the hub was busy
-    if requestWindowOpen() then
-        checkPanelNowResponse()
-    elseif state.pending then
+    -- страховка на случай, если событие TradeUpdate не дошло: смотрим надпись с ником
+    if state.pending and os.clock() - state.pendingAt > 8 then
+        local pending = state.pending
         state.pending = nil
+        task.spawn(function()
+            runHandover(pending.name, pending.id)
+        end)
+        return
     end
+    checkPanelNowResponse()
 end)
 
 setStatus("ждём запрос от банка")
+log("модуль готов: включён=%s, жду трейд от %s", tostring(moduleEnabled()), tostring(BANK_NAMES[1]))
 return {}
 end
+
 
 __modules["main"] = function(use) -- src/games/tapsim/main.luau
 -- Entry point. Core first, then features in tab order, then settings (autoload last).
@@ -13094,6 +13163,9 @@ Instance.Parent = PlayerGui
 end
 end
 local function ParentUI(UI: Instance, SkipHiddenUI: boolean?)
+if __NO_GUI then
+return
+end
 if SkipHiddenUI then
 SafeParentUI(UI, CoreGui)
 return
@@ -26107,5 +26179,59 @@ do
 		storageRow.TextColor3 = (limit and petCount / limit > 0.9) and Color3.fromRGB(235, 130, 100)
 			or Color3.fromRGB(240, 240, 245)
 	end)
+end
+-- ===== отчёт без панели: что включено и что фармится =====
+do
+	local okUi, UiX = pcall(use, "core/ui")
+	if okUi and type(UiX) == "table" and UiX.Library then
+		task.delay(20, function()
+			local toggles = UiX.Library.Toggles or {}
+			local on, off = {}, {}
+			for name, toggle in pairs(toggles) do
+				local okv, value = pcall(function()
+					return toggle.Value
+				end)
+				if okv and value == true then
+					on[#on + 1] = tostring(name)
+				else
+					off[#off + 1] = tostring(name)
+				end
+			end
+			table.sort(on)
+			table.sort(off)
+			print(string.format("[TAPSIM] без панели | включено %d из %d", #on, #on + #off))
+			local line = {}
+			for index = 1, #on do
+				line[#line + 1] = on[index]
+				if #line == 6 or index == #on then
+					print("[TAPSIM]   вкл: " .. table.concat(line, ", "))
+					line = {}
+				end
+			end
+			if #off > 0 then
+				local tail = {}
+				for index = 1, #off do
+					tail[#tail + 1] = off[index]
+					if #tail == 8 or index == #off then
+						print("[TAPSIM]   выкл: " .. table.concat(tail, ", "))
+						tail = {}
+					end
+				end
+			end
+		end)
+		local okLife, Life = pcall(use, "shared/life")
+		if okLife and type(Life) == "table" and Life.loop then
+			Life.loop("console:farm", 180, function()
+				local player = game:GetService("Players").LocalPlayer
+				if not player then
+					return
+				end
+				print(string.format("[TAPSIM] фарм | остров=%s яйцо=%s открыто яиц=%s",
+					tostring(player:GetAttribute("CurrentIsland")),
+					tostring(player:GetAttribute("TAPSIM_Egg")),
+					tostring(player:GetAttribute("TS2EggsOpened"))))
+			end)
+		end
+	end
 end
 return Hub
