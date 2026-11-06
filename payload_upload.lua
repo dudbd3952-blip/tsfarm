@@ -9832,6 +9832,198 @@ local READY_PATH = { "Trading", "Trading", "Build", "Actions", "Ready", "Button"
 local CONFIRM_PATH = { "Trading", "Trading", "Review", "Confirm", "Button" }
 
 -- ---------------------------------------------------------------------------------------------
+-- «Hold to Reveal»: карточка после выпадения секрета
+-- ---------------------------------------------------------------------------------------------
+-- После секрета игра показывает карточку «Hold to Reveal!» и ждёт, пока игрок зажмёт кнопку.
+-- Пока карточка на экране, окно запроса на трейд под ней не видно и не нажимается, поэтому
+-- её надо закрывать самим и как можно быстрее. Ищем надпись, а не путь: имя узла неизвестно.
+
+local REVEAL_WORDS = { "hold to reveal", "hold to open", "зажми", "удерживай" }
+local REVEAL_HOLD = 1.2 -- сколько держим кнопку, секунды
+
+local revealLabel = nil
+local revealBusy = false
+
+local function isShown(node)
+    local ok, shown = pcall(function()
+        if node:IsA("ScreenGui") then
+            return node.Enabled and node.Visible ~= false
+        end
+        return node.Visible ~= false
+    end)
+    return ok and shown == true
+end
+
+local function labelMatches(text)
+    if type(text) ~= "string" or text == "" then
+        return false
+    end
+    local low = string.lower(text)
+    for _, word in ipairs(REVEAL_WORDS) do
+        if string.find(low, word, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+local function textOf(node)
+    local ok, text = pcall(function()
+        return node.Text
+    end)
+    return ok and text or nil
+end
+
+local function findRevealLabel()
+    if revealLabel and revealLabel.Parent and labelMatches(textOf(revealLabel)) and isShown(revealLabel) then
+        return revealLabel
+    end
+    revealLabel = nil
+    local gui = playerGui()
+    if not gui then
+        return nil
+    end
+    local queue, head, seen = {}, 1, 0
+    for _, child in ipairs(gui:GetChildren()) do
+        if child:IsA("ScreenGui") and isShown(child) then
+            queue[#queue + 1] = child
+        end
+    end
+    while head <= #queue and seen < 8000 do
+        local node = queue[head]
+        head += 1
+        seen += 1
+        if labelMatches(textOf(node)) then
+            revealLabel = node
+            return node
+        end
+        if not node:IsA("GuiObject") or isShown(node) then
+            for _, child in ipairs(node:GetChildren()) do
+                if child:IsA("GuiObject") then
+                    queue[#queue + 1] = child
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- Чем зажимать: ближайшая кнопка-родитель надписи, иначе кнопка рядом, иначе сама надпись.
+local function revealTarget(label)
+    local node = label
+    for _ = 1, 6 do
+        local parent = node.Parent
+        if not parent or parent:IsA("ScreenGui") or parent:IsA("PlayerGui") then
+            break
+        end
+        node = parent
+        if node:IsA("GuiButton") then
+            return node, "кнопка над надписью"
+        end
+    end
+    node = label
+    for _ = 1, 3 do
+        node = node.Parent
+        if not node or node:IsA("ScreenGui") then
+            break
+        end
+        for _, child in ipairs(node:GetDescendants()) do
+            if child:IsA("GuiButton") and isShown(child) then
+                return child, "кнопка рядом"
+            end
+        end
+    end
+    return label, "сама надпись"
+end
+
+local function fireConnections(button, signalName)
+    local getconnections = (Env.genv or {}).getconnections
+    if type(getconnections) ~= "function" then
+        return 0
+    end
+    local okSignal, signal = pcall(function()
+        return button[signalName]
+    end)
+    if not okSignal or not signal then
+        return 0
+    end
+    local okList, list = pcall(getconnections, signal)
+    if not okList or type(list) ~= "table" then
+        return 0
+    end
+    local fired = 0
+    for _, connection in ipairs(list) do
+        local hasFire = pcall(function()
+            return connection.Fire
+        end)
+        if connection.Enabled ~= false and hasFire and pcall(connection.Fire) then
+            fired += 1
+        end
+    end
+    return fired
+end
+
+-- Зажимаем двумя способами сразу: обработчики кнопки (MouseButton1Down/Up) и настоящее
+-- нажатие мышью через VirtualInputManager — у «держи» бывает и тот, и другой вариант.
+local function holdTarget(target, seconds)
+    Env.elevate()
+    local handlers = fireConnections(target, "MouseButton1Down")
+    local vim, x, y = nil, 0, 0
+    pcall(function()
+        local pos = target.AbsolutePosition + target.AbsoluteSize * 0.5
+        x, y = math.floor(pos.X), math.floor(pos.Y)
+        vim = game:GetService("VirtualInputManager")
+    end)
+    if vim then
+        pcall(function()
+            vim:SendMouseButtonEvent(x, y, 0, true, game, 1)
+        end)
+    end
+    if handlers == 0 and not vim then
+        return false
+    end
+    Life.wait(seconds)
+    if vim then
+        pcall(function()
+            vim:SendMouseButtonEvent(x, y, 0, false, game, 1)
+        end)
+    end
+    fireConnections(target, "MouseButton1Up")
+    Env.elevate()
+    return true
+end
+
+local function clearReveal(why)
+    if revealBusy then
+        return false
+    end
+    revealBusy = true
+    local held = 0
+    for _ = 1, 3 do
+        local label = findRevealLabel()
+        if not label then
+            break
+        end
+        local target, kind = revealTarget(label)
+        log("reveal: зажимаю %s (%s), повод: %s", kind, tostring(target:GetFullName()), tostring(why))
+        if not holdTarget(target, REVEAL_HOLD) then
+            break
+        end
+        held += 1
+        Life.wait(0.7)
+    end
+    revealBusy = false
+    if held > 0 then
+        log("reveal: карточка закрыта (подходов %d)", held)
+    end
+    return held > 0
+end
+
+Life.loop("handover:reveal", 1.5, function()
+    clearReveal("проверка")
+end)
+
+-- ---------------------------------------------------------------------------------------------
 -- pets
 -- ---------------------------------------------------------------------------------------------
 
@@ -10256,6 +10448,9 @@ local function runHandover(name, fromId)
         pauseFarm()
         log("запрос от %s (id=%s)", tostring(name), tostring(fromId))
 
+        -- карточка «Hold to Reveal» может висеть поверх окна запроса: убираем её до Accept
+        clearReveal("пришёл запрос")
+
         unequipValuables()
 
         local accept = resolvePath(ACCEPT_PATH)
@@ -10264,7 +10459,19 @@ local function runHandover(name, fromId)
         end
 
         local deadline = os.clock() + ACCEPT_WINDOW
+        local nextReveal, nextAccept, presses = 0, os.clock() + 2.5, 1
         while os.clock() < deadline and not state.started do
+            if os.clock() >= nextReveal then
+                nextReveal = os.clock() + 1
+                clearReveal("ждём открытия сессии")
+            end
+            if os.clock() >= nextAccept and presses < 5 and not state.started then
+                nextAccept = os.clock() + 2.5
+                local button = resolvePath(ACCEPT_PATH)
+                if button then
+                    presses += pressConnection(button, "ACCEPT ещё раз")
+                end
+            end
             task.wait(0.2)
         end
         if not state.started then
