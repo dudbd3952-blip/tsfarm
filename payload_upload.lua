@@ -9736,6 +9736,7 @@ local READY_DELAY = 1.5         -- пауза после оффера перед
 local CONFIRM_WINDOW = 45       -- сколько ждём, пока оживёт CONFIRM
 local CONFIRM_ROUNDS = 12       -- максимум раундов, если стадия Confirm всё не приходит
 local CONFIRM_ROUND_WAIT = 1.5  -- пауза между раундами
+local CONFIRM_DELAY = 6         -- пауза перед ПЕРВЫМ нажатием CONFIRM (по просьбе: 6 секунд)
 local ACCEPT_TIMEOUT = 25       -- сколько ждём открытия сессии после Accept
 local TRADE_TIMEOUT = 150       -- сколько всего ждём завершения сделки
 local SECRET_WORD = "secret"    -- сравнение по подстроке: в живых данных пишется «Secret II»
@@ -10313,6 +10314,19 @@ local function readyThenConfirm()
     else
         log("Review за %d с не пришёл — жму CONFIRM всё равно", CONFIRM_WINDOW)
     end
+
+    -- Пауза перед первым нажатием CONFIRM: шаг открывается после Review, а окно подтверждения
+    -- у игры успевает доехать не сразу. Ждём ровно CONFIRM_DELAY секунд.
+    local pauseUntil = os.clock() + CONFIRM_DELAY
+    log("пауза %.0f с перед CONFIRM…", CONFIRM_DELAY)
+    while os.clock() < pauseUntil and not traded do
+        task.wait(0.2)
+    end
+    if traded then
+        log("сделка закрылась во время паузы перед CONFIRM")
+        return true
+    end
+
     return pressConfirmRounds()
 end
 
