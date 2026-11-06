@@ -9737,7 +9737,7 @@ local tab = Ui.Tabs.Home
 local box = tab:AddGroupbox({ Side = "Right", Name = "Handover", IconName = "package" })
 
 box:AddToggle("Handover", {
-    Text = "Отдавать секретов и Godly банку",
+    Text = "Отдавать секретов банку (Godly не трогаем)",
     Default = true,
     -- Без Callback: pauseFarm() зовёт Ui.stopAll(false), тот выставляет ВСЕ тумблеры в false,
     -- и колбэк тут же гасил флаг модуля — после первой же сделки handover «выключался сам».
@@ -26439,6 +26439,13 @@ do
 			and pet.Rarity:lower():find("secret", 1, true) ~= nil
 	end
 
+	-- Godly — отдельная редкость выше секретов. В вебхук такие петы не идут вообще
+	-- (у них часто 30M power, и раньше они пролезали по порогу POWER_THRESHOLD).
+	local function isGodly(pet)
+		return type(pet) == "table" and type(pet.Rarity) == "string"
+			and pet.Rarity:lower():find("godly", 1, true) ~= nil
+	end
+
 	local function powerOf(pet, powers, id)
 		if powers then
 			local value = tonumber(powers[id])
@@ -26492,7 +26499,7 @@ do
 				seen[key] = true
 				if firstScanDone then
 					local power = powerOf(pet, powers, id)
-					if secret or (NOTIFY_POWER_PETS and power and power > POWER_THRESHOLD) then
+					if not isGodly(pet) and (secret or (NOTIFY_POWER_PETS and power and power > POWER_THRESHOLD)) then
 						local name = type(pet) == "table" and tostring(pet.Name or "?") or "?"
 						local price = priceOf(name)
 						local lines = {
