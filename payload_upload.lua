@@ -9718,7 +9718,8 @@ local BANK_NAMES = { "Riglafsma" }
 local BANK_IDS = { 11747325739 }
 local TAKE_RARITY = { "Godly", "Secret" }
 local MAX_PETS = 12
-local ACCEPT_WINDOW = 20        -- seconds to wait for the session after pressing Accept
+local ACCEPT_WINDOW = 35        -- seconds to wait for the session after pressing Accept
+                                -- (игрок может 10+ с держать карточку «Hold to Reveal» сам)
 local READY_DELAY = 4.5         -- pause before READY, as the owner described for the bank
 local POLL_SECONDS = 2          -- how often a pending request is looked for
 
@@ -9728,6 +9729,8 @@ local box = tab:AddGroupbox({ Side = "Right", Name = "Handover", IconName = "pac
 box:AddToggle("Handover", {
     Text = "Отдавать секретов и Godly банку",
     Default = true,
+    -- Без Callback: pauseFarm() зовёт Ui.stopAll(false), тот выставляет ВСЕ тумблеры в false,
+    -- и колбэк тут же гасил флаг модуля — после первой же сделки handover «выключался сам».
     Tooltip = "Ждёт трейд от банка: пауза фарма, снятие петов с команды, приём, оффер, READY и CONFIRM. После сделки возвращает лучших петов и продолжает фарм.",
 })
 local statusLabel = box:AddLabel("Handover: ждём запрос от банка", true)
@@ -9739,9 +9742,13 @@ box:AddButton({
     end,
 })
 
+-- Метка сборки в каждой строке: по ней видно, какой именно экземпляр печатает в консоль.
+-- Старый запущенный payload печатает "[handover]" без метки — так ловится двойная инъекция.
+local BUILD = "v11"
+
 local function log(fmt, ...)
     local ok, text = pcall(string.format, fmt, ...)
-    print("[handover] " .. (ok and text or tostring(fmt)))
+    print("[handover " .. BUILD .. "] " .. (ok and text or tostring(fmt)))
 end
 
 local function setStatus(text)
@@ -10217,13 +10224,42 @@ end
 -- the whole handover
 -- ---------------------------------------------------------------------------------------------
 
+-- Отдельный флаг, а не тумблер панели: в этой сборке окно хаба гасится
+-- (killHubGui), и пропавший тумблер раньше молча выключал весь модуль.
+-- Включённость модуля — ЛОКАЛЬНАЯ переменная, а не что-то в getgenv(): getgenv общий на всю
+-- сессию, и любой другой запущенный экземпляр скрипта мог выставить там false и тем самым
+-- выключить этот. Снаружи теперь только функции:
+--   getgenv().handoverDisable()   getgenv().handoverEnable()
+local enabled = true
+
+local function moduleEnabled()
+    return enabled
+end
+
+if type(Env.genv) == "table" then
+    if Env.genv.__handoverBuild == BUILD then
+        log("ВНИМАНИЕ: payload уже запускался в этой сессии — старый экземпляр может быть ещё жив,")
+        log("тогда на один трейд отвечают двое. Надёжно: выйти из игры, зайти снова, вставить скрипт")
+    end
+    Env.genv.__handoverBuild = BUILD
+    Env.genv.__handoverEnabled = true
+    Env.genv.handoverEnable = function()
+        enabled = true
+        log("handover включён вручную")
+    end
+    Env.genv.handoverDisable = function()
+        enabled = false
+        log("handover выключен вручную")
+    end
+end
+
 local function runHandover(name, fromId)
     if state.busy then
         log("уже в сделке — пропускаю")
         return
     end
-    if not Ui.on("Handover") then
-        log("модуль выключен в панели — трейд не отвечаю")
+    if not moduleEnabled() then
+        log("handover выключен вручную — трейд не отвечаю (getgenv().handoverEnable())")
         return
     end
     state.busy = true
@@ -10236,13 +10272,23 @@ local function runHandover(name, fromId)
 
         unequipValuables()
 
+        -- Карточку «Hold to Reveal» держит сам игрок, автомат её не трогает. Пока она на экране,
+        -- Accept может не сработать, поэтому жмём его повторно, а не один раз.
         local accept = resolvePath(ACCEPT_PATH)
         if not accept or pressConnection(accept, "ACCEPT") == 0 then
             error("кнопка Accept не нажалась")
         end
 
         local deadline = os.clock() + ACCEPT_WINDOW
+        local nextAccept, presses = os.clock() + 2.5, 1
         while os.clock() < deadline and not state.started do
+            if os.clock() >= nextAccept and presses < 10 and not state.started then
+                nextAccept = os.clock() + 2.5
+                local button = resolvePath(ACCEPT_PATH)
+                if button then
+                    presses += pressConnection(button, "ACCEPT ещё раз")
+                end
+            end
             task.wait(0.2)
         end
         if not state.started then
@@ -10284,9 +10330,33 @@ Life.connect(tradeUpdate.OnClientEvent, function(payload)
     end
     local kind = tostring(payload.Type)
     local mine = payload.UserId == Env.LocalPlayer.UserId
+    if kind ~= "Offer" then
+        -- тихая телеметрия: по ней видно, дошёл ли трейд до фермы вообще
+        log("TradeUpdate: %s", kind)
+    end
 
     if kind == "Request" then
         local name, fromId = payload.FromName, tonumber(payload.FromUserId)
+        if not fromId and type(name) == "string" and name ~= "" then
+            pcall(function()
+                local found = Env.Players and Env.Players:FindFirstChild(name)
+                if found then
+                    fromId = found.UserId
+                end
+            end)
+        end
+        if not name and fromId then
+            pcall(function()
+                local found = Env.Players and Env.Players:GetPlayerByUserId(fromId)
+                if found then
+                    name = found.Name
+                end
+            end)
+        end
+        if not name and not fromId then
+            log("пришёл Request без отправителя — не трогаю")
+            return
+        end
         if not senderAllowed(name, fromId) then
             log("запрос от %s — это не банк, отказ", tostring(name))
             local decline = resolvePath(DECLINE_PATH)
@@ -10337,39 +10407,57 @@ end, "handover:trade")
 
 -- Safety net for a request that arrived before this module was loaded, or while the hub was
 -- busy: the request window stays on screen until it is answered.
-local function requestWindowOpen()
+-- Окно Tabs.TradeQuest висит постоянно и видимо всегда, поэтому смотреть надо
+-- не на него, а на надпись с именем отправителя: она появляется только тогда,
+-- когда запрос реально пришёл.
+local function requestSender()
     local gui = playerGui()
     local tabs = gui and gui:FindFirstChild("Tabs")
     local quest = tabs and tabs:FindFirstChild("TradeQuest")
     if not quest then
-        return false
+        return nil
     end
-    local visible = true
-    pcall(function()
-        visible = quest.Visible
-    end)
-    return visible == true
-end
-
-function checkPanelNowResponse()
-    if state.busy or not requestWindowOpen() then
-        setStatus("окна запроса нет")
-        return
-    end
-    local quest = playerGui():FindFirstChild("Tabs"):FindFirstChild("TradeQuest")
     local sent = quest:FindFirstChild("PlayerSent")
     local text = ""
     pcall(function()
         text = tostring(sent and sent.Text or "")
     end)
-    log("окно запроса на экране: %s", text)
-    local name = string.match(text, "^(%S+)")
-    if name and senderAllowed(name, nil) then
+    text = text:gsub("\n", " ")
+    if text == "" then
+        return nil
+    end
+    local lowered = string.lower(text)
+    if not string.find(lowered, "sent", 1, true)
+        and not string.find(lowered, "запрос", 1, true) then
+        return nil
+    end
+    return string.match(text, "^(%S+)"), text
+end
+
+local lastPanelNote = ""
+
+function checkPanelNowResponse()
+    if state.busy then
+        return
+    end
+    local name, text = requestSender()
+    if not name then
+        if lastPanelNote ~= "none" then
+            lastPanelNote = "none"
+            setStatus("ждём запрос от банка")
+        end
+        return
+    end
+    if lastPanelNote ~= text then
+        lastPanelNote = text
+        log("на экране запрос: %s", text)
+    end
+    if senderAllowed(name, nil) then
         task.spawn(function()
             runHandover(name, nil)
         end)
     else
-        setStatus("запрос не от банка")
+        setStatus("запрос не от банка: " .. name)
     end
 end
 
@@ -10377,16 +10465,20 @@ Life.loop("handover:poll", POLL_SECONDS, function()
     if state.busy then
         return
     end
-    -- the request window stays on screen until it is answered, so this catches a request
-    -- that arrived before the module was loaded or while the hub was busy
-    if requestWindowOpen() then
-        checkPanelNowResponse()
-    elseif state.pending then
+    -- страховка на случай, если событие TradeUpdate не дошло: смотрим надпись с ником
+    if state.pending and os.clock() - state.pendingAt > 8 then
+        local pending = state.pending
         state.pending = nil
+        task.spawn(function()
+            runHandover(pending.name, pending.id)
+        end)
+        return
     end
+    checkPanelNowResponse()
 end)
 
 setStatus("ждём запрос от банка")
+log("модуль готов: включён=%s, жду трейд от %s", tostring(moduleEnabled()), tostring(BANK_NAMES[1]))
 return {}
 end
 
@@ -24721,7 +24813,8 @@ do
 	local PING_ID = "1526170419038519377"
 	local POWER_THRESHOLD = 10000000 -- как в трейд-посте: секреты и всё, что выше 10M Power
 	local NOTIFY_POWER_PETS = true
-	local FULLSCREEN = true -- true = панель на весь экран, чёрная и непрозрачная
+	local FULLSCREEN = false -- false = маленькая плашка в углу; полноэкранная чёрная панель
+-- перекрывала весь экран и, главное, съедала нажатия мыши (у Frame был Active = true)
 	local HATCH_DELETE_ABOVE = 50 -- % : удаляем при вылупе только самое частое (>=50%), остальное идёт в крафт
 	local CRAFT_MIN_CHANCE = 50 -- % : в машины попадают только петы с шансом выпадения не ниже этого
 
@@ -25937,17 +26030,23 @@ do
 	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 	local parentGui = (Env.guiParent and Env.guiParent()) or game:GetService("CoreGui")
 	gui.Parent = parentGui
+	gui.Enabled = false -- панель скрыта; RightShift показывает/прячет
 
 	local main = Instance.new("Frame")
 	main.Name = "Main"
 	main.AnchorPoint = FULLSCREEN and Vector2.new(0, 0) or Vector2.new(0.5, 0.5)
 	main.Position = FULLSCREEN and UDim2.fromOffset(0, 0) or UDim2.fromScale(0.5, 0.5)
-	main.Size = FULLSCREEN and UDim2.fromScale(1, 1) or UDim2.fromOffset(340, 0)
+	main.Size = FULLSCREEN and UDim2.fromScale(1, 1) or UDim2.fromOffset(300, 0)
+	if not FULLSCREEN then
+		-- в угол, чтобы не лежать поверх карточек игры
+		main.AnchorPoint = Vector2.new(0, 0)
+		main.Position = UDim2.fromOffset(8, 8)
+	end
 	main.AutomaticSize = FULLSCREEN and Enum.AutomaticSize.None or Enum.AutomaticSize.Y
 	main.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
 	main.BackgroundTransparency = FULLSCREEN and 0 or 0.15
 	main.BorderSizePixel = 0
-	main.Active = true
+	main.Active = false -- не перехватывать мышь: иначе панель ест нажатия по игре
 	main.Parent = gui
 
 	local pad = Instance.new("UIPadding")
