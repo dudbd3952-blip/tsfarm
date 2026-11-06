@@ -9697,9 +9697,17 @@ __modules["features/handover"] = function(use) -- src/games/tapsim/features/hand
 -- Hands this account's Secret and Godly pets to the bank, then goes straight back to farming.
 --
 -- The bank joins this server and sends the request itself. This module answers it:
---   pause every farm toggle -> unlock and take the valuables off the team -> press the real
---   Accept button -> put every Secret/Godly in the offer in one packet -> press READY ->
---   press CONFIRM -> on Completed: EquipBest and put every toggle back exactly as it was.
+--   pause every farm toggle -> unlock and take the Secrets off the team -> press the real
+--   Accept button -> put every Secret in the offer in one packet -> 1.5 s -> READY ->
+--   wait until CONFIRM really works -> press CONFIRM in rounds -> on Completed: EquipBest and put
+--   every toggle back exactly as it was.
+--
+-- ВАЖНО про поиск трейда: окно TradeQuest, кнопка Accept и надпись «<ник> has sent a trade
+-- request!» ЛЕЖАТ В ДЕРЕВЕ ВСЕГДА и всегда с Visible = true, поэтому ни наличие узлов, ни
+-- видимость ничего не говорят. Трейд ловится двумя способами:
+--   1) событие TradingService/RE/TradeUpdate "Request" (главный);
+--   2) раз в 2 секунды — живые обработчики у Accept (getconnections > 0): пока их нет, кнопка
+--      не работает, значит и трейда нет.
 --
 -- Button paths were captured by recording real clicks, because the names say nothing here:
 --   Tabs.TradeQuest.Menu.Accept.Button           the incoming request window
@@ -9716,12 +9724,12 @@ local Ui = use("core/ui")
 
 local BANK_NAMES = { "Riglafsma" }
 local BANK_IDS = { 11747325739 }
-local TAKE_RARITY = { "Godly", "Secret" }
+local TAKE_RARITY = { "Secret" }   -- по просьбе: Godly не трогаем вообще
 local MAX_PETS = 12
 local ACCEPT_WINDOW = 35        -- seconds to wait for the session after pressing Accept
                                 -- (игрок может 10+ с держать карточку «Hold to Reveal» сам)
-local READY_DELAY = 3           -- пауза перед READY (по просьбе: ровно 3 секунды)
-local LOCK_WINDOW = 25          -- сколько после своего READY ждём отметку банка (Lock) перед CONFIRM
+local READY_DELAY = 1.5         -- пауза перед READY: ровно 1.5 с после того, как положили пета
+local CONFIRM_WINDOW = 45       -- сколько ждём, пока игра покажет кнопку CONFIRM (Review.Confirm)
 local READY_WINDOW = 20         -- сколько ищем саму кнопку READY
 local POLL_SECONDS = 2          -- how often a pending request is looked for
 
@@ -9746,7 +9754,7 @@ box:AddButton({
 
 -- Метка сборки в каждой строке: по ней видно, какой именно экземпляр печатает в консоль.
 -- Старый запущенный payload печатает "[handover]" без метки — так ловится двойная инъекция.
-local BUILD = "v11"
+local BUILD = "v12"
 
 local function log(fmt, ...)
     local ok, text = pcall(string.format, fmt, ...)
@@ -9822,16 +9830,44 @@ local function pressConnection(button, label)
             end
         end
     end
+    if pressed == 0 then
+        -- Ни одного обработчика на сигналах: жмём настоящей мышью в центр кнопки — но только если
+        -- кнопка на экране, иначе клик попадёт в то, что лежит под ней.
+        local shown = false
+        pcall(function()
+            shown = button.Visible ~= false and button.AbsoluteSize.X > 0 and button.AbsoluteSize.Y > 0
+        end)
+        if shown then
+            local clicked = pcall(function()
+                local pos = button.AbsolutePosition + button.AbsoluteSize * 0.5
+                local x, y = math.floor(pos.X), math.floor(pos.Y)
+                local vim = game:GetService("VirtualInputManager")
+                vim:SendMouseButtonEvent(x, y, 0, true, game, 1)
+                task.wait(0.1)
+                vim:SendMouseButtonEvent(x, y, 0, false, game, 1)
+            end)
+            if clicked then
+                pressed += 1
+                log("нажал %s мышью в центр", label)
+            end
+        end
+    end
     log("нажал %s (%d)", label, pressed)
     return pressed
 end
 
 local ACCEPT_PATH = { "Tabs", "TradeQuest", "Menu", "Accept", "Button" }
 local DECLINE_PATH = { "Tabs", "TradeQuest", "Menu", "Decline", "Button" }
-local READY_PATH = { "Trading", "Trading", "Build", "Actions", "Ready", "Button" }
-local CONFIRM_PATH = { "Trading", "Trading", "Review", "Confirm", "Button" }
+-- Точные обёртки, снятые с живого окна трейда:
+--   PlayerGui.Trading.Trading.Build.Actions.Ready     — кнопка «готов» (жмём через 1.5 с)
+--   PlayerGui.Trading.Trading.Review.Confirm          — кнопка подтверждения (появляется позже)
+-- Путь может быть и самой кнопкой, и её фреймом-обёрткой, поэтому после resolvePath узел всегда
+-- прогоняется через asButton(): сам GuiButton, ребёнок Button или первая кнопка внутри.
+local READY_PATH = { "Trading", "Trading", "Build", "Actions", "Ready" }
+local CONFIRM_PATH = { "Trading", "Trading", "Review", "Confirm" }
 local CONFIRM_ALTERNATIVES = {
     CONFIRM_PATH,
+    { "Trading", "Trading", "Review", "Confirm", "Button" },
     { "Tabs", "TradeQuest", "Review", "Confirm", "Button" },
     { "Tabs", "TradeQuest", "Menu", "Confirm", "Button" },
     { "Tabs", "TradeQuest", "Confirm", "Button" },
@@ -10216,6 +10252,9 @@ end
 
 -- Годится ли узел в качестве кнопки «готов»: сам GuiButton или у него есть Button внутри.
 local function asButton(node)
+    if not node then
+        return nil
+    end
     if node:IsA("GuiButton") then
         return node
     end
@@ -10223,7 +10262,49 @@ local function asButton(node)
     if child and child:IsA("GuiButton") then
         return child
     end
+    -- Обёртка без ребёнка с именем Button: берём первую видимую кнопку внутри неё.
+    for _, deep in ipairs(node:GetDescendants()) do
+        if deep:IsA("GuiButton") then
+            local okVisible, visible = pcall(function()
+                return deep.Visible
+            end)
+            if okVisible and visible ~= false then
+                return deep
+            end
+        end
+    end
     return nil
+end
+
+-- Сколько живых обработчиков у кнопки. В этой игре окно трейда и его кнопки лежат в PlayerGui
+-- ВСЕГДА и всегда с Visible = true, поэтому наличие/видимость ничего не значат. Реальность
+-- отражают только обработчики: игра подключает их, когда кнопка действительно работает.
+--   > 0 — живая, = 0 — мёртвая, = -1 — getconnections недоступен
+local function liveConnections(button)
+    if not button then
+        return 0
+    end
+    local genv = Env.genv or {}
+    if type(genv.getconnections) ~= "function" then
+        return -1
+    end
+    local total = 0
+    for _, signalName in ipairs({ "Activated", "MouseButton1Click", "MouseButton1Down" }) do
+        local okSignal, signal = pcall(function()
+            return button[signalName]
+        end)
+        if okSignal and signal then
+            local okList, list = pcall(genv.getconnections, signal)
+            if okList and type(list) == "table" then
+                for _, connection in ipairs(list) do
+                    if connection.Enabled ~= false then
+                        total += 1
+                    end
+                end
+            end
+        end
+    end
+    return total
 end
 
 -- Имя + текст + имя родителя одним куском в нижнем регистре: по нему ищем «готов».
@@ -10306,35 +10387,36 @@ local function tradeSubtrees()
     return list
 end
 
+-- Кнопка подтверждения: PlayerGui.Trading.Trading.Review.Confirm. Её появление и есть сигнал,
+-- что можно подтверждать.
+local function findConfirmButton()
+    for _, path in ipairs(CONFIRM_ALTERNATIVES) do
+        local button = asButton(resolvePath(path))
+        if button then
+            return button, table.concat(path, ".")
+        end
+    end
+    -- ищем только внутри окна трейда, чтобы не нажать что-то в другом окне
+    for _, root in ipairs(tradeSubtrees()) do
+        for _, node in ipairs(root:GetDescendants()) do
+            if node:IsA("GuiButton") and isButtonShown(node) then
+                local hay = nodeHay(node)
+                if string.find(hay, "confirm", 1, true) or string.find(hay, "подтвер", 1, true) then
+                    return node, node:GetFullName()
+                end
+            end
+        end
+    end
+    return nil
+end
+
+
 local function pressConfirmRounds()
     for round = 1, 8 do
         if state.done or state.cancelled then
             return state.done
         end
-        local confirm = nil
-        for _, path in ipairs(CONFIRM_ALTERNATIVES) do
-            confirm = resolvePath(path)
-            if confirm then
-                break
-            end
-        end
-        if not confirm then
-            -- ищем только внутри окна трейда, чтобы не нажать что-то в другом окне
-            for _, root in ipairs(tradeSubtrees()) do
-                for _, node in ipairs(root:GetDescendants()) do
-                    if node:IsA("GuiButton") and isButtonShown(node) then
-                        local hay = nodeHay(node)
-                        if string.find(hay, "confirm", 1, true) or string.find(hay, "подтвер", 1, true) then
-                            confirm = node
-                            break
-                        end
-                    end
-                end
-                if confirm then
-                    break
-                end
-            end
-        end
+        local confirm = findConfirmButton()
         if confirm then
             pressConnection(confirm, "CONFIRM, раунд " .. round)
         else
@@ -10374,7 +10456,7 @@ local READY_ALTERNATIVES = {
 
 local function findReadyButton()
     for _, path in ipairs(READY_ALTERNATIVES) do
-        local button = resolvePath(path)
+        local button = asButton(resolvePath(path))
         if button then
             return button, table.concat(path, ".")
         end
@@ -10538,53 +10620,77 @@ local function dumpTradeGui()
     end
 end
 
+-- Ждём, пока игра откроет шаг подтверждения: у CONFIRM появляются обработчики (getconnections > 0).
+-- READY второй раз НЕ жмём: эта кнопка — переключатель, повторное нажатие снимает готовность.
+local function waitForConfirm(seconds)
+    local window = seconds or CONFIRM_WINDOW
+    local started = os.clock()
+    local deadline = started + window
+    local nextNote = started + 10
+    while os.clock() < deadline do
+        if state.done or state.cancelled then
+            return nil
+        end
+        local button, where = findConfirmButton()
+        if button and liveConnections(button) ~= 0 then
+            log("CONFIRM ожил через %.1f с после READY (%s)", os.clock() - started, tostring(where))
+            return button
+        end
+        if os.clock() >= nextNote then
+            nextNote = os.clock() + 10
+            log("жду шаг подтверждения… %.0f с из %d", os.clock() - started, window)
+        end
+        task.wait(0.25)
+    end
+    log("CONFIRM не ожил за %d с", window)
+    return nil
+end
+
 local function pressReadyThenConfirm()
-    -- Порядок такой: ферма положила петов -> 3 секунды -> READY, и подтверждает именно ферма
-    -- первой. Банк после этого видит нашу отметку (Lock) и подтверждает уже сам. Ждать Lock
-    -- перед своим READY нельзя: тогда обе стороны ждут друг друга и сделка стоит.
-    log("петов добавил — жду %s с и жму READY первым", tostring(READY_DELAY))
+    -- Порядок по просьбе: положили своих петов -> 1.5 с -> READY
+    -- (PlayerGui.Trading.Trading.Build.Actions.Ready), подтверждает ферма первой.
+    -- Дальше не гадаем по таймеру: ждём, пока игра покажет CONFIRM
+    -- (PlayerGui.Trading.Trading.Review.Confirm), и жмём его раундами.
+    log("петов добавил — жду %.1f с и жму READY первым", READY_DELAY)
     Life.wait(READY_DELAY)
 
     -- в этот момент оффер уже стоит: печатаем всё, что есть в окне трейда
     logTradeButtons("перед READY")
 
-    local ready, where = nil, nil
+    local ready, where = findReadyButton()
     local readyDeadline = os.clock() + READY_WINDOW
     local remoteAt = os.clock() + 6
     local tried = 0
-    while os.clock() < readyDeadline do
-        ready, where = findReadyButton()
-        if ready then
-            break
-        end
-        -- Кнопки нет 6 секунд — пробуем сделать то же запросом в remote, а поиск продолжаем:
-        -- если кнопка всё-таки появится, нажмём и её (лишним не будет).
+    while not ready and os.clock() < readyDeadline do
+        -- Кнопки нет 6 секунд — пробуем то же запросом в remote, поиск продолжаем: если кнопка
+        -- всё-таки появится, нажмём и её (лишним не будет).
         if tried == 0 and os.clock() >= remoteAt then
-            tried += 1
+            tried = 1
             fireTradeAction("Ready")
         elseif tried == 1 and os.clock() >= remoteAt + 4 then
-            tried += 2
+            tried = 2
             fireTradeAction("Lock")
         end
         task.wait(0.3)
+        ready, where = findReadyButton()
     end
     if not ready then
         log("кнопка READY не появилась за %d с (remote-попытки: Ready, Lock)", READY_WINDOW)
         dumpTradeGui()
         return false
     end
-    log("READY найден: %s", tostring(where))
+    log("READY найден: %s -> %s", tostring(where), ready:GetFullName())
     if pressConnection(ready, "READY") == 0 then
         return false
     end
-    local limit = os.clock() + LOCK_WINDOW
-    while os.clock() < limit do
-        if state.done or state.cancelled or state.partnerReady then
-            break
-        end
-        task.wait(0.3)
+
+    local confirm = waitForConfirm(CONFIRM_WINDOW)
+    if confirm then
+        log("жму CONFIRM: %s", confirm:GetFullName())
+    else
+        log("CONFIRM не дождались — пробую запросом в remote и всё равно жму раундами")
+        fireTradeAction("Confirm")
     end
-    log(state.partnerReady and "банк готов — жму CONFIRM" or "банк не отметился — жму CONFIRM всё равно")
     return pressConfirmRounds()
 end
 
@@ -10715,6 +10821,14 @@ if type(Env.genv) == "table" then
     Env.genv.handoverTradeButtons = function()
         logTradeButtons("вручную")
         return "см. лог"
+    end
+    -- Что видно прямо сейчас: точные пути READY и CONFIRM и то, какая кнопка за ними.
+    Env.genv.handoverButtons = function()
+        local ready, where = findReadyButton()
+        local confirm, cwhere = findConfirmButton()
+        log("READY: %s", ready and (tostring(where) .. " -> " .. ready:GetFullName()) or "нет")
+        log("CONFIRM: %s", confirm and (tostring(cwhere) .. " -> " .. confirm:GetFullName()) or "нет")
+        return ready, confirm
     end
     Env.genv.handoverTryAction = fireTradeAction
     Env.genv.handoverRemotes = function()
@@ -10913,24 +11027,62 @@ local function requestSender()
 end
 
 local lastPanelNote = ""
+local lastLiveNote = 0
+local lastLiveState = false
 
+-- Окно входящего трейда «по-настоящему» открыто, только когда у Accept есть живые обработчики.
+-- Наличие узлов и Visible тут ничего не значат (см. liveConnections).
+local function acceptIsLive()
+    local accept = asButton(resolvePath(ACCEPT_PATH))
+    if not accept then
+        return false
+    end
+    local live = liveConnections(accept)
+    if live == -1 then
+        -- getconnections недоступен: остаётся только надпись панели
+        return requestSender() ~= nil
+    end
+    return live > 0
+end
+
+-- Страховка на случай, если событие TradeUpdate не дошло: каждые 2 секунды смотрим, ожил ли
+-- Accept, и если да — берём ник из панели и, если это банк, начинаем сделку.
 function checkPanelNowResponse()
     if state.busy then
         return
     end
+    local live = acceptIsLive()
     local name, text = requestSender()
-    if not name then
+
+    if live ~= lastLiveState and live then
+        log("окно трейда ожило (Accept с обработчиками) — проверяю отправителя")
+    end
+    lastLiveState = live
+
+    if not live and not name then
         if lastPanelNote ~= "none" then
             lastPanelNote = "none"
             setStatus("ждём запрос от банка")
         end
         return
     end
+
+    if not name then
+        -- окно есть, а ник прочитать не удалось: чужой трейд принимать нельзя
+        if os.clock() - lastLiveNote > 10 then
+            lastLiveNote = os.clock()
+            log("окно трейда есть, но отправителя не видно — не принимаю (приму, когда придёт событие Request)")
+            setStatus("вижу трейд, но не знаю от кого")
+        end
+        return
+    end
+
     if lastPanelNote ~= text then
         lastPanelNote = text
         log("на экране запрос: %s", text)
     end
     if senderAllowed(name, nil) then
+        log("это банк (%s) — начинаю сделку", tostring(name))
         task.spawn(function()
             runHandover(name, nil)
         end)
