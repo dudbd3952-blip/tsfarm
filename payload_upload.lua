@@ -9830,6 +9830,15 @@ local ACCEPT_PATH = { "Tabs", "TradeQuest", "Menu", "Accept", "Button" }
 local DECLINE_PATH = { "Tabs", "TradeQuest", "Menu", "Decline", "Button" }
 local READY_PATH = { "Trading", "Trading", "Build", "Actions", "Ready", "Button" }
 local CONFIRM_PATH = { "Trading", "Trading", "Review", "Confirm", "Button" }
+local CONFIRM_ALTERNATIVES = {
+    CONFIRM_PATH,
+    { "Tabs", "TradeQuest", "Review", "Confirm", "Button" },
+    { "Tabs", "TradeQuest", "Menu", "Confirm", "Button" },
+    { "Tabs", "TradeQuest", "Confirm", "Button" },
+    { "Tabs", "TradeQuest", "Menu", "Confirm" },
+    { "Tabs", "TradeQuest", "Confirm" },
+    { "Trading", "Trading", "Confirm", "Button" },
+}
 
 -- ---------------------------------------------------------------------------------------------
 -- pets
@@ -10278,17 +10287,41 @@ local function tradingRemotes()
     return list
 end
 
+-- Окно трейда на ферме живёт внутри Tabs.TradeQuest (там же кнопка Accept), а не в отдельном
+-- экране Trading, как на банке. Искать кнопки можно ТОЛЬКО внутри этих поддеревьев: поиск по
+-- всему PlayerGui однажды уже нажал "Lock" в инвентаре (кнопка блокировки пета).
+local TRADE_ROOTS = {
+    { "Tabs", "TradeQuest" },
+    { "Trading" },
+}
+
+local function tradeSubtrees()
+    local list = {}
+    for _, path in ipairs(TRADE_ROOTS) do
+        local node = resolvePath(path)
+        if node then
+            list[#list + 1] = node
+        end
+    end
+    return list
+end
+
 local function pressConfirmRounds()
     for round = 1, 8 do
         if state.done or state.cancelled then
             return state.done
         end
-        local confirm = resolvePath(CONFIRM_PATH)
+        local confirm = nil
+        for _, path in ipairs(CONFIRM_ALTERNATIVES) do
+            confirm = resolvePath(path)
+            if confirm then
+                break
+            end
+        end
         if not confirm then
-            -- на приёме окно подтверждения может лежать в другом месте: ищем по имени
-            local gui = playerGui()
-            if gui then
-                for _, node in ipairs(gui:GetDescendants()) do
+            -- ищем только внутри окна трейда, чтобы не нажать что-то в другом окне
+            for _, root in ipairs(tradeSubtrees()) do
+                for _, node in ipairs(root:GetDescendants()) do
                     if node:IsA("GuiButton") and isButtonShown(node) then
                         local hay = nodeHay(node)
                         if string.find(hay, "confirm", 1, true) or string.find(hay, "подтвер", 1, true) then
@@ -10296,6 +10329,9 @@ local function pressConfirmRounds()
                             break
                         end
                     end
+                end
+                if confirm then
+                    break
                 end
             end
         end
@@ -10323,9 +10359,17 @@ end
 local READY_ALTERNATIVES = {
     READY_PATH,
     { "Trading", "Trading", "Actions", "Ready", "Button" },
-    { "Trading", "Actions", "Ready", "Button" },
     { "Trading", "Trading", "Build", "Ready", "Button" },
     { "Trading", "Trading", "Build", "Actions", "Ready" },
+    { "Trading", "Actions", "Ready", "Button" },
+    -- окно трейда на ферме (там же, где Accept)
+    { "Tabs", "TradeQuest", "Build", "Actions", "Ready", "Button" },
+    { "Tabs", "TradeQuest", "Actions", "Ready", "Button" },
+    { "Tabs", "TradeQuest", "Menu", "Ready", "Button" },
+    { "Tabs", "TradeQuest", "Menu", "Actions", "Ready", "Button" },
+    { "Tabs", "TradeQuest", "Ready", "Button" },
+    { "Tabs", "TradeQuest", "Menu", "Ready" },
+    { "Tabs", "TradeQuest", "Ready" },
 }
 
 local function findReadyButton()
@@ -10335,38 +10379,64 @@ local function findReadyButton()
             return button, table.concat(path, ".")
         end
     end
-    local gui = playerGui()
-    if not gui then
+    local roots = tradeSubtrees()
+    if #roots == 0 then
         return nil
     end
-    -- Второй заход: любой узел, в имени которого есть ready/готов, в любом месте PlayerGui.
-    for _, node in ipairs(gui:GetDescendants()) do
-        local ok, name = pcall(function()
-            return node.Name
-        end)
-        if ok and type(name) == "string" then
-            local low = string.lower(name)
-            if string.find(low, "ready", 1, true) or string.find(low, "gotov", 1, true)
-                or string.find(low, "готов", 1, true) then
-                local button = asButton(node)
-                if button and isButtonShown(button) then
-                    return button, node:GetFullName()
+    for _, root in ipairs(roots) do
+        -- узел с именем ready/готов и его Button
+        for _, node in ipairs(root:GetDescendants()) do
+            local ok, name = pcall(function()
+                return node.Name
+            end)
+            if ok and type(name) == "string" then
+                local low = string.lower(name)
+                if string.find(low, "ready", 1, true) or string.find(low, "gotov", 1, true)
+                    or string.find(low, "готов", 1, true) then
+                    local button = asButton(node)
+                    if button and isButtonShown(button) then
+                        return button, node:GetFullName()
+                    end
+                end
+            end
+        end
+        -- видимая кнопка, у которой ready/готов в имени, тексте или имени родителя
+        for _, node in ipairs(root:GetDescendants()) do
+            if node:IsA("GuiButton") and isButtonShown(node) then
+                local hay = nodeHay(node)
+                if string.find(hay, "ready", 1, true) or string.find(hay, "gotov", 1, true)
+                    or string.find(hay, "готов", 1, true) then
+                    return node, node:GetFullName()
                 end
             end
         end
     end
-    -- Третий заход: видимая кнопка, у которой в имени/тексте (или у её родителя) есть
-    -- ready / готов / lock. На приёме кнопка «готов» может называться Lock.
-    for _, node in ipairs(gui:GetDescendants()) do
-        if node:IsA("GuiButton") and isButtonShown(node) then
-            local hay = nodeHay(node)
-            if string.find(hay, "ready", 1, true) or string.find(hay, "gotov", 1, true)
-                or string.find(hay, "готов", 1, true) or string.find(hay, "lock", 1, true) then
-                return node, node:GetFullName()
+    return nil
+end
+
+-- Все видимые кнопки внутри окна трейда: по этому списку видно, как называются READY и CONFIRM.
+local function logTradeButtons(label)
+    local roots = tradeSubtrees()
+    if #roots == 0 then
+        log("%s: окна трейда нет (ни Tabs.TradeQuest, ни Trading)", label)
+        return
+    end
+    local shown = 0
+    for _, root in ipairs(roots) do
+        for _, node in ipairs(root:GetDescendants()) do
+            if node:IsA("GuiButton") and isButtonShown(node) then
+                local okText, text = pcall(function()
+                    return node.Text
+                end)
+                shown += 1
+                if shown <= 40 then
+                    log("%s: %s [%s] «%s»", label, node:GetFullName(), node.ClassName,
+                        tostring(okText and text or ""))
+                end
             end
         end
     end
-    return nil
+    log("%s: видимых кнопок в окне трейда — %d", label, shown)
 end
 
 -- Список всех кнопок, похожих на «готов/подтвердить», для лога: видно, как это зовётся на ферме.
@@ -10475,6 +10545,9 @@ local function pressReadyThenConfirm()
     log("петов добавил — жду %s с и жму READY первым", tostring(READY_DELAY))
     Life.wait(READY_DELAY)
 
+    -- в этот момент оффер уже стоит: печатаем всё, что есть в окне трейда
+    logTradeButtons("перед READY")
+
     local ready, where = nil, nil
     local readyDeadline = os.clock() + READY_WINDOW
     local remoteAt = os.clock() + 6
@@ -10521,6 +10594,85 @@ end
 
 -- Отдельный флаг, а не тумблер панели: в этой сборке окно хаба гасится
 -- (killHubGui), и пропавший тумблер раньше молча выключал весь модуль.
+-- ---------------------------------------------------------------------------------------------
+-- точечные операции по редкости (для trade_farm_probe.lua и ручных вызовов)
+-- ---------------------------------------------------------------------------------------------
+
+local function rarityIs(pet, wanted)
+    if type(pet) ~= "table" or not wanted then
+        return false
+    end
+    local rarity = string.lower(tostring(pet.Rarity or ""))
+    return string.find(rarity, string.lower(tostring(wanted)), 1, true) ~= nil
+end
+
+-- Снять с команды всех петов указанной редкости ("Secret", "Godly", ...).
+local function unequipByRarity(rarity)
+    local pets = petsTable()
+    if not pets or type(pets.Owned) ~= "table" then
+        log("данные петов недоступны")
+        return 0
+    end
+    local team = teamIds()
+    local removed = 0
+    for key, pet in pairs(pets.Owned) do
+        if rarityIs(pet, rarity) then
+            local id = petId(pet, key)
+            if id and team[id] then
+                if pet.Locked == true and not unlockPet(id) then
+                    log("залочен, не снял: %s", tostring(pet.Name))
+                elseif unequipPet(id, pet.Name) then
+                    removed += 1
+                    log("снял с команды: %s (%s)", tostring(pet.Name), tostring(rarity))
+                end
+                task.wait(0.2)
+            end
+        end
+    end
+    log("снято с команды %s: %d", tostring(rarity), removed)
+    return removed
+end
+
+-- Положить в трейд только петов указанной редкости, максимум MAX_PETS.
+local function offerByRarity(rarity)
+    local pets = petsTable()
+    if not pets or type(pets.Owned) ~= "table" then
+        log("данные петов недоступны")
+        return 0
+    end
+    local list = {}
+    for key, pet in pairs(pets.Owned) do
+        if rarityIs(pet, rarity) then
+            local id = petId(pet, key)
+            if id then
+                if pet.Locked == true and not unlockPet(id) then
+                    log("пропускаю залоченного: %s", tostring(pet.Name))
+                else
+                    list[#list + 1] = { id = id, power = tonumber(pet.Power) or 0, name = tostring(pet.Name) }
+                end
+            end
+        end
+    end
+    table.sort(list, function(a, b)
+        return a.power > b.power
+    end)
+    local ids = {}
+    for _, entry in ipairs(list) do
+        if #ids < MAX_PETS then
+            ids[#ids + 1] = entry.id
+        end
+    end
+    if #ids == 0 then
+        log("петов редкости %s нет — класть нечего", tostring(rarity))
+        return 0
+    end
+    pcall(function()
+        Env.fire("TradingService", "TradeRequested", { Action = "Offer", PetIds = ids })
+    end)
+    log("оффер %s: %d петов (всего подходящих %d)", tostring(rarity), #ids, #list)
+    return #ids
+end
+
 -- Включённость модуля — ЛОКАЛЬНАЯ переменная, а не что-то в getgenv(): getgenv общий на всю
 -- сессию, и любой другой запущенный экземпляр скрипта мог выставить там false и тем самым
 -- выключить этот. Снаружи теперь только функции:
@@ -10549,6 +10701,21 @@ if type(Env.genv) == "table" then
     -- Ручные проверки во время открытого трейда:
     --   getgenv().handoverTryAction("Ready")   getgenv().handoverTryAction("Lock")
     --   getgenv().handoverRemotes()            getgenv().handoverDumpTrade()
+    -- Для диагностического скрипта trade_ready_probe.lua: он принимает трейд и просит положить петов
+    Env.genv.handoverGivePets = function()
+        return givePets()
+    end
+    -- Для trade_farm_probe.lua: снять с команды всех Secret и положить в трейд только Godly
+    Env.genv.handoverUnequipRarity = function(rarity)
+        return unequipByRarity(rarity or "Secret")
+    end
+    Env.genv.handoverOfferRarity = function(rarity)
+        return offerByRarity(rarity or "Godly")
+    end
+    Env.genv.handoverTradeButtons = function()
+        logTradeButtons("вручную")
+        return "см. лог"
+    end
     Env.genv.handoverTryAction = fireTradeAction
     Env.genv.handoverRemotes = function()
         for _, line in ipairs(tradingRemotes()) do
@@ -10688,9 +10855,7 @@ Life.connect(tradeUpdate.OnClientEvent, function(payload)
         state.session = payload.SessionId
         state.started = true
         log("экраны: %s", screenNames())
-        for _, line in ipairs(buttonCandidates()) do
-            log("кнопка-кандидат: %s", line)
-        end
+        logTradeButtons("при открытии")
         for _, line in ipairs(tradingRemotes()) do
             log("remote: %s", line)
         end
@@ -10795,6 +10960,432 @@ log("модуль готов: включён=%s, жду трейд от %s", tos
 return {}
 end
 
+__modules["features/holdreveal"] = function(use) -- src/games/tapsim/features/holdreveal.luau
+-- «Hold to Reveal!» на экране вылупления: одна карточка — одно зажатие.
+--
+-- Кнопку снял логгер нажатий (click_logger.lua):
+--   PlayerGui.HatchScreen.Main.Info.HatchEgg            [TextButton]  — сама кнопка
+--   ...HatchEgg.TextLabel                               «Hold to Reveal!»
+--   ...HatchEgg.HoldProgress                            [Frame] — полоска, растёт при удержании
+-- Игра слушает удержание парой MouseButton1Down / MouseButton1Up (Activated и
+-- MouseButton1Click у кнопки пустые), поэтому жмём Down, следим за полоской и отпускаем на Up.
+--
+-- Правило, по просьбе, одно:
+--   карточка появилась -> зажали -> полоска заполнилась -> отпустили -> ждём следующую.
+-- На той же карточке повторов нет: после заполнения модуль молчит, пока карточка не пропадёт
+-- с экрана (GONE_QUIET секунд) — или, страховки ради, пока полоска не продержится на нуле
+-- FALLBACK_ZERO секунд спустя FALLBACK_GAP секунд после заполнения (если игра переиспользует ту
+-- же карточку под следующее яйцо и не убирает её с экрана).
+--
+-- В лог — одна короткая строка на карточку, а не поток. Всё остальное по требованию:
+--   getgenv().holdRevealState()   — что модуль видит сейчас (кнопка, полоска, состояние)
+--   getgenv().holdRevealDebug(true) — подробный лог каждой попытки
+
+local Env = use("core/env")
+local Life = use("shared/life")
+local Ui = use("core/ui")
+
+local BUILD = "v1"
+
+local BUTTON_PATH = { "HatchScreen", "Main", "Info", "HatchEgg" }
+local FILLED = 0.98          -- полоска заполнена (доля ширины кнопки)
+local HOLD_MAX = 12          -- максимум держим одну карточку, секунды
+local POLL = 0.35            -- как часто смотрим на экран
+local RETRY_AT = 1.2         -- полоска стоит на нуле столько — жмём ещё раз в центр надписи
+local RETRY_LIMIT = 2        -- не больше стольких повторов на одну карточку
+local GONE_QUIET = 1.5       -- карточка пропала на столько — считаем, что будет следующая
+local MIN_GAP = 3            -- после заполнения столько секунд вообще не жмём
+local FALLBACK_GAP = 8       -- страховка: следующее зажатие не раньше, чем через столько секунд
+local FALLBACK_ZERO = 3      -- и только если полоска всё это время на нуле
+local BLIND_HOLD = 2.5       -- если полоску прочитать нельзя — держим столько и отпускаем
+
+local tab = Ui.Tabs.Pets
+local box = tab:AddGroupbox({ Side = "Right", Name = "Hold to Reveal", IconName = "egg" })
+box:AddToggle("AutoReveal", {
+    Text = "Держать «Hold to Reveal»",
+    Default = true,
+    Tooltip = "Карточка вылупления: зажать, дождаться заполнения полоски, отпустить. Один раз на карточку — дальше модуль ждёт следующую.",
+})
+local statusLabel = box:AddLabel("Hold: ждём карточку", true)
+
+local verbose = false
+
+local function log(fmt, ...)
+    local ok, text = pcall(string.format, fmt, ...)
+    print("[hold " .. BUILD .. "] " .. (ok and text or tostring(fmt)))
+end
+
+local function debugLog(fmt, ...)
+    if not verbose then
+        return
+    end
+    local ok, text = pcall(string.format, fmt, ...)
+    print("[hold " .. BUILD .. " debug] " .. (ok and text or tostring(fmt)))
+end
+
+local function setStatus(text)
+    pcall(function()
+        statusLabel:SetText("Hold: " .. text)
+    end)
+end
+
+-- Тумблер читается на каждом проходе (без локального флага): Ui.stopAll от handover его не гасит,
+-- потому что модуль не зарегистрирован как automation, а значение всегда живое.
+local function enabled()
+    local ok, value = pcall(function()
+        return Ui.on("AutoReveal")
+    end)
+    return ok and value == true
+end
+
+local function gui()
+    local player = Env.LocalPlayer
+    return player and player:FindFirstChild("PlayerGui")
+end
+
+local function textOf(node)
+    local ok, text = pcall(function()
+        return node.Text
+    end)
+    if ok and type(text) == "string" then
+        return (string.lower(text):gsub("%s+", " "))
+    end
+    return ""
+end
+
+local function isHoldText(button)
+    for _, child in ipairs(button:GetDescendants()) do
+        local text = textOf(child)
+        if string.find(text, "hold to reveal", 1, true)
+            or (string.find(text, "hold", 1, true) and string.find(text, "reveal", 1, true)) then
+            return true
+        end
+    end
+    return false
+end
+
+-- Кнопка карточки: по точному пути, а если путь изменился — по надписи внутри HatchScreen.
+local function findButton()
+    local playerGui = gui()
+    if not playerGui then
+        return nil
+    end
+    local screen = playerGui:FindFirstChild(BUTTON_PATH[1])
+    if not screen then
+        return nil
+    end
+    local node = screen
+    for index = 2, #BUTTON_PATH do
+        node = node and node:FindFirstChild(BUTTON_PATH[index])
+    end
+    if node and node:IsA("GuiButton") and isHoldText(node) then
+        return node
+    end
+    for _, candidate in ipairs(screen:GetDescendants()) do
+        if candidate:IsA("GuiButton") and isHoldText(candidate) then
+            return candidate
+        end
+    end
+    return nil
+end
+
+-- Доля заполнения полоски: ширина HoldProgress к ширине кнопки.
+local function progressOf(button)
+    local bar = button:FindFirstChild("HoldProgress")
+    if not bar then
+        for _, child in ipairs(button:GetChildren()) do
+            local name = string.lower(child.Name)
+            if string.find(name, "progress", 1, true) or string.find(name, "fill", 1, true) then
+                bar = child
+                break
+            end
+        end
+    end
+    if not bar then
+        return nil
+    end
+    local ok, ratio = pcall(function()
+        local buttonWidth = button.AbsoluteSize.X
+        if buttonWidth <= 0 then
+            return nil
+        end
+        return bar.AbsoluteSize.X / buttonWidth
+    end)
+    return ok and ratio or nil
+end
+
+-- Запуск обработчиков сигнала кнопки. Раньше здесь был pcall(connection.Fire) без self: метод
+-- падал, ошибка глоталась, и выходило ложное «обработчиков 0» при живом MouseButton1Down=1.
+local function fireSignal(button, signalName)
+    local okSignal, signal = pcall(function()
+        return button[signalName]
+    end)
+    if not okSignal or not signal then
+        return 0
+    end
+    local fired = 0
+    local genv = Env.genv or {}
+    if type(genv.firesignal) == "function" then
+        if pcall(genv.firesignal, signal) then
+            fired += 1
+        end
+    end
+    if type(genv.getconnections) == "function" then
+        local okList, list = pcall(genv.getconnections, signal)
+        if okList and type(list) == "table" then
+            for _, connection in ipairs(list) do
+                if connection.Enabled ~= false then
+                    local ok = pcall(function()
+                        connection:Fire()
+                    end)
+                    if not ok then
+                        ok = pcall(function()
+                            connection.Fire(connection)
+                        end)
+                    end
+                    if ok then
+                        fired += 1
+                    end
+                end
+            end
+        end
+    end
+    return fired
+end
+
+-- Точка нажатия и центр надписи (запасная цель, если кнопка не отзывается на первую точку).
+local function points(button)
+    local ok, x, y, labelX, labelY = pcall(function()
+        local pos = button.AbsolutePosition + button.AbsoluteSize * 0.5
+        local lx, ly = math.floor(pos.X), math.floor(pos.Y)
+        for _, child in ipairs(button:GetDescendants()) do
+            if child:IsA("TextLabel") then
+                local labelPos = child.AbsolutePosition + child.AbsoluteSize * 0.5
+                lx, ly = math.floor(labelPos.X), math.floor(labelPos.Y)
+                break
+            end
+        end
+        return math.floor(pos.X), math.floor(pos.Y), lx, ly
+    end)
+    if not ok then
+        return nil
+    end
+    return x, y, labelX, labelY
+end
+
+-- Снять Active с фреймов выше кнопки (они съедают нажатие), потом вернуть как было.
+local function unblock(x, y, button)
+    local playerGui = gui()
+    if not playerGui then
+        return {}
+    end
+    local ok, objects = pcall(function()
+        return playerGui:GetGuiObjectsAtPosition(x, y)
+    end)
+    if not ok or type(objects) ~= "table" then
+        return {}
+    end
+    local saved = {}
+    for _, node in ipairs(objects) do
+        local inside = false
+        local ancestor = node
+        while ancestor do
+            if ancestor == button then
+                inside = true
+                break
+            end
+            ancestor = ancestor.Parent
+        end
+        if not inside and node:IsA("GuiObject") then
+            local okActive, active = pcall(function()
+                return node.Active
+            end)
+            if okActive and active == true then
+                saved[#saved + 1] = node
+                pcall(function()
+                    node.Active = false
+                end)
+            end
+        end
+    end
+    return saved
+end
+
+local function restore(saved)
+    for _, node in ipairs(saved or {}) do
+        pcall(function()
+            node.Active = true
+        end)
+    end
+end
+
+-- Одно зажатие: держим, пока полоска не заполнится (или карточка не уйдёт), максимум HOLD_MAX.
+-- Возвращает "filled" | "gone" | "limit" | "gone-early" — по нему и решается, что писать в лог.
+local function holdOnce(button)
+    Env.elevate()
+    local started = os.clock()
+    local hands = fireSignal(button, "MouseButton1Down")
+    local x, y, labelX, labelY = points(button)
+    if not x then
+        fireSignal(button, "MouseButton1Up")
+        return "limit", 0
+    end
+    local vim
+    pcall(function()
+        vim = game:GetService("VirtualInputManager")
+    end)
+    local saved = unblock(x, y, button)
+    debugLog("кнопка %s | обработчиков Down: %d | мышь %s | точка %d,%d",
+        button:GetFullName(), hands, vim and "да" or "нет", x, y)
+    if vim then
+        pcall(function()
+            vim:SendMouseButtonEvent(x, y, 0, true, game, 1)
+        end)
+    end
+
+    local result = "limit"
+    local ratio = nil
+    local retries = 0
+    local zeroSince = nil
+    while os.clock() - started < HOLD_MAX do
+        task.wait(0.15)
+        if not button.Parent then
+            result = "gone"
+            break
+        end
+        ratio = progressOf(button)
+        if ratio and ratio >= FILLED then
+            result = "filled"
+            break
+        end
+        if ratio and ratio <= 0.02 then
+            zeroSince = zeroSince or os.clock()
+            -- Нажатие не дошло: один-два раза пробуем ещё раз, но уже в центр надписи.
+            if retries < RETRY_LIMIT and os.clock() - zeroSince >= RETRY_AT then
+                retries += 1
+                zeroSince = nil
+                debugLog("полоска на нуле — повторное нажатие в %d,%d", labelX, labelY)
+                if vim then
+                    pcall(function()
+                        vim:SendMouseButtonEvent(x, y, 0, false, game, 1)
+                    end)
+                    task.wait(0.1)
+                    pcall(function()
+                        vim:SendMouseButtonEvent(labelX, labelY, 0, true, game, 1)
+                    end)
+                end
+                x, y = labelX, labelY
+                fireSignal(button, "MouseButton1Down")
+            end
+        else
+            zeroSince = nil
+        end
+        if not ratio and os.clock() - started >= BLIND_HOLD then
+            result = "limit"
+            break
+        end
+    end
+
+    if vim then
+        pcall(function()
+            vim:SendMouseButtonEvent(x, y, 0, false, game, 1)
+        end)
+    end
+    fireSignal(button, "MouseButton1Up")
+    restore(saved)
+    Env.elevate()
+    return result, os.clock() - started, ratio
+end
+
+-- Состояние: одна карточка — одно зажатие -------------------------------------------------------
+
+local state = {
+    armed = true,      -- можно ли жать (false = уже заполнили эту карточку, ждём следующую)
+    filledAt = 0,      -- когда отпустили после заполнения
+    goneAt = nil,      -- когда карточку последний раз не было на экране
+    zeroSince = nil,   -- с какого момента полоска стоит на нуле
+    cards = 0,         -- сколько карточек заполнено с момента запуска
+}
+
+local function arm(reason)
+    state.armed = true
+    state.zeroSince = nil
+    debugLog("снова можно жать: %s", reason)
+end
+
+Life.loop("holdreveal:watch", POLL, function()
+    if not enabled() then
+        return
+    end
+    local now = os.clock()
+    local button = findButton()
+
+    if not button then
+        state.zeroSince = nil
+        state.goneAt = state.goneAt or now
+        if not state.armed and now - state.filledAt >= MIN_GAP and now - state.goneAt >= GONE_QUIET then
+            arm("карточка ушла с экрана")
+            setStatus("ждём карточку")
+        end
+        return
+    end
+
+    state.goneAt = nil
+    if not state.armed then
+        -- Страховка на случай, если игра переиспользует ту же карточку под следующее яйцо.
+        local ratio = progressOf(button)
+        if ratio and ratio <= 0.1 then
+            state.zeroSince = state.zeroSince or now
+        else
+            state.zeroSince = nil
+        end
+        if state.zeroSince and now - state.filledAt >= FALLBACK_GAP
+            and now - state.zeroSince >= FALLBACK_ZERO then
+            arm("полоска снова на нуле — похоже, следующая карточка")
+        else
+            return
+        end
+    end
+
+    setStatus("держу кнопку")
+    local result, seconds, ratio = holdOnce(button)
+    state.armed = false
+    state.filledAt = os.clock()
+
+    if result == "filled" then
+        state.cards += 1
+        setStatus("заполнили — ждём следующую")
+        log("карточка #%d: заполнил за %.2f с — отпустил, жду следующую", state.cards, seconds)
+    elseif result == "gone" then
+        state.cards += 1
+        setStatus("карточка закрылась — ждём следующую")
+        log("карточка #%d: закрылась во время удержания (%.2f с)", state.cards, seconds)
+    else
+        -- заполнить не удалось: пишем это всегда, тут молчать нельзя
+        setStatus("не заполнилась")
+        log("карточка: заполнить не удалось за %.2f с (полоска %s) — жду следующую",
+            seconds, ratio and string.format("%.2f", ratio) or "не читается")
+    end
+end)
+
+Env.genv.holdRevealDebug = function(value)
+    verbose = value ~= false
+    return verbose
+end
+
+Env.genv.holdRevealState = function()
+    local button = findButton()
+    local ratio = button and progressOf(button) or nil
+    log("кнопка: %s | полоска: %s | можно жать: %s | заполнено карточек: %d",
+        button and button:GetFullName() or "нет",
+        ratio and string.format("%.2f", ratio) or "нет",
+        tostring(state.armed), state.cards)
+    return button
+end
+
+log("готов: карточка появилась -> зажал -> полоска заполнилась -> отпустил -> ждём следующую")
+return {}
+end
 __modules["main"] = function(use) -- src/games/tapsim/main.luau
 -- Entry point. Core first, then features in tab order, then settings (autoload last).
 
@@ -10839,6 +11430,7 @@ local FEATURES = {
     "features/skilltree",
     -- Pets
     "features/hatch",
+    "features/holdreveal",
     "features/pets",
     "features/handover",
     "features/treats",
