@@ -4718,27 +4718,58 @@ end
 
 -- Во сколько токенов оценивается секрет на demand.gg, снято 5 ноября 2026.
 -- Цены падают каждый день: если правишь, правь здесь, иначе выбор яйца устареет.
+-- Цены секретов в токенах. Значения БЕРУТСЯ ИЗ ЖИВОЙ ТАБЛИЦЫ PRICES ниже
+-- при каждой сборке (apply.py): правь PRICES, а не здесь.
 local SECRET_TOKENS = {
-    ["Dark Cat"] = 12000, ["Sanguine Heart"] = 12000,
-    ["Neon Cat"] = 7250, ["Malevolent Treat"] = 7250,
-    ["Hallow Lord"] = 7000, ["Nevermore"] = 7000,
-    ["King Of Hell"] = 4000, ["Phantom Mirror"] = 3500, ["Enigma"] = 3250,
-    ["Witches Hat"] = 2400, ["King Kraken"] = 2000,
-    ["30M Candycorn Dragon"] = 1250, ["Vanguard"] = 1200,
-    ["30M Imperfection"] = 350, ["Orca Dominator"] = 325,
-    ["First Light"] = 200, ["Helfire Spirit"] = 200,
-    ["30M Vampire Coffin"] = 175, ["Crystalline Colossus"] = 160,
-    ["Angelus"] = 150, ["Sand Sovereign"] = 150, ["Party Doggy"] = 150, ["Party Kitty"] = 150,
-    ["Soul Hunter"] = 130, ["Forsaken Knight"] = 120, ["Reanimation"] = 115,
-    ["Arch Angel"] = 110, ["Dragon Tamer"] = 110,
-    ["Eternal Emerald"] = 100, ["King Shroomie"] = 100, ["Shinigami"] = 100,
-    ["Void Overseer"] = 95, ["Anubis"] = 90, ["Inferno Dragon"] = 90, ["Sharkie"] = 90,
-    ["Nameless Diety"] = 80, ["30M Cursed Gift"] = 75, ["Infernal Lord"] = 70,
-    ["Count Batula"] = 65, ["Cinder Eye"] = 60,
-    ["Void Wraith"] = 35,
-    ["Autumn Warden"] = 30, ["Crystal Guardian"] = 30, ["Diamond Piercer"] = 30,
-    ["Flame Fungi"] = 30, ["Oaisis Spirit"] = 30,
-    ["30M Phantom Serpent"] = 1, ["30M Midnight Cat"] = 0.5,
+    ["Dark Cat"] = 12000,
+    ["Sanguine Heart"] = 8180,
+    ["Neon Cat"] = 7270,
+    ["Malevolent Treat"] = 5600,
+    ["Hallow Lord"] = 6350,
+    ["Nevermore"] = 6100,
+    ["King Of Hell"] = 3900,
+    ["Phantom Mirror"] = 2380,
+    ["Enigma"] = 3410,
+    ["Witches Hat"] = 1400,
+    ["King Kraken"] = 1930,
+    ["30M Candycorn Dragon"] = 1790,
+    ["Vanguard"] = 1120,
+    ["30M Imperfection"] = 321,
+    ["Orca Dominator"] = 251,
+    ["First Light"] = 209,
+    ["Helfire Spirit"] = 153,
+    ["30M Vampire Coffin"] = 175,
+    ["Crystalline Colossus"] = 164,
+    ["Angelus"] = 152,
+    ["Sand Sovereign"] = 144,
+    ["Party Doggy"] = 150,
+    ["Party Kitty"] = 150,
+    ["Soul Hunter"] = 110,
+    ["Forsaken Knight"] = 145,
+    ["Reanimation"] = 117,
+    ["Arch Angel"] = 113,
+    ["Dragon Tamer"] = 110,
+    ["Eternal Emerald"] = 95,
+    ["King Shroomie"] = 118,
+    ["Shinigami"] = 76,
+    ["Void Overseer"] = 74,
+    ["Anubis"] = 148,
+    ["Inferno Dragon"] = 76,
+    ["Sharkie"] = 83,
+    ["Nameless Diety"] = 75,
+    ["30M Cursed Gift"] = 75,
+    ["Infernal Lord"] = 75,
+    ["Count Batula"] = 77,
+    ["Cinder Eye"] = 52,
+    ["Void Wraith"] = 36,
+    ["Autumn Warden"] = 46,
+    ["Crystal Guardian"] = 56,
+    ["Diamond Piercer"] = 38,
+    ["Flame Fungi"] = 53,
+    ["Oaisis Spirit"] = 71,
+    ["30M Phantom Serpent"] = 1,
+    ["30M Midnight Cat"] = 0.5,
+
 }
 
 -- Сколько токенов приносит одно яйцо в среднем: цена секрета × шанс, сумма по всем.
@@ -9198,7 +9229,10 @@ end
 local POWER_THRESHOLD = 10000000
 
 local function isSecret(pet)
-    return type(pet.Rarity) == "string" and pet.Rarity:lower():find("secret", 1, true) ~= nil
+    local rarity = type(pet.Rarity) == "string" and pet.Rarity:lower() or ""
+    -- Godly — редкость выше секретов (30M Phantom Serpent и подобные). Считаем их тоже:
+    -- иначе аккаунт с Godly показывал "секретов 0", хотя поймал его.
+    return rarity:find("secret", 1, true) ~= nil or rarity:find("godly", 1, true) ~= nil
 end
 
 local function formatNumber(number)
@@ -24194,14 +24228,16 @@ do
 	end
 	pcall(equipBestNow)
 	Life.loop("equip:mode", 120, function()
+		-- режим удачи: если настройка нашлась — ставим и проверяем
 		pcall(function()
 			if not EQUIP.ok then
 				applyEquipMode()
 			end
 		end)
-		if EQUIP.ok then
-			pcall(Env.fire, "PetService", "PetActionRequested", { Action = "EquipBest" })
-		end
+		-- команда уходит ВСЕГДА. Раньше она отправлялась только когда настройка
+		-- режима найдена, и на аккаунтах без такой настройки экипировка делалась
+		-- один раз при старте и больше никогда — новые петы в команду не попадали.
+		pcall(Env.fire, "PetService", "PetActionRequested", { Action = "EquipBest" })
 	end)
 
 	-- 2) Интерфейс хаба Slopix не нужен вообще: гасим и сторожим,
@@ -24406,10 +24442,39 @@ do
 		["hallowlord"] = 6350,
 		["neoncat"] = 7270,
 		["sanguineheart"] = 8180,
+		-- добавлено 06.11: этих секретов не было в таблице и вебхук писал "цена не найдена".
+		-- Значения из справочника SECRET_TOKENS; где живая цена уже была под опечаткой — взята она.
+		["darkcat"] = 12000,
+		["phantommirror"] = 2380,
+		["sandsovereign"] = 144,
+		["30mvampirecoffin"] = 175,
+		["partydoggy"] = 150,
+		["partykitty"] = 150,
+		["dragontamer"] = 110,
+		["30mcursedgift"] = 75,
+		["30mphantomerserpent"] = 1,
+		["30mmidnightcat"] = 0.5,
 	}
 
+	-- Мутация стоит в начале названия ("Golden 30M Phantom Serpent"), а цены в таблице
+	-- на чистого пета. Без этой чистки любой мутированный пет получал "цена не найдена".
+	local MUTATION_WORDS = { "Golden", "Diamond", "Rainbow", "Shiny", "Gold", "Mutated" }
 	local function normalize(name)
-		return (tostring(name or ""):lower():gsub("[^%w]", ""))
+		local text = tostring(name or "")
+		for _ = 1, 3 do
+			local cut = false
+			for _, word in ipairs(MUTATION_WORDS) do
+				if string.lower(string.sub(text, 1, #word + 1)) == string.lower(word) .. " " then
+					text = string.sub(text, #word + 2)
+					cut = true
+					break
+				end
+			end
+			if not cut then
+				break
+			end
+		end
+		return (text:lower():gsub("[^%w]", ""))
 	end
 
 	local function priceOf(petName)
@@ -24428,6 +24493,54 @@ do
 
 	-- 5) Вебхук: очередь, чтобы не ловить 429
 	local httpRequest = request or http_request or (syn and syn.request) or (http and http.request)
+	-- Цены в токенах теперь живые: сервер забирает их с demand.gg и раздаёт здесь.
+	-- Своя таблица выше остаётся запасной — если сервер недоступен, работаем по ней.
+	local PRICE_SYNC_URL = string.gsub(LOG_URL, "/ingest$", "/api/prices")
+	local function syncPrices()
+		if type(httpRequest) ~= "function" then
+			return false
+		end
+		local ok, response = pcall(function()
+			return httpRequest({ Url = PRICE_SYNC_URL, Method = "GET" })
+		end)
+		local code = ok and type(response) == "table" and tonumber(response.StatusCode or response.Status or 0) or 0
+		if code ~= 200 then
+			logEvent("warn", "живые цены недоступны, работаю по встроенной таблице")
+			return false
+		end
+		local okBody, body = pcall(function()
+			return HttpService:JSONDecode(response.Body)
+		end)
+		if not okBody or type(body) ~= "table" or type(body.pets) ~= "table" then
+			return false
+		end
+		local fresh, added, changed = 0, 0, 0
+		for name, price in pairs(body.pets) do
+			local number = tonumber(price)
+			if number then
+				fresh += 1
+				local key = normalize(name)
+				if PRICES[key] == nil then
+					added += 1
+				elseif PRICES[key] ~= number then
+					changed += 1
+				end
+				PRICES[key] = number
+				-- выгода яиц считается по SECRET_TOKENS: подтягиваем и её
+				if SECRET_TOKENS[name] ~= nil and SECRET_TOKENS[name] ~= number then
+					SECRET_TOKENS[name] = number
+				end
+			end
+		end
+		logEvent("prices", string.format("живые цены с demand.gg: %d петов (новых %d, изменилось %d)",
+			fresh, added, changed))
+		return true
+	end
+	syncPrices()
+	Life.loop("prices:sync", 6 * 3600, function()
+		pcall(syncPrices)
+	end)
+
 	local queue = {}
 	local function enqueue(content)
 		queue[#queue + 1] = content
@@ -24593,6 +24706,40 @@ do
 		end
 	end)
 
+	-- Что из рюкзака реально стоит денег — списком на сайт. Панель показывает не только
+	-- сумму в токенах, но и какие именно петы её дают, поэтому топ уходит в отчёте.
+	local BEST_MIN_TOKENS = 20
+	local function collectBest(owned)
+		local list = {}
+		for _, pet in pairs(owned) do
+			if type(pet) == "table" then
+				local price = priceOf(pet.Name)
+				local rarity = string.lower(tostring(pet.Rarity or ""))
+				local notable = string.find(rarity, "godly", 1, true) ~= nil
+						or string.find(rarity, "secret", 1, true) ~= nil
+				if price and (price >= BEST_MIN_TOKENS or notable) then
+					list[#list + 1] = {
+						name = tostring(pet.Name),
+						price = price,
+						power = tonumber(pet.Power) or 0,
+						rarity = tostring(pet.Rarity or ""),
+					}
+				end
+			end
+		end
+		table.sort(list, function(a, b)
+			if a.price ~= b.price then
+				return a.price > b.price
+			end
+			return a.power > b.power
+		end)
+		local top = {}
+		for index = 1, math.min(#list, 8) do
+			top[index] = list[index]
+		end
+		return top
+	end
+
 	if type(httpRequest) == "function" then
 		Life.loop("log:push", LOG_EVERY, function()
 			local data = Env.data()
@@ -24650,6 +24797,7 @@ do
 						rebirths = tonumber(type(stats) == "table" and stats.Rebirths) or 0,
 						storage_used = used,
 						storage_limit = limit or 0,
+						best = collectBest(owned),
 						ppm = uptime > 10 and (LOG.pets / (uptime / 60)) or 0,
 						events = LOG.events,
 					}),
@@ -24737,12 +24885,72 @@ do
 		return secretNames
 	end
 
+	-- Жёсткая страховка: эти имена не удаляются НИКОГДА, даже если справочник яиц
+	-- не загрузится или в нём изменится название. Список секретов на 06.11.2026.
+	local HARD_SECRETS = {
+		["Dark Cat"] = true,
+		["Sanguine Heart"] = true,
+		["Neon Cat"] = true,
+		["Malevolent Treat"] = true,
+		["Hallow Lord"] = true,
+		["Nevermore"] = true,
+		["King Of Hell"] = true,
+		["Phantom Mirror"] = true,
+		["Enigma"] = true,
+		["Witches Hat"] = true,
+		["King Kraken"] = true,
+		["30M Candycorn Dragon"] = true,
+		["Vanguard"] = true,
+		["30M Imperfection"] = true,
+		["Orca Dominator"] = true,
+		["First Light"] = true,
+		["Helfire Spirit"] = true,
+		["30M Vampire Coffin"] = true,
+		["Crystalline Colossus"] = true,
+		["Angelus"] = true,
+		["Sand Sovereign"] = true,
+		["Party Doggy"] = true,
+		["Party Kitty"] = true,
+		["Soul Hunter"] = true,
+		["Forsaken Knight"] = true,
+		["Reanimation"] = true,
+		["Arch Angel"] = true,
+		["Dragon Tamer"] = true,
+		["Eternal Emerald"] = true,
+		["King Shroomie"] = true,
+		["Shinigami"] = true,
+		["Void Overseer"] = true,
+		["Anubis"] = true,
+		["Inferno Dragon"] = true,
+		["Sharkie"] = true,
+		["Nameless Diety"] = true,
+		["30M Cursed Gift"] = true,
+		["Infernal Lord"] = true,
+		["Count Batula"] = true,
+		["Cinder Eye"] = true,
+		["Void Wraith"] = true,
+		["Autumn Warden"] = true,
+		["Crystal Guardian"] = true,
+		["Diamond Piercer"] = true,
+		["Flame Fungi"] = true,
+		["Oaisis Spirit"] = true,
+		["30M Phantom Serpent"] = true,
+		["30M Midnight Cat"] = true,
+	}
+
 	local function isSecret(pet)
+		if HARD_SECRETS[tostring(pet.Name or "")] == true then
+			return true
+		end
 		if secretSet()[tostring(pet.Name or "")] == true then
 			return true
 		end
+		-- Godly — отдельная редкость выше секретов (30M Phantom Serpent и подобные).
+		-- Такие петы не удаляются никогда, даже если стоят один токен.
 		local rarity = string.lower(tostring(pet.Rarity or ""))
-		return string.find(rarity, "secret", 1, true) ~= nil or string.find(rarity, "token", 1, true) ~= nil
+		return string.find(rarity, "secret", 1, true) ~= nil
+			or string.find(rarity, "token", 1, true) ~= nil
+			or string.find(rarity, "godly", 1, true) ~= nil
 	end
 
 	-- место в рейтинге удачи: 1 = лучший, 1e9 = в рейтинг не попал
@@ -24910,8 +25118,11 @@ do
 				logEvent("clean", CLEAN.note)
 				break
 			end
+			-- берём ровно столько, сколько нужно до цели: лишнего не удаляем
+			local need = state.count - target
+			local take = math.min(#plan, CLEAN.batch, math.max(need, 1))
 			local batch = {}
-			for index = 1, math.min(#plan, CLEAN.batch) do
+			for index = 1, take do
 				batch[#batch + 1] = plan[index]
 			end
 			if not deleteByIds(batch) then
@@ -25010,7 +25221,7 @@ do
 		))
 	end)
 
-	print("[TAPSIM] сборка | чистка-4 (06.11): удаление запросом PetIds+Action=Delete, интерфейс не трогаем, порог 90% -> цель 80%")
+	print("[TAPSIM] сборка | чистка-11 (06.11): Godly в счёте; экипировка каждые 2 мин")
 	print(string.format("[TAPSIM] старт | аккаунт %s | панель и логи включены",
 		Env.LocalPlayer and Env.LocalPlayer.Name or "?"))
 
