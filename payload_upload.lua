@@ -9693,6 +9693,703 @@ end)
 
 return {}
 end
+__modules["features/handover"] = function(use) -- src/games/tapsim/features/handover.luau
+-- Hands this account's Secret and Godly pets to the bank, then goes straight back to farming.
+--
+-- The bank joins this server and sends the request itself. This module answers it:
+--   pause every farm toggle -> unlock and take the valuables off the team -> press the real
+--   Accept button -> put every Secret/Godly in the offer in one packet -> press READY ->
+--   press CONFIRM -> on Completed: EquipBest and put every toggle back exactly as it was.
+--
+-- Button paths were captured by recording real clicks, because the names say nothing here:
+--   Tabs.TradeQuest.Menu.Accept.Button           the incoming request window
+--   Tabs.TradeQuest.Menu.Decline.Button          its Ignore button
+--   Trading.Trading.Build.Actions.Ready.Button   the big READY
+--   Trading.Trading.Review.Confirm.Button        CONFIRM inside the review step
+--
+-- The farm is paused by switching the hub's own automation toggles off (Ui.stopAll) after
+-- remembering their values, so nothing taps, hatches or re-equips while the trade is open.
+
+local Env = use("core/env")
+local Life = use("shared/life")
+local Ui = use("core/ui")
+
+local BANK_NAMES = { "Riglafsma" }
+local BANK_IDS = { 11747325739 }
+local TAKE_RARITY = { "Godly", "Secret" }
+local MAX_PETS = 12
+local ACCEPT_WINDOW = 20        -- seconds to wait for the session after pressing Accept
+local READY_DELAY = 4.5         -- pause before READY, as the owner described for the bank
+local POLL_SECONDS = 2          -- how often a pending request is looked for
+
+local tab = Ui.Tabs.Home
+local box = tab:AddGroupbox({ Side = "Right", Name = "Handover", IconName = "package" })
+
+box:AddToggle("Handover", {
+    Text = "Отдавать секретов и Godly банку",
+    Default = true,
+    Tooltip = "Ждёт трейд от банка: пауза фарма, снятие петов с команды, приём, оффер, READY и CONFIRM. После сделки возвращает лучших петов и продолжает фарм.",
+})
+local statusLabel = box:AddLabel("Handover: ждём запрос от банка", true)
+local checkPanelNowResponse -- forward declaration, defined below
+box:AddButton({
+    Text = "Проверить трейд сейчас",
+    Func = function()
+        checkPanelNowResponse()
+    end,
+})
+
+local function log(fmt, ...)
+    local ok, text = pcall(string.format, fmt, ...)
+    print("[handover] " .. (ok and text or tostring(fmt)))
+end
+
+local function setStatus(text)
+    pcall(function()
+        statusLabel:SetText("Handover: " .. text)
+    end)
+end
+
+-- ---------------------------------------------------------------------------------------------
+-- buttons
+-- ---------------------------------------------------------------------------------------------
+
+local function playerGui()
+    local gui = Env.LocalPlayer and Env.LocalPlayer:FindFirstChild("PlayerGui")
+    return gui
+end
+
+local function resolvePath(parts)
+    local node = playerGui()
+    if not node then
+        return nil
+    end
+    for _, name in ipairs(parts) do
+        node = node:FindFirstChild(name)
+        if not node then
+            return nil
+        end
+    end
+    return node
+end
+
+local function pressConnection(button, label)
+    if not button then
+        log("кнопки %s нет", label)
+        return 0
+    end
+    local genv = Env.genv or {}
+    Env.elevate()
+    local pressed = 0
+    local getconnections = genv.getconnections
+    if type(getconnections) == "function" then
+        for _, signalName in ipairs({ "Activated", "MouseButton1Click", "MouseButton1Down" }) do
+            local okSignal, signal = pcall(function()
+                return button[signalName]
+            end)
+            if okSignal and signal then
+                local okList, list = pcall(getconnections, signal)
+                if okList and type(list) == "table" then
+                    for _, connection in ipairs(list) do
+                        local hasFire = pcall(function()
+                            return connection.Fire
+                        end)
+                        if connection.Enabled ~= false and hasFire and pcall(connection.Fire) then
+                            pressed += 1
+                        end
+                    end
+                end
+            end
+        end
+    end
+    local firesignal = genv.firesignal
+    if pressed == 0 and type(firesignal) == "function" then
+        for _, signalName in ipairs({ "Activated", "MouseButton1Click" }) do
+            local okSignal, signal = pcall(function()
+                return button[signalName]
+            end)
+            if okSignal and signal and pcall(firesignal, signal) then
+                pressed += 1
+            end
+        end
+    end
+    log("нажал %s (%d)", label, pressed)
+    return pressed
+end
+
+local ACCEPT_PATH = { "Tabs", "TradeQuest", "Menu", "Accept", "Button" }
+local DECLINE_PATH = { "Tabs", "TradeQuest", "Menu", "Decline", "Button" }
+local READY_PATH = { "Trading", "Trading", "Build", "Actions", "Ready", "Button" }
+local CONFIRM_PATH = { "Trading", "Trading", "Review", "Confirm", "Button" }
+
+-- ---------------------------------------------------------------------------------------------
+-- pets
+-- ---------------------------------------------------------------------------------------------
+
+local function petsTable()
+    local data = Env.data()
+    local pets = data and type(data.Pets) == "table" and data.Pets
+    return pets
+end
+
+local function isWanted(pet)
+    if type(pet) ~= "table" then
+        return false
+    end
+    local rarity = string.lower(tostring(pet.Rarity or ""))
+    for _, wanted in ipairs(TAKE_RARITY) do
+        if string.find(rarity, string.lower(wanted), 1, true) then
+            return true
+        end
+    end
+    local name = string.lower(tostring(pet.Name or ""))
+    for _, wanted in ipairs({ "30m phantom serpent", "30m cursed gift", "30m imperfection" }) do
+        if string.find(name, wanted, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+local function ownedById()
+    local map = {}
+    local pets = petsTable()
+    if not pets or type(pets.Owned) ~= "table" then
+        return map
+    end
+    for key, pet in pairs(pets.Owned) do
+        if type(pet) == "table" then
+            local id = pet.Id ~= nil and tostring(pet.Id) or tostring(key)
+            map[id] = pet
+        end
+    end
+    return map
+end
+
+local function teamIds()
+    local ids = {}
+    local pets = petsTable()
+    if not pets then
+        return ids
+    end
+    if type(pets.Equipped) == "table" then
+        for _, value in pairs(pets.Equipped) do
+            local id = type(value) == "table" and (value.Id or value.PetId) or value
+            if id ~= nil then
+                ids[tostring(id)] = true
+            end
+        end
+    end
+    for id, pet in pairs(pets.Owned or {}) do
+        if type(pet) == "table" and pet.Equip == true then
+            ids[tostring(pet.Id ~= nil and pet.Id or id)] = true
+        end
+    end
+    return ids
+end
+
+local function petId(pet, fallback)
+    if type(pet) == "table" and pet.Id ~= nil then
+        return tostring(pet.Id)
+    end
+    return fallback and tostring(fallback) or nil
+end
+
+local function isLocked(id)
+    local pet = ownedById()[tostring(id)]
+    return pet ~= nil and pet.Locked == true
+end
+
+local function unlockPet(id)
+    if not isLocked(id) then
+        return true
+    end
+    for _, action in ipairs({ "ToggleLock", "Unlock", "SetLocked" }) do
+        pcall(function()
+            Env.fire("PetService", "PetActionRequested", { Action = action, PetId = id, Locked = false })
+        end)
+        local deadline = os.clock() + 1.5
+        while os.clock() < deadline do
+            if not isLocked(id) then
+                return true
+            end
+            task.wait(0.15)
+        end
+    end
+    return false
+end
+
+local function unequipPet(id, label)
+    if not teamIds()[tostring(id)] then
+        return true
+    end
+    for _ = 1, 3 do
+        pcall(function()
+            Env.fire("PetService", "PetActionRequested", { Action = "Unequip", PetId = id })
+        end)
+        local deadline = os.clock() + 2
+        while os.clock() < deadline do
+            if not teamIds()[tostring(id)] then
+                log("снял с команды: %s", tostring(label))
+                return true
+            end
+            task.wait(0.15)
+        end
+    end
+    log("НЕ снялось: %s", tostring(label))
+    return false
+end
+
+local function unequipValuables()
+    local pets = petsTable()
+    if not pets or type(pets.Owned) ~= "table" then
+        log("данные петов недоступны")
+        return 0
+    end
+    local removed = 0
+    for key, pet in pairs(pets.Owned) do
+        if type(pet) == "table" and isWanted(pet) then
+            local id = petId(pet, key)
+            if id and teamIds()[id] then
+                if pet.Locked == true and not unlockPet(id) then
+                    log("залочен и не разлочился: %s", tostring(pet.Name))
+                elseif unequipPet(id, pet.Name) then
+                    removed += 1
+                end
+                task.wait(0.2)
+            end
+        end
+    end
+    return removed
+end
+
+-- ---------------------------------------------------------------------------------------------
+-- pause and resume of the whole farm
+-- ---------------------------------------------------------------------------------------------
+
+local paused = false
+local savedToggles = nil
+
+local function pauseFarm()
+    if paused then
+        return
+    end
+    paused = true
+    savedToggles = {}
+    local toggles = Ui.Library and Ui.Library.Toggles or {}
+    for name, toggle in pairs(toggles) do
+        savedToggles[name] = toggle.Value == true
+    end
+    Ui.stopAll(false)
+    if Env.genv then
+        Env.genv.__handoverPaused = true
+    end
+    setStatus("фарм на паузе, идёт сделка")
+    log("фарм на паузе")
+end
+
+local function resumeFarm()
+    if not paused then
+        return
+    end
+    paused = false
+    for name, value in pairs(savedToggles or {}) do
+        pcall(Ui.set, name, value)
+    end
+    savedToggles = nil
+    if Env.genv then
+        Env.genv.__handoverPaused = false
+    end
+    -- the pets we gave away are gone, so take the strongest of what is left
+    pcall(function()
+        Env.fire("PetService", "PetActionRequested", { Action = "EquipBest" })
+    end)
+    setStatus("фарм продолжается")
+    log("фарм снова работает, EquipBest отправлен")
+end
+
+-- ---------------------------------------------------------------------------------------------
+-- deal state
+-- ---------------------------------------------------------------------------------------------
+
+local state = {
+    busy = false,
+    pending = nil,
+    session = nil,
+    started = false,
+    done = false,
+    cancelled = false,
+    partnerReady = false,
+    mine = {},
+    pendingAt = 0,
+}
+
+local function resetState()
+    state.session = nil
+    state.started = false
+    state.done = false
+    state.cancelled = false
+    state.partnerReady = false
+    state.mine = {}
+end
+
+local function senderAllowed(name, userId)
+    for _, wanted in ipairs(BANK_NAMES) do
+        if type(name) == "string" and string.lower(wanted) == string.lower(name) then
+            return true
+        end
+    end
+    for _, wanted in ipairs(BANK_IDS) do
+        if tonumber(userId) == tonumber(wanted) then
+            return true
+        end
+    end
+    return false
+end
+
+-- ---------------------------------------------------------------------------------------------
+-- offer
+-- ---------------------------------------------------------------------------------------------
+
+local function wantedIds()
+    local list = {}
+    local pets = petsTable()
+    if not pets or type(pets.Owned) ~= "table" then
+        return list
+    end
+    local byRarity = {}
+    for key, pet in pairs(pets.Owned) do
+        if type(pet) == "table" and isWanted(pet) then
+            local id = petId(pet, key)
+            if id then
+                if pet.Locked == true and not unlockPet(id) then
+                    log("пропускаю %s — залочен", tostring(pet.Name))
+                else
+                    list[#list + 1] = { id = id, power = tonumber(pet.Power) or 0, name = tostring(pet.Name) }
+                    local rarity = string.lower(tostring(pet.Rarity or "?"))
+                    byRarity[rarity] = (byRarity[rarity] or 0) + 1
+                end
+            end
+        end
+    end
+    local parts = {}
+    for rarity, amount in pairs(byRarity) do
+        parts[#parts + 1] = rarity .. "=" .. amount
+    end
+    table.sort(parts)
+    log("к передаче %d петов (%s)", #list, table.concat(parts, ", "))
+    table.sort(list, function(a, b)
+        return a.power > b.power
+    end)
+    return list
+end
+
+local function offerCount()
+    local total = 0
+    for _ in pairs(state.mine) do
+        total += 1
+    end
+    return total
+end
+
+local function offerMissing(ids)
+    local missing = {}
+    for _, id in ipairs(ids) do
+        if not state.mine[tostring(id)] then
+            missing[#missing + 1] = tostring(id)
+        end
+    end
+    return missing
+end
+
+local function givePets()
+    local list = wantedIds()
+    if #list == 0 then
+        log("секретов и Godly нет — отдавать нечего")
+        return 0
+    end
+    local ids, seen = {}, {}
+    for _, entry in ipairs(list) do
+        if not seen[entry.id] and #ids < MAX_PETS then
+            seen[entry.id] = true
+            ids[#ids + 1] = entry.id
+        end
+    end
+    if #list > #ids then
+        log("в окно беру %d, остальные %d пойдут следующим трейдом", #ids, #list - #ids)
+    end
+
+    pcall(function()
+        Env.fire("TradingService", "TradeRequested", { Action = "Offer", PetIds = ids })
+    end)
+    log("отправил оффер: %d петов", #ids)
+
+    local deadline = os.clock() + 6
+    while os.clock() < deadline do
+        if #offerMissing(ids) == 0 then
+            break
+        end
+        task.wait(0.2)
+    end
+
+    local missing = offerMissing(ids)
+    if #missing > 0 then
+        log("%d петов не появились в оффере — добиваю по одному", #missing)
+        for _, id in ipairs(missing) do
+            pcall(function()
+                Env.fire("TradingService", "TradeRequested", { Action = "Offer", PetIds = { id } })
+            end)
+            task.wait(0.4)
+        end
+    end
+
+    local given = offerCount()
+    local names = {}
+    local byId = ownedById()
+    for id in pairs(state.mine) do
+        local pet = byId[tostring(id)]
+        names[#names + 1] = pet and tostring(pet.Name) or tostring(id)
+    end
+    log("в оффере %d петов: %s", given, table.concat(names, ", "))
+    return given
+end
+
+-- ---------------------------------------------------------------------------------------------
+-- ready and confirm
+-- ---------------------------------------------------------------------------------------------
+
+local function waitForButton(path, label, seconds)
+    local deadline = os.clock() + (seconds or 15)
+    while os.clock() < deadline do
+        local button = resolvePath(path)
+        if button then
+            return button
+        end
+        task.wait(0.3)
+    end
+    log("кнопка %s не появилась", label)
+    return nil
+end
+
+local function pressConfirmRounds()
+    for round = 1, 8 do
+        if state.done or state.cancelled then
+            return state.done
+        end
+        local confirm = resolvePath(CONFIRM_PATH)
+        if confirm then
+            pressConnection(confirm, "CONFIRM, раунд " .. round)
+        else
+            log("окна Review пока нет, раунд %d", round)
+        end
+        local deadline = os.clock() + 1.5
+        while os.clock() < deadline do
+            if state.done or state.cancelled then
+                return state.done
+            end
+            task.wait(0.2)
+        end
+    end
+    return state.done
+end
+
+local function pressReadyThenConfirm()
+    Life.wait(READY_DELAY)
+    local ready = waitForButton(READY_PATH, "READY", 15)
+    if not ready then
+        return false
+    end
+    if pressConnection(ready, "READY") == 0 then
+        return false
+    end
+    local limit = os.clock() + 25
+    while os.clock() < limit do
+        if state.done or state.cancelled or state.partnerReady then
+            break
+        end
+        task.wait(0.3)
+    end
+    log(state.partnerReady and "банк готов — жму CONFIRM" or "банк не отметился — жму CONFIRM всё равно")
+    return pressConfirmRounds()
+end
+
+-- ---------------------------------------------------------------------------------------------
+-- the whole handover
+-- ---------------------------------------------------------------------------------------------
+
+local function runHandover(name, fromId)
+    if state.busy then
+        log("уже в сделке — пропускаю")
+        return
+    end
+    if not Ui.on("Handover") then
+        log("модуль выключен в панели — трейд не отвечаю")
+        return
+    end
+    state.busy = true
+    state.pending = nil
+    resetState()
+
+    local ok, err = pcall(function()
+        pauseFarm()
+        log("запрос от %s (id=%s)", tostring(name), tostring(fromId))
+
+        unequipValuables()
+
+        local accept = resolvePath(ACCEPT_PATH)
+        if not accept or pressConnection(accept, "ACCEPT") == 0 then
+            error("кнопка Accept не нажалась")
+        end
+
+        local deadline = os.clock() + ACCEPT_WINDOW
+        while os.clock() < deadline and not state.started do
+            task.wait(0.2)
+        end
+        if not state.started then
+            error("сессия не открылась")
+        end
+        log("сессия открыта: %s", tostring(state.session))
+
+        Life.wait(1.5)
+        givePets()
+        pressReadyThenConfirm()
+
+        local limit = os.clock() + 120
+        while os.clock() < limit and not state.done and not state.cancelled do
+            task.wait(0.3)
+        end
+        if not state.done then
+            error(state.cancelled and "сделка отменена" or "сделка не завершилась")
+        end
+    end)
+
+    if not ok then
+        log("ошибка: %s", tostring(err))
+        setStatus("ошибка: " .. tostring(err))
+    end
+
+    state.busy = false
+    Life.wait(1)
+    resumeFarm()
+end
+
+-- ---------------------------------------------------------------------------------------------
+-- events and the 2 second check
+-- ---------------------------------------------------------------------------------------------
+
+local tradeUpdate = Env.remote("TradingService", "TradeUpdate")
+Life.connect(tradeUpdate.OnClientEvent, function(payload)
+    if type(payload) ~= "table" then
+        return
+    end
+    local kind = tostring(payload.Type)
+    local mine = payload.UserId == Env.LocalPlayer.UserId
+
+    if kind == "Request" then
+        local name, fromId = payload.FromName, tonumber(payload.FromUserId)
+        if not senderAllowed(name, fromId) then
+            log("запрос от %s — это не банк, отказ", tostring(name))
+            local decline = resolvePath(DECLINE_PATH)
+            if decline then
+                pressConnection(decline, "IGNORE")
+            end
+            pcall(function()
+                Env.fire("TradingService", "TradeRequested", { Action = "Decline", TargetUserId = fromId })
+            end)
+            return
+        end
+        if state.busy then
+            log("запрос от банка, но сделка уже идёт")
+            return
+        end
+        state.pending = { name = name, id = fromId }
+        state.pendingAt = os.clock()
+        task.spawn(function()
+            runHandover(name, fromId)
+        end)
+
+    elseif kind == "Started" then
+        state.session = payload.SessionId
+        state.started = true
+
+    elseif kind == "Offer" then
+        if mine then
+            state.mine = {}
+            for _, value in pairs(payload.PetIds or {}) do
+                state.mine[tostring(value)] = true
+            end
+        end
+
+    elseif kind == "Lock" then
+        if not mine then
+            state.partnerReady = true
+        end
+
+    elseif kind == "Completed" then
+        state.done = true
+        log("СДЕЛКА ЗАВЕРШЕНА: %s", tostring(payload.TxId))
+
+    elseif kind == "Cancelled" then
+        state.cancelled = true
+        log("отменено: %s", tostring(payload.Reason))
+    end
+end, "handover:trade")
+
+-- Safety net for a request that arrived before this module was loaded, or while the hub was
+-- busy: the request window stays on screen until it is answered.
+local function requestWindowOpen()
+    local gui = playerGui()
+    local tabs = gui and gui:FindFirstChild("Tabs")
+    local quest = tabs and tabs:FindFirstChild("TradeQuest")
+    if not quest then
+        return false
+    end
+    local visible = true
+    pcall(function()
+        visible = quest.Visible
+    end)
+    return visible == true
+end
+
+function checkPanelNowResponse()
+    if state.busy or not requestWindowOpen() then
+        setStatus("окна запроса нет")
+        return
+    end
+    local quest = playerGui():FindFirstChild("Tabs"):FindFirstChild("TradeQuest")
+    local sent = quest:FindFirstChild("PlayerSent")
+    local text = ""
+    pcall(function()
+        text = tostring(sent and sent.Text or "")
+    end)
+    log("окно запроса на экране: %s", text)
+    local name = string.match(text, "^(%S+)")
+    if name and senderAllowed(name, nil) then
+        task.spawn(function()
+            runHandover(name, nil)
+        end)
+    else
+        setStatus("запрос не от банка")
+    end
+end
+
+Life.loop("handover:poll", POLL_SECONDS, function()
+    if state.busy then
+        return
+    end
+    -- the request window stays on screen until it is answered, so this catches a request
+    -- that arrived before the module was loaded or while the hub was busy
+    if requestWindowOpen() then
+        checkPanelNowResponse()
+    elseif state.pending then
+        state.pending = nil
+    end
+end)
+
+setStatus("ждём запрос от банка")
+return {}
+end
+
 __modules["main"] = function(use) -- src/games/tapsim/main.luau
 -- Entry point. Core first, then features in tab order, then settings (autoload last).
 
@@ -9738,6 +10435,7 @@ local FEATURES = {
     -- Pets
     "features/hatch",
     "features/pets",
+    "features/handover",
     "features/treats",
     "features/enchant",
     "features/shrine",
@@ -24228,6 +24926,10 @@ do
 	end
 	pcall(equipBestNow)
 	Life.loop("equip:mode", 120, function()
+		-- идёт сделка: не переэкипировываем, иначе петы вернутся в команду и уйдут из оффера
+		if Env.genv and Env.genv.__handoverPaused then
+			return
+		end
 		-- режим удачи: если настройка нашлась — ставим и проверяем
 		pcall(function()
 			if not EQUIP.ok then
@@ -25154,6 +25856,10 @@ do
 	-- проверка заполненности и чистка: раз в 20 секунд
 	Life.loop("pet:clean", 20, function()
 		if not CLEAN.enabled then
+			return
+		end
+		-- во время сделки рюкзак не трогаем
+		if Env.genv and Env.genv.__handoverPaused then
 			return
 		end
 		cleanNow()
