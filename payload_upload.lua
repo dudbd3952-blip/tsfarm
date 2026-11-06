@@ -9734,7 +9734,7 @@ local CONFIRM_PATH_BUTTON = { "Trading", "Trading", "Review", "Confirm", "Button
 
 local READY_DELAY = 1.5         -- пауза после оффера перед READY
 local CONFIRM_WINDOW = 45       -- сколько ждём, пока оживёт CONFIRM
-local CONFIRM_ROUNDS = 8        -- подтверждаем раундами
+local CONFIRM_ROUNDS = 12       -- максимум раундов, если стадия Confirm всё не приходит
 local CONFIRM_ROUND_WAIT = 1.5  -- пауза между раундами
 local ACCEPT_TIMEOUT = 25       -- сколько ждём открытия сессии после Accept
 local TRADE_TIMEOUT = 150       -- сколько всего ждём завершения сделки
@@ -9750,6 +9750,9 @@ local stage = "ждём трейд"
 local busy = false           -- идёт сделка целиком (от Accept до итога)
 local handoverActive = false -- идёт шаг «оффер -> READY -> CONFIRM»
 local traded = false         -- сделка закрылась (Completed/Cancelled)
+local sawReview = false      -- игра прислала стадию "Review": шаг подтверждения открыт
+local sawConfirm = false     -- игра прислала стадию "Confirm": наш CONFIRM принят
+local lastStage = "—"        -- последняя стадия из TradeUpdate (для лога ожидания)
 local startedEvent = false   -- сервер прислал TradeUpdate "Started"
 local finishedLogged = false -- «трейд закончился» уже напечатали для этой сделки
 local readyAt = os.clock()   -- когда нажали READY (для лога «CONFIRM ожил через N с»)
@@ -10239,21 +10242,36 @@ end
 -- ---------------------------------------------------------------------------------------------
 
 local function pressConfirmRounds()
-    for round = 1, CONFIRM_ROUNDS do
+    local startedAt = os.clock()
+    local rounds = 0
+    while not traded and not sawConfirm and rounds < CONFIRM_ROUNDS do
         if not running then
             return false
         end
-        if traded then
-            log("сделка завершилась — CONFIRM больше не жму (нажатий: %d)", round - 1)
-            return true
+        if os.clock() - startedAt > CONFIRM_WINDOW then
+            break
         end
+        rounds += 1
         local confirm = findConfirmButton()
         if confirm then
-            press(confirm, string.format("CONFIRM, раунд %d", round))
+            press(confirm, string.format("CONFIRM, раунд %d", rounds))
         else
-            log("узла CONFIRM нет в дереве, раунд %d", round)
+            log("узла CONFIRM нет в дереве, раунд %d", rounds)
         end
-        task.wait(CONFIRM_ROUND_WAIT)
+        -- Ждём не «полторы секунды», а либо стадию Confirm (наш клик принят), либо закрытие
+        -- сделки. Раньше жало все 8 раундов подряд, в том числе уже после Confirm, и сделка
+        -- вставала на месте: подтверждение снималось повторными нажатиями.
+        local deadline = os.clock() + CONFIRM_ROUND_WAIT
+        while os.clock() < deadline and not traded and not sawConfirm do
+            task.wait(0.1)
+        end
+    end
+    if sawConfirm then
+        log("наш CONFIRM принят (стадия Confirm, нажатий: %d) — дальше ждём вторую сторону", rounds)
+    elseif traded then
+        log("сделка закрылась на CONFIRM (нажатий: %d)", rounds)
+    else
+        log("стадия Confirm так и не пришла за %d с (нажатий: %d)", CONFIRM_WINDOW, rounds)
     end
     return true
 end
@@ -10275,25 +10293,25 @@ local function readyThenConfirm()
     end
     readyAt = os.clock()
 
-    -- Ждём, пока у CONFIRM появятся обработчики: значит игра открыла шаг подтверждения.
-    -- Если getconnections недоступен — просто даём паузу и жмём раундами.
-    local wired = waitFor(function()
+    -- Открытие шага подтверждения определяем ПО СОБЫТИЮ "Review", а не по обработчикам кнопки:
+    -- у Review.Confirm обработчики висят всегда, поэтому по ним момент не поймать (в живом логе
+    -- выходило «CONFIRM ожил через 0.0 с» и четыре первых нажатия уходили в пустоту).
+    local opened = waitFor(function()
         if traded then
             return "done"
         end
-        local confirm = findConfirmButton()
-        if confirm and liveConnections(confirm) ~= 0 then
-            return "ready"
+        if sawReview then
+            return "review"
         end
         return nil
-    end, CONFIRM_WINDOW, 0.3)
-    if wired == "done" then
+    end, CONFIRM_WINDOW, 0.25)
+    if opened == "done" then
         log("сделка закрылась ещё до CONFIRM")
         return true
-    elseif wired == "ready" then
-        log("CONFIRM ожил через %.1f с после READY", os.clock() - readyAt)
+    elseif opened == "review" then
+        log("шаг подтверждения открылся (Review) через %.1f с после READY", os.clock() - readyAt)
     else
-        log("CONFIRM за %d с не ожил — жму раундами всё равно", CONFIRM_WINDOW)
+        log("Review за %d с не пришёл — жму CONFIRM всё равно", CONFIRM_WINDOW)
     end
     return pressConfirmRounds()
 end
@@ -10322,12 +10340,20 @@ local function handover()
 
         stage = "ждём завершения сделки"
         log("этап: %s", stage)
-        if waitFor(function()
-            return traded
-        end, TRADE_TIMEOUT, 0.3) then
+        local waitFrom = os.clock()
+        local nextNote = os.clock() + 15
+        while not traded and os.clock() - waitFrom < TRADE_TIMEOUT do
+            task.wait(0.3)
+            if not traded and os.clock() >= nextNote then
+                nextNote = os.clock() + 15
+                log("ждём завершения: стадия %s | наш CONFIRM принят: %s",
+                    tostring(lastStage), tostring(sawConfirm))
+            end
+        end
+        if traded then
             log("сделка завершена")
         else
-            log("сделка не завершилась за %d с", TRADE_TIMEOUT)
+            log("сделка не завершилась за %d с (стадия %s)", TRADE_TIMEOUT, tostring(lastStage))
         end
     end)
     if not ok then
@@ -10348,6 +10374,9 @@ local function acceptTrade(name)
     startedEvent = false
     finishedLogged = false
     traded = false
+    sawReview = false
+    sawConfirm = false
+    lastStage = "—"
     stage = "пришёл трейд от " .. tostring(name)
     log("этап: %s", stage)
     task.spawn(function()
@@ -10450,6 +10479,12 @@ if okRemote and tradeUpdate then
         local kind = tostring(payload.Type)
         if kind ~= "Offer" then
             log("TradeUpdate: %s", kind)
+        end
+        lastStage = kind
+        if kind == "Review" then
+            sawReview = true
+        elseif kind == "Confirm" then
+            sawConfirm = true
         end
 
         if kind == "Request" then
