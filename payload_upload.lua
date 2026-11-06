@@ -9694,44 +9694,76 @@ end)
 return {}
 end
 __modules["features/handover"] = function(use) -- src/games/tapsim/features/handover.luau
--- Hands this account's Secret and Godly pets to the bank, then goes straight back to farming.
+-- Передача петов банку. Это ПОРТ отдельного скрипта farm_trade_only.lua (v2), который проверен
+-- в игре: те же пути кнопок, те же тайминги, тот же порядок. Ничего «своего» здесь нет.
 --
--- The bank joins this server and sends the request itself. This module answers it:
---   pause every farm toggle -> unlock and take the Secrets off the team -> press the real
---   Accept button -> put every Secret in the offer in one packet -> 1.5 s -> READY ->
---   wait until CONFIRM really works -> press CONFIRM in rounds -> on Completed: EquipBest and put
---   every toggle back exactly as it was.
+-- Порядок ровно как в отдельном скрипте:
+--   1) событие TradeUpdate "Request" и проверка, что оно от банка (Riglafsma / id 11747325739),
+--      остальным — Decline;
+--   2) фарм на паузу;
+--   3) с команды снимаются ТОЛЬКО Secret (Godly не трогаем вообще);
+--   4) Accept — через обработчики скрытой кнопки, с повторами, пока сервер не пришлёт Started;
+--   5) в оффер уходят ТОЛЬКО Secret, до 12 штук, по убыванию силы;
+--   6) ровно 1.5 с после оффера -> READY: PlayerGui.Trading.Trading.Build.Actions.Ready;
+--   7) ждём, пока оживёт CONFIRM: PlayerGui.Trading.Trading.Review.Confirm, затем раунды 8 x 1.5 с;
+--   8) на Completed/Cancelled: тумблеры фарма возвращаются как были + родной EquipBest payload'а.
 --
--- ВАЖНО про поиск трейда: окно TradeQuest, кнопка Accept и надпись «<ник> has sent a trade
--- request!» ЛЕЖАТ В ДЕРЕВЕ ВСЕГДА и всегда с Visible = true, поэтому ни наличие узлов, ни
--- видимость ничего не говорят. Трейд ловится двумя способами:
---   1) событие TradingService/RE/TradeUpdate "Request" (главный);
---   2) раз в 2 секунды — живые обработчики у Accept (getconnections > 0): пока их нет, кнопка
---      не работает, значит и трейда нет.
+-- READY второй раз НЕ нажимаем: это переключатель, повторное нажатие снимает готовность.
+-- Никаких remote-ов вместо кнопок: READY и CONFIRM нажимаются только как кнопки.
+-- По GUI трейд не определяется: окно Tabs.TradeQuest и кнопки лежат в дереве всегда и всегда
+-- с Visible = true. Правда только в событии RemoteServices.TradingService.RE.TradeUpdate.
 --
--- Button paths were captured by recording real clicks, because the names say nothing here:
---   Tabs.TradeQuest.Menu.Accept.Button           the incoming request window
---   Tabs.TradeQuest.Menu.Decline.Button          its Ignore button
---   Trading.Trading.Build.Actions.Ready.Button   the big READY
---   Trading.Trading.Review.Confirm.Button        CONFIRM inside the review step
---
--- The farm is paused by switching the hub's own automation toggles off (Ui.stopAll) after
--- remembering their values, so nothing taps, hatches or re-equips while the trade is open.
+-- Ручные команды: getgenv().farmTrade = { state, dump, unequip, offer, accept, ready, confirm,
+--                                          full, stop }
 
 local Env = use("core/env")
 local Life = use("shared/life")
 local Ui = use("core/ui")
 
+local BUILD = "v13"
+
 local BANK_NAMES = { "Riglafsma" }
 local BANK_IDS = { 11747325739 }
-local TAKE_RARITY = { "Secret" }   -- по просьбе: Godly не трогаем вообще
-local MAX_PETS = 12
-local ACCEPT_WINDOW = 35        -- seconds to wait for the session after pressing Accept
-                                -- (игрок может 10+ с держать карточку «Hold to Reveal» сам)
-local READY_DELAY = 1.5         -- пауза перед READY: ровно 1.5 с после того, как положили пета
-local CONFIRM_WINDOW = 45       -- сколько ждём, пока игра покажет кнопку CONFIRM (Review.Confirm)
-local READY_WINDOW = 20         -- сколько ищем саму кнопку READY
-local POLL_SECONDS = 2          -- how often a pending request is looked for
+
+local ACCEPT_PATH = { "Tabs", "TradeQuest", "Menu", "Accept", "Button" }
+local DECLINE_PATH = { "Tabs", "TradeQuest", "Menu", "Decline", "Button" }
+local READY_PATH = { "Trading", "Trading", "Build", "Actions", "Ready" }
+local CONFIRM_PATH = { "Trading", "Trading", "Review", "Confirm" }
+local READY_PATH_BUTTON = { "Trading", "Trading", "Build", "Actions", "Ready", "Button" }
+local CONFIRM_PATH_BUTTON = { "Trading", "Trading", "Review", "Confirm", "Button" }
+
+local READY_DELAY = 1.5         -- пауза после оффера перед READY
+local CONFIRM_WINDOW = 45       -- сколько ждём, пока оживёт CONFIRM
+local CONFIRM_ROUNDS = 8        -- подтверждаем раундами
+local CONFIRM_ROUND_WAIT = 1.5  -- пауза между раундами
+local ACCEPT_TIMEOUT = 25       -- сколько ждём открытия сессии после Accept
+local TRADE_TIMEOUT = 150       -- сколько всего ждём завершения сделки
+local SECRET_WORD = "secret"    -- сравнение по подстроке: в живых данных пишется «Secret II»
+local REVEAL_PATH = { "HatchScreen", "Main", "Info", "HatchEgg" }   -- карточка «Hold to Reveal»
+local MAX_OFFER = 12
+local POLL_SECONDS = 2          -- только для надписи в панели, ничего не нажимает
+
+-- Всё состояние объявлено до функций: объявленное ниже стало бы для них отдельной переменной,
+-- и проверки вида «if traded then» читали бы nil.
+local running = true
+local stage = "ждём трейд"
+local busy = false           -- идёт сделка целиком (от Accept до итога)
+local handoverActive = false -- идёт шаг «оффер -> READY -> CONFIRM»
+local traded = false         -- сделка закрылась (Completed/Cancelled)
+local startedEvent = false   -- сервер прислал TradeUpdate "Started"
+local finishedLogged = false -- «трейд закончился» уже напечатали для этой сделки
+local readyAt = os.clock()   -- когда нажали READY (для лога «CONFIRM ожил через N с»)
+local paused = false
+local savedToggles = nil
+
+local function log(fmt, ...)
+    local ok, text = pcall(string.format, fmt, ...)
+    print("[handover " .. BUILD .. "] " .. (ok and text or tostring(fmt)))
+end
+
+-- ---------------------------------------------------------------------------------------------
+-- панель
+-- ---------------------------------------------------------------------------------------------
 
 local tab = Ui.Tabs.Home
 local box = tab:AddGroupbox({ Side = "Right", Name = "Handover", IconName = "package" })
@@ -9740,26 +9772,13 @@ box:AddToggle("Handover", {
     Text = "Отдавать секретов банку (Godly не трогаем)",
     Default = true,
     -- Без Callback: pauseFarm() зовёт Ui.stopAll(false), тот выставляет ВСЕ тумблеры в false,
-    -- и колбэк тут же гасил флаг модуля — после первой же сделки handover «выключался сам».
-    Tooltip = "Ждёт трейд от банка: пауза фарма, снятие петов с команды, приём, оффер, READY и CONFIRM. После сделки возвращает лучших петов и продолжает фарм.",
+    -- и колбэк тут же гасил бы флаг модуля — после первой же сделки handover «выключался сам».
+    -- Флаг модуля живёт в running, а тумблер читается на каждом заходе.
+    Tooltip = "Ждёт трейд от банка: пауза фарма, снятие Secret с команды, приём, оффер Secret, "
+        .. "1.5 с, READY, раунды CONFIRM. После сделки возвращает фарм и лучших петов.",
 })
+
 local statusLabel = box:AddLabel("Handover: ждём запрос от банка", true)
-local checkPanelNowResponse -- forward declaration, defined below
-box:AddButton({
-    Text = "Проверить трейд сейчас",
-    Func = function()
-        checkPanelNowResponse()
-    end,
-})
-
--- Метка сборки в каждой строке: по ней видно, какой именно экземпляр печатает в консоль.
--- Старый запущенный payload печатает "[handover]" без метки — так ловится двойная инъекция.
-local BUILD = "v12"
-
-local function log(fmt, ...)
-    local ok, text = pcall(string.format, fmt, ...)
-    print("[handover " .. BUILD .. "] " .. (ok and text or tostring(fmt)))
-end
 
 local function setStatus(text)
     pcall(function()
@@ -9767,17 +9786,210 @@ local function setStatus(text)
     end)
 end
 
--- ---------------------------------------------------------------------------------------------
--- buttons
--- ---------------------------------------------------------------------------------------------
-
-local function playerGui()
-    local gui = Env.LocalPlayer and Env.LocalPlayer:FindFirstChild("PlayerGui")
-    return gui
+local function moduleEnabled()
+    if busy then
+        -- сделку доводим до конца, даже если пауза фарма погасила тумблер
+        return true
+    end
+    if not running then
+        return false
+    end
+    local ok, value = pcall(function()
+        return Ui.on("Handover")
+    end)
+    return ok and value == true
 end
 
+-- ---------------------------------------------------------------------------------------------
+-- общее: gui, remote-ы, данные игрока
+-- ---------------------------------------------------------------------------------------------
+
+local function gui()
+    local player = Env.LocalPlayer
+    return player and player:FindFirstChild("PlayerGui")
+end
+
+local function fireRemote(service, name, payload)
+    Env.elevate()
+    local ok, err = pcall(function()
+        Env.fire(service, name, payload)
+    end)
+    if not ok then
+        log("FireServer %s не сработал: %s", tostring(name), tostring(err))
+    end
+    return ok
+end
+
+local function petsTable()
+    local ok, data = pcall(Env.data)
+    if not ok then
+        return nil
+    end
+    return data and type(data.Pets) == "table" and data.Pets or nil
+end
+
+local function petIdOf(pet, fallback)
+    if type(pet) == "table" and pet.Id ~= nil then
+        return tostring(pet.Id)
+    end
+    return fallback and tostring(fallback) or nil
+end
+
+local function rarityMatches(pet, word)
+    if type(pet) ~= "table" or not word then
+        return false
+    end
+    local rarity = string.lower(tostring(pet.Rarity or ""))
+    return string.find(rarity, word, 1, true) ~= nil
+end
+
+-- Кто стоит в команде. Главный источник — Pets.Equipped; поштучный Pet.Equip читаем только
+-- если списка нет вовсе, иначе два источника спорят и «снялось/не снялось» врёт.
+local function teamIds()
+    local ids = {}
+    local pets = petsTable()
+    if not pets then
+        return ids
+    end
+    if type(pets.Equipped) == "table" and next(pets.Equipped) ~= nil then
+        for _, value in pairs(pets.Equipped) do
+            local id = type(value) == "table" and (value.Id or value.PetId) or value
+            if id ~= nil and id ~= false then
+                ids[tostring(id)] = true
+            end
+        end
+        return ids
+    end
+    for key, pet in pairs(pets.Owned or {}) do
+        if type(pet) == "table" and pet.Equip == true then
+            ids[tostring(pet.Id ~= nil and pet.Id or key)] = true
+        end
+    end
+    return ids
+end
+
+local function isLocked(id)
+    local pets = petsTable()
+    for key, pet in pairs(pets and pets.Owned or {}) do
+        if type(pet) == "table" and petIdOf(pet, key) == tostring(id) then
+            return pet.Locked == true
+        end
+    end
+    return false
+end
+
+local function unlockPet(id)
+    if not isLocked(id) then
+        return true
+    end
+    for _, action in ipairs({ "ToggleLock", "Unlock", "SetLocked" }) do
+        fireRemote("PetService", "PetActionRequested", { Action = action, PetId = id, Locked = false })
+        local deadline = os.clock() + 1.5
+        while os.clock() < deadline do
+            if not isLocked(id) then
+                return true
+            end
+            task.wait(0.15)
+        end
+    end
+    return false
+end
+
+-- Снять с команды всех петов указанной редкости (только Secret).
+local function unequipRarity(word)
+    local pets = petsTable()
+    if not pets or type(pets.Owned) ~= "table" then
+        log("данные петов не прочитались — снять не могу")
+        return 0
+    end
+    Env.elevate()
+    local team = teamIds()
+    local removed = 0
+    local onTeam = 0
+    for key, pet in pairs(pets.Owned) do
+        if rarityMatches(pet, word) then
+            local id = petIdOf(pet, key)
+            if id and team[id] then
+                onTeam += 1
+                if pet.Locked == true and not unlockPet(id) then
+                    log("залочен, не снял: %s", tostring(pet.Name))
+                else
+                    local done = false
+                    for _ = 1, 3 do
+                        fireRemote("PetService", "PetActionRequested", { Action = "Unequip", PetId = id })
+                        local deadline = os.clock() + 2
+                        while os.clock() < deadline do
+                            if not teamIds()[id] then
+                                done = true
+                                break
+                            end
+                            task.wait(0.15)
+                        end
+                        if done then
+                            break
+                        end
+                    end
+                    if done then
+                        removed += 1
+                        log("снял с команды: %s (%s)", tostring(pet.Name), tostring(pet.Rarity))
+                    else
+                        log("НЕ снялось: %s (%s)", tostring(pet.Name), tostring(pet.Rarity))
+                    end
+                end
+                task.wait(0.2)
+            end
+        end
+    end
+    log("снято с команды %s-петов: %d (было на команде: %d)", word, removed, onTeam)
+    return removed
+end
+
+-- Положить в трейд только Secret, максимум MAX_OFFER, по убыванию силы.
+local function offerRarity(word)
+    local pets = petsTable()
+    if not pets or type(pets.Owned) ~= "table" then
+        log("данные петов не прочитались — оффер не сделать")
+        return 0
+    end
+    Env.elevate()
+    local list = {}
+    for key, pet in pairs(pets.Owned) do
+        if rarityMatches(pet, word) then
+            local id = petIdOf(pet, key)
+            if id then
+                if pet.Locked == true and not unlockPet(id) then
+                    log("пропускаю залоченного: %s", tostring(pet.Name))
+                else
+                    list[#list + 1] = { id = id, power = tonumber(pet.Power) or 0, name = tostring(pet.Name) }
+                end
+            end
+        end
+    end
+    table.sort(list, function(a, b)
+        return a.power > b.power
+    end)
+    local ids, names = {}, {}
+    for _, entry in ipairs(list) do
+        if #ids < MAX_OFFER then
+            ids[#ids + 1] = entry.id
+            names[#names + 1] = entry.name
+        end
+    end
+    if #ids == 0 then
+        log("%s-петов нет — класть нечего", word)
+        return 0
+    end
+    fireRemote("TradingService", "TradeRequested", { Action = "Offer", PetIds = ids })
+    log("положил в трейд %d петов: %s", #ids, table.concat(names, ", "))
+    return #ids
+end
+
+-- ---------------------------------------------------------------------------------------------
+-- кнопки
+-- ---------------------------------------------------------------------------------------------
+
 local function resolvePath(parts)
-    local node = playerGui()
+    local node = gui()
     if not node then
         return nil
     end
@@ -9790,13 +10002,84 @@ local function resolvePath(parts)
     return node
 end
 
-local function pressConnection(button, label)
+local function isShown(node)
+    local ok, visible = pcall(function()
+        return node.Visible
+    end)
+    if not ok or visible == false then
+        return false
+    end
+    local parent = node
+    for _ = 1, 8 do
+        parent = parent.Parent
+        if not parent or parent:IsA("PlayerGui") then
+            break
+        end
+        local okParent, parentVisible = pcall(function()
+            if parent:IsA("ScreenGui") then
+                return parent.Enabled
+            end
+            return parent.Visible
+        end)
+        if okParent and parentVisible == false then
+            return false
+        end
+    end
+    return true
+end
+
+-- Путь может указывать и на сам GuiButton, и на его фрейм-обёртку: берём кнопку изнутри.
+local function asButton(node)
+    if not node then
+        return nil
+    end
+    if node:IsA("GuiButton") then
+        return node
+    end
+    local child = node:FindFirstChild("Button")
+    if child and child:IsA("GuiButton") then
+        return child
+    end
+    for _, deep in ipairs(node:GetDescendants()) do
+        if deep:IsA("GuiButton") then
+            return deep
+        end
+    end
+    return nil
+end
+
+local function byPath(parts, partsButton)
+    local button = asButton(resolvePath(parts))
+    if button then
+        return button
+    end
+    if partsButton then
+        return asButton(resolvePath(partsButton))
+    end
+    return nil
+end
+
+local function findAcceptButton()
+    return byPath(ACCEPT_PATH)
+end
+
+local function findReadyButton()
+    return byPath(READY_PATH, READY_PATH_BUTTON)
+end
+
+local function findConfirmButton()
+    return byPath(CONFIRM_PATH, CONFIRM_PATH_BUTTON)
+end
+
+-- Нажатие: сначала обработчики сигналов кнопки (так работают скрытые Accept/READY/CONFIRM),
+-- если их нет — firesignal, и только потом настоящая мышь в центр видимой кнопки.
+local function press(button, label)
     if not button then
-        log("кнопки %s нет", label)
+        log("нажать нечего: %s", tostring(label))
         return 0
     end
-    local genv = Env.genv or {}
     Env.elevate()
+    local genv = Env.genv or {}
     local pressed = 0
     local getconnections = genv.getconnections
     if type(getconnections) == "function" then
@@ -9819,210 +10102,99 @@ local function pressConnection(button, label)
             end
         end
     end
-    local firesignal = genv.firesignal
-    if pressed == 0 and type(firesignal) == "function" then
+    if pressed == 0 and type(genv.firesignal) == "function" then
         for _, signalName in ipairs({ "Activated", "MouseButton1Click" }) do
             local okSignal, signal = pcall(function()
                 return button[signalName]
             end)
-            if okSignal and signal and pcall(firesignal, signal) then
+            if okSignal and signal and pcall(genv.firesignal, signal) then
                 pressed += 1
             end
         end
     end
-    if pressed == 0 then
-        -- Ни одного обработчика на сигналах: жмём настоящей мышью в центр кнопки — но только если
-        -- кнопка на экране, иначе клик попадёт в то, что лежит под ней.
-        local shown = false
-        pcall(function()
-            shown = button.Visible ~= false and button.AbsoluteSize.X > 0 and button.AbsoluteSize.Y > 0
+    if pressed == 0 and isShown(button) then
+        local clicked = pcall(function()
+            local pos = button.AbsolutePosition + button.AbsoluteSize * 0.5
+            local x, y = math.floor(pos.X), math.floor(pos.Y)
+            local vim = game:GetService("VirtualInputManager")
+            vim:SendMouseButtonEvent(x, y, 0, true, game, 1)
+            task.wait(0.1)
+            vim:SendMouseButtonEvent(x, y, 0, false, game, 1)
         end)
-        if shown then
-            local clicked = pcall(function()
-                local pos = button.AbsolutePosition + button.AbsoluteSize * 0.5
-                local x, y = math.floor(pos.X), math.floor(pos.Y)
-                local vim = game:GetService("VirtualInputManager")
-                vim:SendMouseButtonEvent(x, y, 0, true, game, 1)
-                task.wait(0.1)
-                vim:SendMouseButtonEvent(x, y, 0, false, game, 1)
-            end)
-            if clicked then
-                pressed += 1
-                log("нажал %s мышью в центр", label)
-            end
+        if clicked then
+            pressed += 1
         end
     end
-    log("нажал %s (%d)", label, pressed)
+    log("нажал %s (%d) — %s", tostring(label), pressed, button:GetFullName())
     return pressed
 end
 
-local ACCEPT_PATH = { "Tabs", "TradeQuest", "Menu", "Accept", "Button" }
-local DECLINE_PATH = { "Tabs", "TradeQuest", "Menu", "Decline", "Button" }
--- Точные обёртки, снятые с живого окна трейда:
---   PlayerGui.Trading.Trading.Build.Actions.Ready     — кнопка «готов» (жмём через 1.5 с)
---   PlayerGui.Trading.Trading.Review.Confirm          — кнопка подтверждения (появляется позже)
--- Путь может быть и самой кнопкой, и её фреймом-обёрткой, поэтому после resolvePath узел всегда
--- прогоняется через asButton(): сам GuiButton, ребёнок Button или первая кнопка внутри.
-local READY_PATH = { "Trading", "Trading", "Build", "Actions", "Ready" }
-local CONFIRM_PATH = { "Trading", "Trading", "Review", "Confirm" }
-local CONFIRM_ALTERNATIVES = {
-    CONFIRM_PATH,
-    { "Trading", "Trading", "Review", "Confirm", "Button" },
-    { "Tabs", "TradeQuest", "Review", "Confirm", "Button" },
-    { "Tabs", "TradeQuest", "Menu", "Confirm", "Button" },
-    { "Tabs", "TradeQuest", "Confirm", "Button" },
-    { "Tabs", "TradeQuest", "Menu", "Confirm" },
-    { "Tabs", "TradeQuest", "Confirm" },
-    { "Trading", "Trading", "Confirm", "Button" },
-}
-
--- ---------------------------------------------------------------------------------------------
--- pets
--- ---------------------------------------------------------------------------------------------
-
-local function petsTable()
-    local data = Env.data()
-    local pets = data and type(data.Pets) == "table" and data.Pets
-    return pets
-end
-
-local function isWanted(pet)
-    if type(pet) ~= "table" then
-        return false
-    end
-    local rarity = string.lower(tostring(pet.Rarity or ""))
-    for _, wanted in ipairs(TAKE_RARITY) do
-        if string.find(rarity, string.lower(wanted), 1, true) then
-            return true
-        end
-    end
-    local name = string.lower(tostring(pet.Name or ""))
-    for _, wanted in ipairs({ "30m phantom serpent", "30m cursed gift", "30m imperfection" }) do
-        if string.find(name, wanted, 1, true) then
-            return true
-        end
-    end
-    return false
-end
-
-local function ownedById()
-    local map = {}
-    local pets = petsTable()
-    if not pets or type(pets.Owned) ~= "table" then
-        return map
-    end
-    for key, pet in pairs(pets.Owned) do
-        if type(pet) == "table" then
-            local id = pet.Id ~= nil and tostring(pet.Id) or tostring(key)
-            map[id] = pet
-        end
-    end
-    return map
-end
-
-local function teamIds()
-    local ids = {}
-    local pets = petsTable()
-    if not pets then
-        return ids
-    end
-    if type(pets.Equipped) == "table" then
-        for _, value in pairs(pets.Equipped) do
-            local id = type(value) == "table" and (value.Id or value.PetId) or value
-            if id ~= nil then
-                ids[tostring(id)] = true
-            end
-        end
-    end
-    for id, pet in pairs(pets.Owned or {}) do
-        if type(pet) == "table" and pet.Equip == true then
-            ids[tostring(pet.Id ~= nil and pet.Id or id)] = true
-        end
-    end
-    return ids
-end
-
-local function petId(pet, fallback)
-    if type(pet) == "table" and pet.Id ~= nil then
-        return tostring(pet.Id)
-    end
-    return fallback and tostring(fallback) or nil
-end
-
-local function isLocked(id)
-    local pet = ownedById()[tostring(id)]
-    return pet ~= nil and pet.Locked == true
-end
-
-local function unlockPet(id)
-    if not isLocked(id) then
-        return true
-    end
-    for _, action in ipairs({ "ToggleLock", "Unlock", "SetLocked" }) do
-        pcall(function()
-            Env.fire("PetService", "PetActionRequested", { Action = action, PetId = id, Locked = false })
-        end)
-        local deadline = os.clock() + 1.5
-        while os.clock() < deadline do
-            if not isLocked(id) then
-                return true
-            end
-            task.wait(0.15)
-        end
-    end
-    return false
-end
-
-local function unequipPet(id, label)
-    if not teamIds()[tostring(id)] then
-        return true
-    end
-    for _ = 1, 3 do
-        pcall(function()
-            Env.fire("PetService", "PetActionRequested", { Action = "Unequip", PetId = id })
-        end)
-        local deadline = os.clock() + 2
-        while os.clock() < deadline do
-            if not teamIds()[tostring(id)] then
-                log("снял с команды: %s", tostring(label))
-                return true
-            end
-            task.wait(0.15)
-        end
-    end
-    log("НЕ снялось: %s", tostring(label))
-    return false
-end
-
-local function unequipValuables()
-    local pets = petsTable()
-    if not pets or type(pets.Owned) ~= "table" then
-        log("данные петов недоступны")
+-- Сколько живых обработчиков у кнопки: > 0 живая, = 0 мёртвая, = -1 getconnections недоступен.
+-- По GUI трейд не определить (окно и кнопки лежат в дереве всегда), а обработчики — отражают.
+local function liveConnections(button)
+    if not button then
         return 0
     end
-    local removed = 0
-    for key, pet in pairs(pets.Owned) do
-        if type(pet) == "table" and isWanted(pet) then
-            local id = petId(pet, key)
-            if id and teamIds()[id] then
-                if pet.Locked == true and not unlockPet(id) then
-                    log("залочен и не разлочился: %s", tostring(pet.Name))
-                elseif unequipPet(id, pet.Name) then
-                    removed += 1
+    local genv = Env.genv or {}
+    if type(genv.getconnections) ~= "function" then
+        return -1
+    end
+    local total = 0
+    for _, signalName in ipairs({ "Activated", "MouseButton1Click", "MouseButton1Down" }) do
+        local okSignal, signal = pcall(function()
+            return button[signalName]
+        end)
+        if okSignal and signal then
+            local okList, list = pcall(genv.getconnections, signal)
+            if okList and type(list) == "table" then
+                for _, connection in ipairs(list) do
+                    if connection.Enabled ~= false then
+                        total += 1
+                    end
                 end
-                task.wait(0.2)
             end
         end
     end
-    return removed
+    return total
+end
+
+local function waitFor(condition, seconds, tick)
+    local deadline = os.clock() + seconds
+    while os.clock() < deadline do
+        local value = condition()
+        if value then
+            return value
+        end
+        task.wait(tick or 0.25)
+    end
+    return nil
+end
+
+-- Карточка «Hold to Reveal» лежит поверх экрана и может съедать клики мышью. Своё зажатие делает
+-- модуль holdreveal (его пауза фарма не гасит), поэтому перед Accept просто ждём, чтобы карточка
+-- ушла. Кнопки трейда жмутся через обработчики, так что даже висящая карточка не блокирует.
+local function revealCardUp()
+    local card = resolvePath(REVEAL_PATH)
+    return card ~= nil and isShown(card)
+end
+
+local function waitRevealClear(seconds)
+    if not revealCardUp() then
+        return true
+    end
+    log("на экране карточка Hold to Reveal — жду, пока освободит экран (до %.0f с)", seconds)
+    local cleared = waitFor(function()
+        return not revealCardUp()
+    end, seconds, 0.25)
+    if not cleared then
+        log("карточка так и висит — жму Accept всё равно (кнопки нажимаются через обработчики)")
+    end
+    return cleared ~= nil
 end
 
 -- ---------------------------------------------------------------------------------------------
--- pause and resume of the whole farm
+-- пауза и возврат фарма (родные тумблеры + родной EquipBest payload'а)
 -- ---------------------------------------------------------------------------------------------
-
-local paused = false
-local savedToggles = nil
 
 local function pauseFarm()
     if paused then
@@ -10054,42 +10226,191 @@ local function resumeFarm()
     if Env.genv then
         Env.genv.__handoverPaused = false
     end
-    -- the pets we gave away are gone, so take the strongest of what is left
+    -- отданных петов больше нет — берём лучших из того, что осталось, родной функцией payload'а
     pcall(function()
         Env.fire("PetService", "PetActionRequested", { Action = "EquipBest" })
     end)
-    setStatus("фарм продолжается")
+    setStatus("фарм снова работает, EquipBest отправлен")
     log("фарм снова работает, EquipBest отправлен")
 end
 
 -- ---------------------------------------------------------------------------------------------
--- deal state
+-- подтверждение: после READY жмём CONFIRM раундами, пока сделка не закроется
 -- ---------------------------------------------------------------------------------------------
 
-local state = {
-    busy = false,
-    pending = nil,
-    session = nil,
-    started = false,
-    done = false,
-    cancelled = false,
-    partnerReady = false,
-    mine = {},
-    pendingAt = 0,
-    target = nil,
-}
-
-local function resetState()
-    state.target = nil
-    state.session = nil
-    state.started = false
-    state.done = false
-    state.cancelled = false
-    state.partnerReady = false
-    state.mine = {}
+local function pressConfirmRounds()
+    for round = 1, CONFIRM_ROUNDS do
+        if not running then
+            return false
+        end
+        if traded then
+            log("сделка завершилась — CONFIRM больше не жму (нажатий: %d)", round - 1)
+            return true
+        end
+        local confirm = findConfirmButton()
+        if confirm then
+            press(confirm, string.format("CONFIRM, раунд %d", round))
+        else
+            log("узла CONFIRM нет в дереве, раунд %d", round)
+        end
+        task.wait(CONFIRM_ROUND_WAIT)
+    end
+    return true
 end
 
-local function senderAllowed(name, userId)
+-- петов положили -> 1.5 с -> READY (ровно один раз) -> раунды CONFIRM
+local function readyThenConfirm()
+    log("пауза %.1f с после оффера…", READY_DELAY)
+    task.wait(READY_DELAY)
+
+    local ready = findReadyButton()
+    if not ready then
+        log("узла READY нет в дереве (%s) — подтверждать нечем", table.concat(READY_PATH, "."))
+        return false
+    end
+    log("READY: %s | живых обработчиков: %d", ready:GetFullName(), liveConnections(ready))
+    if press(ready, "READY") == 0 then
+        log("READY не отозвался: ни обработчиков, ни мыши")
+        return false
+    end
+    readyAt = os.clock()
+
+    -- Ждём, пока у CONFIRM появятся обработчики: значит игра открыла шаг подтверждения.
+    -- Если getconnections недоступен — просто даём паузу и жмём раундами.
+    local wired = waitFor(function()
+        if traded then
+            return "done"
+        end
+        local confirm = findConfirmButton()
+        if confirm and liveConnections(confirm) ~= 0 then
+            return "ready"
+        end
+        return nil
+    end, CONFIRM_WINDOW, 0.3)
+    if wired == "done" then
+        log("сделка закрылась ещё до CONFIRM")
+        return true
+    elseif wired == "ready" then
+        log("CONFIRM ожил через %.1f с после READY", os.clock() - readyAt)
+    else
+        log("CONFIRM за %d с не ожил — жму раундами всё равно", CONFIRM_WINDOW)
+    end
+    return pressConfirmRounds()
+end
+
+-- ---------------------------------------------------------------------------------------------
+-- сделка после того, как сессия открыта
+-- ---------------------------------------------------------------------------------------------
+
+local function handover()
+    if handoverActive then
+        log("подтверждение уже идёт — пропускаю")
+        return false
+    end
+    handoverActive = true
+    log("================ СДЕЛКА НАЧАТА ================")
+    local ok, err = pcall(function()
+        stage = "кладу Secret в трейд"
+        log("этап: %s", stage)
+        if offerRarity(SECRET_WORD) == 0 then
+            error("класть нечего: Secret-петов нет")
+        end
+
+        stage = "жму READY"
+        log("этап: %s", stage)
+        readyThenConfirm()
+
+        stage = "ждём завершения сделки"
+        log("этап: %s", stage)
+        if waitFor(function()
+            return traded
+        end, TRADE_TIMEOUT, 0.3) then
+            log("сделка завершена")
+        else
+            log("сделка не завершилась за %d с", TRADE_TIMEOUT)
+        end
+    end)
+    if not ok then
+        log("ошибка: %s", tostring(err))
+    end
+    handoverActive = false
+    return ok
+end
+
+-- Трейд пришёл (событие Request): пауза фарма, снять Secret, нажать Accept.
+-- Повторные нажатия Accept — пока сервер не пришлёт Started.
+local function acceptTrade(name)
+    if busy then
+        log("уже в сделке — запрос пропускаю")
+        return
+    end
+    busy = true
+    startedEvent = false
+    finishedLogged = false
+    traded = false
+    stage = "пришёл трейд от " .. tostring(name)
+    log("этап: %s", stage)
+    task.spawn(function()
+        pauseFarm()
+        log("запрос от %s", tostring(name))
+
+        stage = "снимаю Secret с команды"
+        log("этап: %s", stage)
+        unequipRarity(SECRET_WORD)
+
+        stage = "жму Accept"
+        log("этап: %s", stage)
+        waitRevealClear(4)
+        local accept = findAcceptButton()
+        if not accept then
+            log("узла Accept нет в дереве — принять не могу")
+            busy = false
+            resumeFarm()
+            stage = "ждём следующий трейд"
+            return
+        end
+        press(accept, "ACCEPT")
+
+        -- Признак открытой сессии — только событие сервера. По GUI судить нельзя.
+        local startedAt = os.clock()
+        local nextPress = os.clock() + 2.5
+        local presses = 1
+        while os.clock() - startedAt < ACCEPT_TIMEOUT do
+            if startedEvent then
+                break
+            end
+            if os.clock() >= nextPress and presses < 10 then
+                nextPress = os.clock() + 2.5
+                local again = findAcceptButton()
+                if again then
+                    presses += press(again, "ACCEPT ещё раз") or 0
+                end
+            end
+            task.wait(0.25)
+        end
+
+        if not startedEvent then
+            log("событие Started не пришло за %d с (Accept нажат %d раз). Петов не выкладываю — "
+                .. "без подтверждения сервера это была бы пустая сделка", ACCEPT_TIMEOUT, presses)
+            busy = false
+            resumeFarm()
+            stage = "ждём следующий трейд"
+            return
+        end
+
+        log("сессия открыта (Started)")
+        task.wait(1.5)
+        handover()
+        -- фарм вернёт событие Completed/Cancelled, там же снимется busy
+        stage = "ждём завершения сделки"
+    end)
+end
+
+-- ---------------------------------------------------------------------------------------------
+-- события трейда: единственный надёжный источник правды
+-- ---------------------------------------------------------------------------------------------
+
+local function allowed(name, userId)
     for _, wanted in ipairs(BANK_NAMES) do
         if type(name) == "string" and string.lower(wanted) == string.lower(name) then
             return true
@@ -10103,1012 +10424,180 @@ local function senderAllowed(name, userId)
     return false
 end
 
--- ---------------------------------------------------------------------------------------------
--- offer
--- ---------------------------------------------------------------------------------------------
-
-local function wantedIds()
-    local list = {}
-    local pets = petsTable()
-    if not pets or type(pets.Owned) ~= "table" then
-        return list
-    end
-    local byRarity = {}
-    for key, pet in pairs(pets.Owned) do
-        if type(pet) == "table" and isWanted(pet) then
-            local id = petId(pet, key)
-            if id then
-                if pet.Locked == true and not unlockPet(id) then
-                    log("пропускаю %s — залочен", tostring(pet.Name))
-                else
-                    list[#list + 1] = { id = id, power = tonumber(pet.Power) or 0, name = tostring(pet.Name) }
-                    local rarity = string.lower(tostring(pet.Rarity or "?"))
-                    byRarity[rarity] = (byRarity[rarity] or 0) + 1
-                end
-            end
+local function dumpTrade()
+    for _, part in ipairs({ "Trading", "Trading.Trading.Build.Actions.Ready",
+        "Trading.Trading.Review.Confirm", "Tabs.TradeQuest.Menu.Accept", "Tabs.TradeQuest.Menu.Decline" }) do
+        local node = gui()
+        for piece in string.gmatch(part, "[^%.]+") do
+            node = node and node:FindFirstChild(piece)
         end
-    end
-    local parts = {}
-    for rarity, amount in pairs(byRarity) do
-        parts[#parts + 1] = rarity .. "=" .. amount
-    end
-    table.sort(parts)
-    log("к передаче %d петов (%s)", #list, table.concat(parts, ", "))
-    table.sort(list, function(a, b)
-        return a.power > b.power
-    end)
-    return list
-end
-
-local function offerCount()
-    local total = 0
-    for _ in pairs(state.mine) do
-        total += 1
-    end
-    return total
-end
-
-local function offerMissing(ids)
-    local missing = {}
-    for _, id in ipairs(ids) do
-        if not state.mine[tostring(id)] then
-            missing[#missing + 1] = tostring(id)
-        end
-    end
-    return missing
-end
-
-local function givePets()
-    local list = wantedIds()
-    if #list == 0 then
-        log("секретов и Godly нет — отдавать нечего")
-        return 0
-    end
-    local ids, seen = {}, {}
-    for _, entry in ipairs(list) do
-        if not seen[entry.id] and #ids < MAX_PETS then
-            seen[entry.id] = true
-            ids[#ids + 1] = entry.id
-        end
-    end
-    if #list > #ids then
-        log("в окно беру %d, остальные %d пойдут следующим трейдом", #ids, #list - #ids)
-    end
-
-    pcall(function()
-        Env.fire("TradingService", "TradeRequested", { Action = "Offer", PetIds = ids })
-    end)
-    log("отправил оффер: %d петов", #ids)
-
-    local deadline = os.clock() + 6
-    while os.clock() < deadline do
-        if #offerMissing(ids) == 0 then
-            break
-        end
-        task.wait(0.2)
-    end
-
-    local missing = offerMissing(ids)
-    if #missing > 0 then
-        log("%d петов не появились в оффере — добиваю по одному", #missing)
-        for _, id in ipairs(missing) do
-            pcall(function()
-                Env.fire("TradingService", "TradeRequested", { Action = "Offer", PetIds = { id } })
-            end)
-            task.wait(0.4)
-        end
-    end
-
-    local given = offerCount()
-    local names = {}
-    local byId = ownedById()
-    for id in pairs(state.mine) do
-        local pet = byId[tostring(id)]
-        names[#names + 1] = pet and tostring(pet.Name) or tostring(id)
-    end
-    log("в оффере %d петов: %s", given, table.concat(names, ", "))
-    return given
-end
-
--- ---------------------------------------------------------------------------------------------
--- ready and confirm
--- ---------------------------------------------------------------------------------------------
-
-local function waitForButton(path, label, seconds)
-    local deadline = os.clock() + (seconds or 15)
-    while os.clock() < deadline do
-        local button = resolvePath(path)
-        if button then
-            return button
-        end
-        task.wait(0.3)
-    end
-    log("кнопка %s не появилась", label)
-    return nil
-end
-
-local function isButtonShown(button)
-    local ok, visible = pcall(function()
-        return button.Visible
-    end)
-    if not ok or visible == false then
-        return false
-    end
-    local node = button
-    for _ = 1, 6 do
-        node = node.Parent
-        if not node or node:IsA("PlayerGui") then
-            break
-        end
-        local okParent, parentVisible = pcall(function()
-            return node:IsA("ScreenGui") and node.Enabled or node.Visible
-        end)
-        if okParent and parentVisible == false then
-            return false
-        end
-    end
-    return true
-end
-
--- Годится ли узел в качестве кнопки «готов»: сам GuiButton или у него есть Button внутри.
-local function asButton(node)
-    if not node then
-        return nil
-    end
-    if node:IsA("GuiButton") then
-        return node
-    end
-    local child = node:FindFirstChild("Button")
-    if child and child:IsA("GuiButton") then
-        return child
-    end
-    -- Обёртка без ребёнка с именем Button: берём первую видимую кнопку внутри неё.
-    for _, deep in ipairs(node:GetDescendants()) do
-        if deep:IsA("GuiButton") then
-            local okVisible, visible = pcall(function()
-                return deep.Visible
-            end)
-            if okVisible and visible ~= false then
-                return deep
-            end
-        end
-    end
-    return nil
-end
-
--- Сколько живых обработчиков у кнопки. В этой игре окно трейда и его кнопки лежат в PlayerGui
--- ВСЕГДА и всегда с Visible = true, поэтому наличие/видимость ничего не значат. Реальность
--- отражают только обработчики: игра подключает их, когда кнопка действительно работает.
---   > 0 — живая, = 0 — мёртвая, = -1 — getconnections недоступен
-local function liveConnections(button)
-    if not button then
-        return 0
-    end
-    local genv = Env.genv or {}
-    if type(genv.getconnections) ~= "function" then
-        return -1
-    end
-    local total = 0
-    for _, signalName in ipairs({ "Activated", "MouseButton1Click", "MouseButton1Down" }) do
-        local okSignal, signal = pcall(function()
-            return button[signalName]
-        end)
-        if okSignal and signal then
-            local okList, list = pcall(genv.getconnections, signal)
-            if okList and type(list) == "table" then
-                for _, connection in ipairs(list) do
-                    if connection.Enabled ~= false then
-                        total += 1
-                    end
-                end
-            end
-        end
-    end
-    return total
-end
-
--- Имя + текст + имя родителя одним куском в нижнем регистре: по нему ищем «готов».
-local function nodeHay(node)
-    local parts = {}
-    local ok, name = pcall(function()
-        return node.Name
-    end)
-    parts[#parts + 1] = ok and tostring(name) or ""
-    local okText, text = pcall(function()
-        return node.Text
-    end)
-    parts[#parts + 1] = okText and tostring(text) or ""
-    pcall(function()
-        parts[#parts + 1] = tostring(node.Parent and node.Parent.Name or "")
-    end)
-    return string.lower(table.concat(parts, " "))
-end
-
--- ---------------------------------------------------------------------------------------------
--- те же шаги, но запросом в remote — на случай, если окно трейда вообще не открылось
--- ---------------------------------------------------------------------------------------------
--- Петов мы ставим именно так ({Action="Offer"} и PetIds), без кликов по плиткам. Кнопки READY и
--- CONFIRM раньше так не срабатывали, но проверить стоит: у сервера может быть своё имя действия.
-
-local function fireTradeAction(action)
-    local payload = { Action = action }
-    if state.session then
-        payload.SessionId = state.session
-    end
-    if state.target then
-        payload.TargetUserId = state.target
-    end
-    local ok = pcall(function()
-        Env.fire("TradingService", "TradeRequested", payload)
-    end)
-    log("remote TradeRequested {Action=%s, SessionId=%s} → %s", tostring(action),
-        tostring(state.session), ok and "отправлен" or "ошибка")
-    return ok
-end
-
--- Все remote сервисов с Trading в имени: вдруг там есть отдельный «TradeAction».
-local function tradingRemotes()
-    local list = {}
-    local services = Env.ReplicatedStorage:FindFirstChild("RemoteServices")
-    if not services then
-        return list
-    end
-    for _, folder in ipairs(services:GetChildren()) do
-        if string.find(string.lower(folder.Name), "trad", 1, true) then
-            for _, group in ipairs({ "RE", "RF" }) do
-                local holder = folder:FindFirstChild(group)
-                if holder then
-                    for _, remote in ipairs(holder:GetChildren()) do
-                        list[#list + 1] = string.format("%s/%s/%s [%s]", folder.Name, group, remote.Name, remote.ClassName)
-                    end
-                end
-            end
-        end
-    end
-    return list
-end
-
--- Окно трейда на ферме живёт внутри Tabs.TradeQuest (там же кнопка Accept), а не в отдельном
--- экране Trading, как на банке. Искать кнопки можно ТОЛЬКО внутри этих поддеревьев: поиск по
--- всему PlayerGui однажды уже нажал "Lock" в инвентаре (кнопка блокировки пета).
-local TRADE_ROOTS = {
-    { "Tabs", "TradeQuest" },
-    { "Trading" },
-}
-
-local function tradeSubtrees()
-    local list = {}
-    for _, path in ipairs(TRADE_ROOTS) do
-        local node = resolvePath(path)
         if node then
-            list[#list + 1] = node
-        end
-    end
-    return list
-end
-
--- Кнопка подтверждения: PlayerGui.Trading.Trading.Review.Confirm. Её появление и есть сигнал,
--- что можно подтверждать.
-local function findConfirmButton()
-    for _, path in ipairs(CONFIRM_ALTERNATIVES) do
-        local button = asButton(resolvePath(path))
-        if button then
-            return button, table.concat(path, ".")
-        end
-    end
-    -- ищем только внутри окна трейда, чтобы не нажать что-то в другом окне
-    for _, root in ipairs(tradeSubtrees()) do
-        for _, node in ipairs(root:GetDescendants()) do
-            if node:IsA("GuiButton") and isButtonShown(node) then
-                local hay = nodeHay(node)
-                if string.find(hay, "confirm", 1, true) or string.find(hay, "подтвер", 1, true) then
-                    return node, node:GetFullName()
-                end
-            end
-        end
-    end
-    return nil
-end
-
-
-local function pressConfirmRounds()
-    for round = 1, 8 do
-        if state.done or state.cancelled then
-            return state.done
-        end
-        local confirm = findConfirmButton()
-        if confirm then
-            pressConnection(confirm, "CONFIRM, раунд " .. round)
+            log("%s [%s] Visible=%s handlers=%d", part, node.ClassName,
+                tostring(node.Visible), liveConnections(asButton(node) or node))
         else
-            log("кнопки CONFIRM нет, раунд %d — пробую remote", round)
-            if round == 1 or round == 4 then
-                fireTradeAction("Confirm")
-            end
-        end
-        local deadline = os.clock() + 1.5
-        while os.clock() < deadline do
-            if state.done or state.cancelled then
-                return state.done
-            end
-            task.wait(0.2)
+            log("%s — нет в дереве", part)
         end
     end
-    return state.done
 end
 
--- Кнопка READY на стороне получателя может лежать по другому пути, чем на стороне банка,
--- поэтому пробуем несколько вариантов и, в крайнем случае, ищем узел с именем Ready.
-local READY_ALTERNATIVES = {
-    READY_PATH,
-    { "Trading", "Trading", "Actions", "Ready", "Button" },
-    { "Trading", "Trading", "Build", "Ready", "Button" },
-    { "Trading", "Trading", "Build", "Actions", "Ready" },
-    { "Trading", "Actions", "Ready", "Button" },
-    -- окно трейда на ферме (там же, где Accept)
-    { "Tabs", "TradeQuest", "Build", "Actions", "Ready", "Button" },
-    { "Tabs", "TradeQuest", "Actions", "Ready", "Button" },
-    { "Tabs", "TradeQuest", "Menu", "Ready", "Button" },
-    { "Tabs", "TradeQuest", "Menu", "Actions", "Ready", "Button" },
-    { "Tabs", "TradeQuest", "Ready", "Button" },
-    { "Tabs", "TradeQuest", "Menu", "Ready" },
-    { "Tabs", "TradeQuest", "Ready" },
-}
+local okRemote, tradeUpdate = pcall(Env.remote, "TradingService", "TradeUpdate")
+if okRemote and tradeUpdate then
+    Life.connect(tradeUpdate.OnClientEvent, function(payload)
+        Env.elevate()
+        if type(payload) ~= "table" then
+            return
+        end
+        local kind = tostring(payload.Type)
+        if kind ~= "Offer" then
+            log("TradeUpdate: %s", kind)
+        end
 
-local function findReadyButton()
-    for _, path in ipairs(READY_ALTERNATIVES) do
-        local button = asButton(resolvePath(path))
-        if button then
-            return button, table.concat(path, ".")
-        end
-    end
-    local roots = tradeSubtrees()
-    if #roots == 0 then
-        return nil
-    end
-    for _, root in ipairs(roots) do
-        -- узел с именем ready/готов и его Button
-        for _, node in ipairs(root:GetDescendants()) do
-            local ok, name = pcall(function()
-                return node.Name
-            end)
-            if ok and type(name) == "string" then
-                local low = string.lower(name)
-                if string.find(low, "ready", 1, true) or string.find(low, "gotov", 1, true)
-                    or string.find(low, "готов", 1, true) then
-                    local button = asButton(node)
-                    if button and isButtonShown(button) then
-                        return button, node:GetFullName()
-                    end
-                end
-            end
-        end
-        -- видимая кнопка, у которой ready/готов в имени, тексте или имени родителя
-        for _, node in ipairs(root:GetDescendants()) do
-            if node:IsA("GuiButton") and isButtonShown(node) then
-                local hay = nodeHay(node)
-                if string.find(hay, "ready", 1, true) or string.find(hay, "gotov", 1, true)
-                    or string.find(hay, "готов", 1, true) then
-                    return node, node:GetFullName()
-                end
-            end
-        end
-    end
-    return nil
-end
-
--- Все видимые кнопки внутри окна трейда: по этому списку видно, как называются READY и CONFIRM.
-local function logTradeButtons(label)
-    local roots = tradeSubtrees()
-    if #roots == 0 then
-        log("%s: окна трейда нет (ни Tabs.TradeQuest, ни Trading)", label)
-        return
-    end
-    local shown = 0
-    for _, root in ipairs(roots) do
-        for _, node in ipairs(root:GetDescendants()) do
-            if node:IsA("GuiButton") and isButtonShown(node) then
-                local okText, text = pcall(function()
-                    return node.Text
-                end)
-                shown += 1
-                if shown <= 40 then
-                    log("%s: %s [%s] «%s»", label, node:GetFullName(), node.ClassName,
-                        tostring(okText and text or ""))
-                end
-            end
-        end
-    end
-    log("%s: видимых кнопок в окне трейда — %d", label, shown)
-end
-
--- Список всех кнопок, похожих на «готов/подтвердить», для лога: видно, как это зовётся на ферме.
-local function buttonCandidates()
-    local gui = playerGui()
-    local list = {}
-    if not gui then
-        return list
-    end
-    for _, node in ipairs(gui:GetDescendants()) do
-        if node:IsA("GuiButton") then
-            local hay = nodeHay(node)
-            if string.find(hay, "ready", 1, true) or string.find(hay, "gotov", 1, true)
-                or string.find(hay, "готов", 1, true) or string.find(hay, "lock", 1, true)
-                or string.find(hay, "confirm", 1, true) or string.find(hay, "подтвер", 1, true) then
-                local okText, text = pcall(function()
-                    return node.Text
-                end)
-                list[#list + 1] = string.format("%s [%s] «%s» %s",
-                    node:GetFullName(), node.ClassName, tostring(okText and text or ""),
-                    isButtonShown(node) and "видна" or "скрыта")
-            end
-        end
-    end
-    return list
-end
-
--- Имена всех экранов PlayerGui одной строкой: полезно в момент открытия сессии.
-local function screenNames()
-    local gui = playerGui()
-    if not gui then
-        return "PlayerGui нет"
-    end
-    local names = {}
-    for _, child in ipairs(gui:GetChildren()) do
-        if child:IsA("ScreenGui") then
-            local enabled = true
-            pcall(function()
-                enabled = child.Enabled
-            end)
-            names[#names + 1] = enabled and child.Name or (child.Name .. "(off)")
-        end
-    end
-    return table.concat(names, ", ")
-end
-
--- Диагностика: печатаем все экраны PlayerGui и дерево тех, что похожи на трейд.
-local function dumpTradeGui()
-    local gui = playerGui()
-    if not gui then
-        log("PlayerGui нет — нечего печатать")
-        return
-    end
-    local screens = {}
-    for _, child in ipairs(gui:GetChildren()) do
-        if child:IsA("ScreenGui") then
-            local enabled = true
-            pcall(function()
-                enabled = child.Enabled
-            end)
-            screens[#screens + 1] = child
-            log("экран %s | Enabled=%s | детей %d", child.Name, tostring(enabled), #child:GetChildren())
-        end
-    end
-    if type(Env.genv) == "table" then
-        Env.genv.handoverDumpTrade = dumpTradeGui
-    end
-    for _, screen in ipairs(screens) do
-        local low = string.lower(screen.Name)
-        local hasTradeChild = false
-        for _, child in ipairs(screen:GetChildren()) do
-            if string.find(string.lower(child.Name), "trad", 1, true) then
-                hasTradeChild = true
-                break
-            end
-        end
-        if string.find(low, "trad", 1, true) or string.find(low, "swap", 1, true) or hasTradeChild then
-            local shown = 0
-            log("--- дерево экрана %s ---", screen.Name)
-            for _, node in ipairs(screen:GetDescendants()) do
-                if shown >= 120 then
-                    log("... обрезано на %d узлах", shown)
-                    break
-                end
-                local visible = true
+        if kind == "Request" then
+            local name, fromId = payload.FromName, tonumber(payload.FromUserId)
+            if not name and fromId then
                 pcall(function()
-                    visible = node.Visible
+                    local player = Env.Players:GetPlayerByUserId(fromId)
+                    name = player and player.Name or nil
                 end)
-                if visible then
-                    shown += 1
-                    local text = ""
-                    pcall(function()
-                        text = tostring(node.Text or "")
+            end
+            if not allowed(name, fromId) then
+                log("запрос не от банка (%s) — отклоняю", tostring(name))
+                press(byPath(DECLINE_PATH), "DECLINE (не банк)")
+                return
+            end
+            if not moduleEnabled() then
+                log("handover выключен — трейд не отвечаю (getgenv().handoverEnable())")
+                return
+            end
+            acceptTrade(name)
+        elseif kind == "Started" then
+            traded = false
+            startedEvent = true
+            if not busy then
+                log("сессия уже открыта (Started пришёл без Request)")
+                if moduleEnabled() then
+                    busy = true
+                    finishedLogged = false
+                    task.spawn(function()
+                        pauseFarm()
+                        task.wait(1.5)
+                        handover()
                     end)
-                    log("TradeGui: %s [%s] %s", node:GetFullName(), node.ClassName, text ~= "" and ("«" .. text .. "»") or "")
                 end
             end
-        end
-    end
-end
-
--- Ждём, пока игра откроет шаг подтверждения: у CONFIRM появляются обработчики (getconnections > 0).
--- READY второй раз НЕ жмём: эта кнопка — переключатель, повторное нажатие снимает готовность.
-local function waitForConfirm(seconds)
-    local window = seconds or CONFIRM_WINDOW
-    local started = os.clock()
-    local deadline = started + window
-    local nextNote = started + 10
-    while os.clock() < deadline do
-        if state.done or state.cancelled then
-            return nil
-        end
-        local button, where = findConfirmButton()
-        if button and liveConnections(button) ~= 0 then
-            log("CONFIRM ожил через %.1f с после READY (%s)", os.clock() - started, tostring(where))
-            return button
-        end
-        if os.clock() >= nextNote then
-            nextNote = os.clock() + 10
-            log("жду шаг подтверждения… %.0f с из %d", os.clock() - started, window)
-        end
-        task.wait(0.25)
-    end
-    log("CONFIRM не ожил за %d с", window)
-    return nil
-end
-
-local function pressReadyThenConfirm()
-    -- Порядок по просьбе: положили своих петов -> 1.5 с -> READY
-    -- (PlayerGui.Trading.Trading.Build.Actions.Ready), подтверждает ферма первой.
-    -- Дальше не гадаем по таймеру: ждём, пока игра покажет CONFIRM
-    -- (PlayerGui.Trading.Trading.Review.Confirm), и жмём его раундами.
-    log("петов добавил — жду %.1f с и жму READY первым", READY_DELAY)
-    Life.wait(READY_DELAY)
-
-    -- в этот момент оффер уже стоит: печатаем всё, что есть в окне трейда
-    logTradeButtons("перед READY")
-
-    local ready, where = findReadyButton()
-    local readyDeadline = os.clock() + READY_WINDOW
-    local remoteAt = os.clock() + 6
-    local tried = 0
-    while not ready and os.clock() < readyDeadline do
-        -- Кнопки нет 6 секунд — пробуем то же запросом в remote, поиск продолжаем: если кнопка
-        -- всё-таки появится, нажмём и её (лишним не будет).
-        if tried == 0 and os.clock() >= remoteAt then
-            tried = 1
-            fireTradeAction("Ready")
-        elseif tried == 1 and os.clock() >= remoteAt + 4 then
-            tried = 2
-            fireTradeAction("Lock")
-        end
-        task.wait(0.3)
-        ready, where = findReadyButton()
-    end
-    if not ready then
-        log("кнопка READY не появилась за %d с (remote-попытки: Ready, Lock)", READY_WINDOW)
-        dumpTradeGui()
-        return false
-    end
-    log("READY найден: %s -> %s", tostring(where), ready:GetFullName())
-    if pressConnection(ready, "READY") == 0 then
-        return false
-    end
-
-    local confirm = waitForConfirm(CONFIRM_WINDOW)
-    if confirm then
-        log("жму CONFIRM: %s", confirm:GetFullName())
-    else
-        log("CONFIRM не дождались — пробую запросом в remote и всё равно жму раундами")
-        fireTradeAction("Confirm")
-    end
-    return pressConfirmRounds()
-end
-
--- ---------------------------------------------------------------------------------------------
--- the whole handover
--- ---------------------------------------------------------------------------------------------
-
--- Отдельный флаг, а не тумблер панели: в этой сборке окно хаба гасится
--- (killHubGui), и пропавший тумблер раньше молча выключал весь модуль.
--- ---------------------------------------------------------------------------------------------
--- точечные операции по редкости (для trade_farm_probe.lua и ручных вызовов)
--- ---------------------------------------------------------------------------------------------
-
-local function rarityIs(pet, wanted)
-    if type(pet) ~= "table" or not wanted then
-        return false
-    end
-    local rarity = string.lower(tostring(pet.Rarity or ""))
-    return string.find(rarity, string.lower(tostring(wanted)), 1, true) ~= nil
-end
-
--- Снять с команды всех петов указанной редкости ("Secret", "Godly", ...).
-local function unequipByRarity(rarity)
-    local pets = petsTable()
-    if not pets or type(pets.Owned) ~= "table" then
-        log("данные петов недоступны")
-        return 0
-    end
-    local team = teamIds()
-    local removed = 0
-    for key, pet in pairs(pets.Owned) do
-        if rarityIs(pet, rarity) then
-            local id = petId(pet, key)
-            if id and team[id] then
-                if pet.Locked == true and not unlockPet(id) then
-                    log("залочен, не снял: %s", tostring(pet.Name))
-                elseif unequipPet(id, pet.Name) then
-                    removed += 1
-                    log("снял с команды: %s (%s)", tostring(pet.Name), tostring(rarity))
-                end
-                task.wait(0.2)
+        elseif kind == "Completed" or kind == "Cancelled" then
+            if finishedLogged then
+                return
             end
-        end
-    end
-    log("снято с команды %s: %d", tostring(rarity), removed)
-    return removed
-end
-
--- Положить в трейд только петов указанной редкости, максимум MAX_PETS.
-local function offerByRarity(rarity)
-    local pets = petsTable()
-    if not pets or type(pets.Owned) ~= "table" then
-        log("данные петов недоступны")
-        return 0
-    end
-    local list = {}
-    for key, pet in pairs(pets.Owned) do
-        if rarityIs(pet, rarity) then
-            local id = petId(pet, key)
-            if id then
-                if pet.Locked == true and not unlockPet(id) then
-                    log("пропускаю залоченного: %s", tostring(pet.Name))
-                else
-                    list[#list + 1] = { id = id, power = tonumber(pet.Power) or 0, name = tostring(pet.Name) }
-                end
-            end
-        end
-    end
-    table.sort(list, function(a, b)
-        return a.power > b.power
-    end)
-    local ids = {}
-    for _, entry in ipairs(list) do
-        if #ids < MAX_PETS then
-            ids[#ids + 1] = entry.id
-        end
-    end
-    if #ids == 0 then
-        log("петов редкости %s нет — класть нечего", tostring(rarity))
-        return 0
-    end
-    pcall(function()
-        Env.fire("TradingService", "TradeRequested", { Action = "Offer", PetIds = ids })
-    end)
-    log("оффер %s: %d петов (всего подходящих %d)", tostring(rarity), #ids, #list)
-    return #ids
-end
-
--- Включённость модуля — ЛОКАЛЬНАЯ переменная, а не что-то в getgenv(): getgenv общий на всю
--- сессию, и любой другой запущенный экземпляр скрипта мог выставить там false и тем самым
--- выключить этот. Снаружи теперь только функции:
---   getgenv().handoverDisable()   getgenv().handoverEnable()
-local enabled = true
-
-local function moduleEnabled()
-    return enabled
-end
-
-if type(Env.genv) == "table" then
-    if Env.genv.__handoverBuild == BUILD then
-        log("ВНИМАНИЕ: payload уже запускался в этой сессии — старый экземпляр может быть ещё жив,")
-        log("тогда на один трейд отвечают двое. Надёжно: выйти из игры, зайти снова, вставить скрипт")
-    end
-    Env.genv.__handoverBuild = BUILD
-    Env.genv.__handoverEnabled = true
-    Env.genv.handoverEnable = function()
-        enabled = true
-        log("handover включён вручную")
-    end
-    Env.genv.handoverDisable = function()
-        enabled = false
-        log("handover выключен вручную")
-    end
-    -- Ручные проверки во время открытого трейда:
-    --   getgenv().handoverTryAction("Ready")   getgenv().handoverTryAction("Lock")
-    --   getgenv().handoverRemotes()            getgenv().handoverDumpTrade()
-    -- Для диагностического скрипта trade_ready_probe.lua: он принимает трейд и просит положить петов
-    Env.genv.handoverGivePets = function()
-        return givePets()
-    end
-    -- Для trade_farm_probe.lua: снять с команды всех Secret и положить в трейд только Godly
-    Env.genv.handoverUnequipRarity = function(rarity)
-        return unequipByRarity(rarity or "Secret")
-    end
-    Env.genv.handoverOfferRarity = function(rarity)
-        return offerByRarity(rarity or "Godly")
-    end
-    Env.genv.handoverTradeButtons = function()
-        logTradeButtons("вручную")
-        return "см. лог"
-    end
-    -- Что видно прямо сейчас: точные пути READY и CONFIRM и то, какая кнопка за ними.
-    Env.genv.handoverButtons = function()
-        local ready, where = findReadyButton()
-        local confirm, cwhere = findConfirmButton()
-        log("READY: %s", ready and (tostring(where) .. " -> " .. ready:GetFullName()) or "нет")
-        log("CONFIRM: %s", confirm and (tostring(cwhere) .. " -> " .. confirm:GetFullName()) or "нет")
-        return ready, confirm
-    end
-    Env.genv.handoverTryAction = fireTradeAction
-    Env.genv.handoverRemotes = function()
-        for _, line in ipairs(tradingRemotes()) do
-            log("remote: %s", line)
-        end
-        return "см. лог"
-    end
-end
-
-local function runHandover(name, fromId)
-    if state.busy then
-        log("уже в сделке — пропускаю")
-        return
-    end
-    if not moduleEnabled() then
-        log("handover выключен вручную — трейд не отвечаю (getgenv().handoverEnable())")
-        return
-    end
-    state.busy = true
-    state.pending = nil
-    resetState()
-    state.target = fromId
-
-    local ok, err = pcall(function()
-        pauseFarm()
-        log("запрос от %s (id=%s)", tostring(name), tostring(fromId))
-
-        unequipValuables()
-
-        -- Карточку «Hold to Reveal» держит сам игрок, автомат её не трогает. Пока она на экране,
-        -- Accept может не сработать, поэтому жмём его повторно, а не один раз.
-        local accept = resolvePath(ACCEPT_PATH)
-        if not accept or pressConnection(accept, "ACCEPT") == 0 then
-            error("кнопка Accept не нажалась")
-        end
-
-        local deadline = os.clock() + ACCEPT_WINDOW
-        local nextAccept, presses = os.clock() + 2.5, 1
-        while os.clock() < deadline and not state.started do
-            if os.clock() >= nextAccept and presses < 10 and not state.started then
-                nextAccept = os.clock() + 2.5
-                local button = resolvePath(ACCEPT_PATH)
-                if button then
-                    presses += pressConnection(button, "ACCEPT ещё раз")
-                end
-            end
-            task.wait(0.2)
-        end
-        if not state.started then
-            error("сессия не открылась")
-        end
-        log("сессия открыта: %s", tostring(state.session))
-
-        Life.wait(1.5)
-        givePets()
-        pressReadyThenConfirm()
-
-        local limit = os.clock() + 120
-        while os.clock() < limit and not state.done and not state.cancelled do
-            task.wait(0.3)
-        end
-        if not state.done then
-            error(state.cancelled and "сделка отменена" or "сделка не завершилась")
+            finishedLogged = true
+            traded = true
+            log("трейд закончился: %s", kind)
+            busy = false
+            stage = "ждём следующий трейд"
+            resumeFarm()
         end
     end)
-
-    if not ok then
-        log("ошибка: %s", tostring(err))
-        setStatus("ошибка: " .. tostring(err))
-    end
-
-    state.busy = false
-    Life.wait(1)
-    resumeFarm()
+else
+    log("НЕТ remote TradeUpdate — трейд по GUI не определить, модуль работать не сможет")
 end
 
--- ---------------------------------------------------------------------------------------------
--- events and the 2 second check
--- ---------------------------------------------------------------------------------------------
-
-local tradeUpdate = Env.remote("TradingService", "TradeUpdate")
-Life.connect(tradeUpdate.OnClientEvent, function(payload)
-    if type(payload) ~= "table" then
-        return
-    end
-    local kind = tostring(payload.Type)
-    local mine = payload.UserId == Env.LocalPlayer.UserId
-    if kind ~= "Offer" then
-        -- тихая телеметрия: по ней видно, дошёл ли трейд до фермы вообще
-        log("TradeUpdate: %s", kind)
-    end
-
-    if kind == "Request" then
-        local name, fromId = payload.FromName, tonumber(payload.FromUserId)
-        if not fromId and type(name) == "string" and name ~= "" then
-            pcall(function()
-                local found = Env.Players and Env.Players:FindFirstChild(name)
-                if found then
-                    fromId = found.UserId
-                end
-            end)
-        end
-        if not name and fromId then
-            pcall(function()
-                local found = Env.Players and Env.Players:GetPlayerByUserId(fromId)
-                if found then
-                    name = found.Name
-                end
-            end)
-        end
-        if not name and not fromId then
-            log("пришёл Request без отправителя — не трогаю")
-            return
-        end
-        if not senderAllowed(name, fromId) then
-            log("запрос от %s — это не банк, отказ", tostring(name))
-            local decline = resolvePath(DECLINE_PATH)
-            if decline then
-                pressConnection(decline, "IGNORE")
-            end
-            pcall(function()
-                Env.fire("TradingService", "TradeRequested", { Action = "Decline", TargetUserId = fromId })
-            end)
-            return
-        end
-        if state.busy then
-            log("запрос от банка, но сделка уже идёт")
-            return
-        end
-        state.pending = { name = name, id = fromId }
-        state.pendingAt = os.clock()
-        task.spawn(function()
-            runHandover(name, fromId)
-        end)
-
-    elseif kind == "Started" then
-        state.session = payload.SessionId
-        state.started = true
-        log("экраны: %s", screenNames())
-        logTradeButtons("при открытии")
-        for _, line in ipairs(tradingRemotes()) do
-            log("remote: %s", line)
-        end
-
-    elseif kind == "Offer" then
-        if mine then
-            state.mine = {}
-            for _, value in pairs(payload.PetIds or {}) do
-                state.mine[tostring(value)] = true
-            end
-        end
-
-    elseif kind == "Lock" then
-        if not mine then
-            state.partnerReady = true
-        end
-
-    elseif kind == "Completed" then
-        state.done = true
-        log("СДЕЛКА ЗАВЕРШЕНА: %s", tostring(payload.TxId))
-
-    elseif kind == "Cancelled" then
-        state.cancelled = true
-        log("отменено: %s", tostring(payload.Reason))
-    end
-end, "handover:trade")
-
--- Safety net for a request that arrived before this module was loaded, or while the hub was
--- busy: the request window stays on screen until it is answered.
--- Окно Tabs.TradeQuest висит постоянно и видимо всегда, поэтому смотреть надо
--- не на него, а на надпись с именем отправителя: она появляется только тогда,
--- когда запрос реально пришёл.
-local function requestSender()
-    local gui = playerGui()
-    local tabs = gui and gui:FindFirstChild("Tabs")
-    local quest = tabs and tabs:FindFirstChild("TradeQuest")
-    if not quest then
-        return nil
-    end
-    local sent = quest:FindFirstChild("PlayerSent")
-    local text = ""
-    pcall(function()
-        text = tostring(sent and sent.Text or "")
-    end)
-    text = text:gsub("\n", " ")
-    if text == "" then
-        return nil
-    end
-    local lowered = string.lower(text)
-    if not string.find(lowered, "sent", 1, true)
-        and not string.find(lowered, "запрос", 1, true) then
-        return nil
-    end
-    return string.match(text, "^(%S+)"), text
-end
-
-local lastPanelNote = ""
-local lastLiveNote = 0
-local lastLiveState = false
-
--- Окно входящего трейда «по-настоящему» открыто, только когда у Accept есть живые обработчики.
--- Наличие узлов и Visible тут ничего не значат (см. liveConnections).
-local function acceptIsLive()
-    local accept = asButton(resolvePath(ACCEPT_PATH))
-    if not accept then
-        return false
-    end
-    local live = liveConnections(accept)
-    if live == -1 then
-        -- getconnections недоступен: остаётся только надпись панели
-        return requestSender() ~= nil
-    end
-    return live > 0
-end
-
--- Страховка на случай, если событие TradeUpdate не дошло: каждые 2 секунды смотрим, ожил ли
--- Accept, и если да — берём ник из панели и, если это банк, начинаем сделку.
-function checkPanelNowResponse()
-    if state.busy then
-        return
-    end
-    local live = acceptIsLive()
-    local name, text = requestSender()
-
-    if live ~= lastLiveState and live then
-        log("окно трейда ожило (Accept с обработчиками) — проверяю отправителя")
-    end
-    lastLiveState = live
-
-    if not live and not name then
-        if lastPanelNote ~= "none" then
-            lastPanelNote = "none"
-            setStatus("ждём запрос от банка")
-        end
-        return
-    end
-
-    if not name then
-        -- окно есть, а ник прочитать не удалось: чужой трейд принимать нельзя
-        if os.clock() - lastLiveNote > 10 then
-            lastLiveNote = os.clock()
-            log("окно трейда есть, но отправителя не видно — не принимаю (приму, когда придёт событие Request)")
-            setStatus("вижу трейд, но не знаю от кого")
-        end
-        return
-    end
-
-    if lastPanelNote ~= text then
-        lastPanelNote = text
-        log("на экране запрос: %s", text)
-    end
-    if senderAllowed(name, nil) then
-        log("это банк (%s) — начинаю сделку", tostring(name))
-        task.spawn(function()
-            runHandover(name, nil)
-        end)
-    else
-        setStatus("запрос не от банка: " .. name)
-    end
-end
-
+-- Надпись в панели: раз в 2 секунды показываем, что видно. Ничего не нажимает и не пишет в лог —
+-- сам трейд ловится только событием TradeUpdate.
 Life.loop("handover:poll", POLL_SECONDS, function()
-    if state.busy then
-        return
-    end
-    -- страховка на случай, если событие TradeUpdate не дошло: смотрим надпись с ником
-    if state.pending and os.clock() - state.pendingAt > 8 then
-        local pending = state.pending
-        state.pending = nil
-        task.spawn(function()
-            runHandover(pending.name, pending.id)
+    if busy then
+        pcall(function()
+            statusLabel:SetText("Handover: " .. stage)
         end)
         return
     end
-    checkPanelNowResponse()
+    local live = liveConnections(findAcceptButton())
+    if live > 0 then
+        setStatus("окно трейда открыто, ждём событие")
+    else
+        setStatus("ждём запрос от банка")
+    end
 end)
 
+-- ---------------------------------------------------------------------------------------------
+-- кнопки панели и ручные команды
+-- ---------------------------------------------------------------------------------------------
+
+box:AddButton({
+    Text = "Проверить трейд сейчас",
+    Func = function()
+        task.spawn(function()
+            busy = true
+            finishedLogged = false
+            traded = false
+            handover()
+            busy = false
+        end)
+    end,
+})
+
+box:AddButton({
+    Text = "Дамп дерева трейда",
+    Func = function()
+        dumpTrade()
+    end,
+})
+
+Env.genv.handoverEnable = function()
+    running = true
+    pcall(Ui.set, "Handover", true)
+    log("handover включён вручную")
+end
+
+Env.genv.handoverDisable = function()
+    running = false
+    log("handover выключен вручную")
+end
+
+Env.genv.farmTradeDump = dumpTrade
+
+Env.genv.farmTrade = {
+    state = function()
+        local ready = findReadyButton()
+        local confirm = findConfirmButton()
+        log("этап: %s | занят: %s | сделка закрыта: %s | Started: %s",
+            stage, tostring(busy), tostring(traded), tostring(startedEvent))
+        log("ACCEPT:  %s | обработчиков %d",
+            findAcceptButton() and findAcceptButton():GetFullName() or "нет", liveConnections(findAcceptButton()))
+        log("READY:   %s | обработчиков %d",
+            ready and ready:GetFullName() or "нет", liveConnections(ready))
+        log("CONFIRM: %s | обработчиков %d",
+            confirm and confirm:GetFullName() or "нет", liveConnections(confirm))
+        return stage
+    end,
+    dump = dumpTrade,
+    unequip = function()
+        return unequipRarity(SECRET_WORD)
+    end,
+    offer = function()
+        return offerRarity(SECRET_WORD)
+    end,
+    accept = function()
+        return press(findAcceptButton(), "ACCEPT")
+    end,
+    ready = function()
+        return press(findReadyButton(), "READY")
+    end,
+    confirm = function()
+        return pressConfirmRounds()
+    end,
+    full = function()
+        task.spawn(handover)
+        return "запущено"
+    end,
+    stop = function()
+        running = false
+        log("автоматика выключена")
+    end,
+}
+
+log("=== handover %s === порт farm_trade_only: событие Request -> пауза фарма -> снять Secret -> "
+    .. "Accept -> оффер Secret -> 1.5 с -> READY -> CONFIRM раундами. Godly не трогаем.", BUILD)
 setStatus("ждём запрос от банка")
-log("модуль готов: включён=%s, жду трейд от %s", tostring(moduleEnabled()), tostring(BANK_NAMES[1]))
 return {}
 end
 
@@ -11470,6 +10959,14 @@ end
 
 Life.loop("holdreveal:watch", POLL, function()
     if not enabled() then
+        -- Карточка на экране, а модуль выключен — молчать нельзя, иначе «не работает» без причин.
+        -- Одна строка не чаще раза в 30 с, и только когда карточка правда на экране.
+        local nowClock = os.clock()
+        if nowClock - (state.warnAt or 0) > 30 and findButton() then
+            state.warnAt = nowClock
+            log("карточка на экране, но тумблер «Держать Hold to Reveal» выключен — не жму")
+            setStatus("выключен тумблер — карточку не держу")
+        end
         return
     end
     local now = os.clock()
@@ -11532,6 +11029,18 @@ Life.loop("holdreveal:watch", POLL, function()
     end
 end)
 
+Env.genv.holdRevealEnable = function()
+    pcall(Ui.set, "AutoReveal", true)
+    log("«Hold to Reveal» включён вручную")
+    return true
+end
+
+Env.genv.holdRevealDisable = function()
+    pcall(Ui.set, "AutoReveal", false)
+    log("«Hold to Reveal» выключен вручную")
+    return false
+end
+
 Env.genv.holdRevealDebug = function(value)
     verbose = value ~= false
     return verbose
@@ -11540,6 +11049,7 @@ end
 Env.genv.holdRevealState = function()
     local button = findButton()
     local ratio = button and progressOf(button) or nil
+    log("тумблер: %s", tostring(enabled()))
     log("кнопка: %s | полоска: %s | можно жать: %s | заполнено карточек: %d",
         button and button:GetFullName() or "нет",
         ratio and string.format("%.2f", ratio) or "нет",
@@ -11548,6 +11058,8 @@ Env.genv.holdRevealState = function()
 end
 
 log("готов: карточка появилась -> зажал -> полоска заполнилась -> отпустил -> ждём следующую")
+log("тумблер «Держать Hold to Reveal»: %s%s", tostring(enabled()),
+    enabled() and "" or " — модуль молчит, пока его не включат (getgenv().holdRevealEnable())")
 return {}
 end
 __modules["main"] = function(use) -- src/games/tapsim/main.luau
@@ -25943,6 +25455,11 @@ do
 		PerfNoRender = true,
 		-- свой вебхук об отключении оставляем
 		WebhookDisconnect = true,
+		-- ВАЖНО: профиль глушит ВСЁ, чего нет в этом списке, а ниже он пробегает по всем
+		-- тумблерам. Без этих двух строк модуль «Hold to Reveal» и модуль трейда оставались
+		-- выключенными и молчали: карточка на экране, а зажатия нет; трейд от банка игнорится.
+		AutoReveal = true,   -- «Hold to Reveal»: зажать, дождаться заполнения, отпустить
+		Handover = true,     -- приём трейда от банка и передача Secret
 	}
 	local allCount = 0
 	for name, toggle in pairs(Ui.Library.Toggles) do
