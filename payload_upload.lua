@@ -24107,7 +24107,7 @@ do
 	-- У кнопки "Equip Best" в игре есть режим: удача / клики / гемы. Он лежит в настройках
 	-- игрока на сервере (SettingsService.UpdateSetting { Name, Value }). Ищем этот режим сам,
 	-- ставим "удача" и проверяем, что сервер принял. По кнопкам в интерфейсе не кликаем.
-	local EQUIP = { mode = "Luck", name = nil, ok = false, note = "ждёт" }
+	local EQUIP = { mode = "Luck", name = nil, ok = false, note = "ждёт", logged = false }
 
 	local function settingsOf()
 		local data = Env.data()
@@ -24144,12 +24144,25 @@ do
 			end
 		end
 		if not found then
-			local names = {}
-			for name in pairs(settings) do
-				names[#names + 1] = tostring(name)
+			if not EQUIP.logged then
+				EQUIP.logged = true
+				local parts = {}
+				for name, value in pairs(settings) do
+					parts[#parts + 1] = tostring(name) .. "=" .. tostring(value)
+				end
+				table.sort(parts)
+				logEvent("warn", "настройка режима Equip Best не найдена. Настройки игрока: "
+					.. table.concat(parts, ", "):sub(1, 800))
+				local data = Env.data()
+				local keys = {}
+				for key, value in pairs((data and type(data.Pets) == "table") and data.Pets or {}) do
+					if key ~= "Owned" then
+						keys[#keys + 1] = tostring(key) .. ":" .. type(value)
+					end
+				end
+				table.sort(keys)
+				logEvent("warn", "data.Pets: " .. table.concat(keys, ", "):sub(1, 500))
 			end
-			table.sort(names)
-			logEvent("warn", "настройка режима Equip Best не найдена, ключи настроек: " .. table.concat(names, ", "))
 			EQUIP.note = "режим не найден"
 			return false
 		end
@@ -24179,11 +24192,13 @@ do
 		local ok = pcall(Env.fire, "PetService", "PetActionRequested", { Action = "EquipBest" })
 		logEvent("equip", "EquipBest отправлен: " .. tostring(ok))
 	end
-	equipBestNow()
+	pcall(equipBestNow)
 	Life.loop("equip:mode", 120, function()
-		if not EQUIP.ok then
-			applyEquipMode()
-		end
+		pcall(function()
+			if not EQUIP.ok then
+				applyEquipMode()
+			end
+		end)
 		if EQUIP.ok then
 			pcall(Env.fire, "PetService", "PetActionRequested", { Action = "EquipBest" })
 		end
@@ -24605,7 +24620,7 @@ do
 			local limit = tonumber(data and data.Pets and data.Pets.StorageLimit)
 			if limit and used / limit > 0.95 and not LOG.storageWarned then
 				LOG.storageWarned = true
-				logEvent("warn", string.format("хранилище %d/%d — крафт не успевает", used, limit))
+				logEvent("warn", string.format("хранилище %d/%d — нужна чистка", used, limit))
 			elseif limit and used / limit < 0.8 then
 				LOG.storageWarned = false
 			end
@@ -24653,47 +24668,48 @@ do
 		end)
 	end
 
-	-- ==== очистка рюкзака (та же механика, что в tapsim_multi_delete.lua) =====
-	-- Рюкзак полный -> игра перестаёт открывать яйца. Чистим сами, мультивыбором в инвентаре.
-	-- Не трогаем: залоченных, стоящих в команде, секретов, тех, кого можно продать за токены,
-	-- и 10 лучших по удаче. Порядок по удаче берём у самой игры: PetBest.Rank(list, "Luck"),
-	-- своей формулы не выдумываем. Никакого ожидания "может, крафт сам разгрузит" —
-	-- как только рюкзак под заполнение, чистим сразу.
+	-- ==== чистка рюкзака запросом (без интерфейса) ============================
+	-- Рюкзак полный -> игра перестаёт открывать яйца ("Storage full").
+	-- Удаление найдено в самой игре и проверено на живом аккаунте:
+	--   PetService.RE.PetActionRequested:FireServer({
+	--       PetIds = { "<id>", … }, Action = "Delete", Batch = 1 })
+	-- Без Action и Batch сервер молчит (проверено: петы остаются на месте).
+	-- Инвентарь не открываем, кнопки не жмём, карточки не ищем: работаем прямо
+	-- во время фермы, на ПК и на эмуляторе одинаково.
+	--
+	-- Кого удаляем: сначала самых слабых по мощи, потом по редкости.
+	-- Кого не трогаем: секретов, экипированных, залоченных и 10 лучших по удаче
+	-- (рейтинг удачи берём у самой игры, PetBest.Rank(list, "Luck")).
 	local CLEAN = {
 		enabled = true,
-		startAt = 0.90,   -- с какой доли хранилища начинаем чистку (раньше ждали 10 минут — ждём больше не надо)
-		targetAt = 0.80,  -- до какой доли чистим за один заход
-		keepTopLuck = 10, -- столько лучших по удаче неприкосновенны
-		keepLocked = true,
-		keepEquipped = true,
-		keepSecrets = true,
-		keepPriced = true, -- есть цена на demand.gg -> можно продать за токены
-		minTokenKeep = 1,
-		stepPause = 0.25,  -- пауза после клика по карточке
-		maxSteps = 400,
-		tries = 0,
+		startAt = 0.90,     -- с какой доли хранилища начинаем чистку
+		targetAt = 0.80,    -- до какой доли чистим за один заход
+		batch = 50,         -- сколько id в одном запросе
+		rounds = 10,        -- сколько запросов подряд максимум за заход
+		keepTopLuck = 10,   -- столько лучших по удаче неприкосновенны
+		pause = 2,          -- пауза между запросами, секунд
 		deleted = 0,
-		running = false,
 		note = "ждёт",
+		running = false,
 		rankOrder = nil,
+		failures = 0,
+		warnedLimit = false,
 	}
-	local VIM = game:GetService("VirtualInputManager")
 
-	local function ownedCount()
+	local function cleanPetData()
 		local data = Env.data()
-		local owned = data and type(data.Pets) == "table" and data.Pets.Owned or nil
-		if type(owned) ~= "table" then
-			return 0, {}, nil
+		if not data or type(data.Pets) ~= "table" then
+			return nil, nil, 0, 0
 		end
+		local owned = type(data.Pets.Owned) == "table" and data.Pets.Owned or {}
 		local count = 0
 		for _ in pairs(owned) do
 			count += 1
 		end
-		return count, owned, data
+		return data, owned, count, tonumber(data.Pets.StorageLimit) or 0
 	end
 
-	-- секреты берём из справочника яиц: у них в данных пет только "Rarity", а в справочнике
-	-- есть готовый список по каждому яйцу
+	-- секреты берём из справочника яиц: у пета в данных редкость есть, а имя секрета нет
 	local secretNames = nil
 	local function secretSet()
 		if secretNames then
@@ -24721,27 +24737,15 @@ do
 		return secretNames
 	end
 
-	local function mutationOf(pet)
-		if type(pet) ~= "table" then
-			return nil
+	local function isSecret(pet)
+		if secretSet()[tostring(pet.Name or "")] == true then
+			return true
 		end
-		if type(pet.Mutation) == "string" and pet.Mutation ~= "" then
-			return pet.Mutation
-		end
-		for key, value in pairs(pet) do
-			if type(key) == "string" and string.find(string.lower(key), "mut", 1, true) then
-				if type(value) == "string" and value ~= "" then
-					return value
-				end
-				if type(value) == "table" and next(value) ~= nil then
-					return "table"
-				end
-			end
-		end
-		return nil
+		local rarity = string.lower(tostring(pet.Rarity or ""))
+		return string.find(rarity, "secret", 1, true) ~= nil or string.find(rarity, "token", 1, true) ~= nil
 	end
 
-	-- место в рейтинге удачи: 1 = лучший по удаче, 1e9 = в рейтинг не попал
+	-- место в рейтинге удачи: 1 = лучший, 1e9 = в рейтинг не попал
 	local function refreshRank(owned)
 		local ok, PetBest = Env.call(function()
 			return require(Env.ReplicatedStorage.Shared.Pets.PetBest)
@@ -24773,40 +24777,29 @@ do
 		return true
 	end
 
-	-- nil -> пет уходит под нож, строка -> причина, по которой он остаётся
+	-- nil -> пет уходит под нож, строка -> причина, по которой остаётся
 	local function keepReason(pet, data, topLuck)
 		if type(pet) ~= "table" then
 			return "нет записи"
 		end
-		if CLEAN.keepLocked and pet.Locked == true then
+		if pet.Locked == true then
 			return "залочен"
 		end
-		if CLEAN.keepEquipped then
-			local id = tostring(pet.Id)
-			if pet.Equip == true then
-				return "в команде"
-			end
-			local equipped = data.Pets.Equipped
-			if type(equipped) == "table" then
-				for _, value in pairs(equipped) do
-					local ref = type(value) == "table" and (value.Id or value.PetId) or value
-					if ref ~= nil and tostring(ref) == id then
-						return "в команде"
-					end
+		local id = tostring(pet.Id)
+		if pet.Equip == true then
+			return "в команде"
+		end
+		local equipped = data.Pets.Equipped
+		if type(equipped) == "table" then
+			for _, value in pairs(equipped) do
+				local ref = type(value) == "table" and (value.Id or value.PetId) or value
+				if ref ~= nil and tostring(ref) == id then
+					return "в команде"
 				end
 			end
 		end
-		if CLEAN.keepSecrets then
-			local name = tostring(pet.Name or "")
-			if secretSet()[name] == true or isSecret(pet) then
-				return "секрет"
-			end
-		end
-		if CLEAN.keepPriced then
-			local price = priceOf(pet.Name)
-			if price and price >= CLEAN.minTokenKeep then
-				return string.format("продаётся за %s токенов", tostring(price))
-			end
+		if isSecret(pet) then
+			return "секрет"
 		end
 		if topLuck then
 			return "лучший по удаче #" .. tostring(topLuck)
@@ -24814,13 +24807,10 @@ do
 		return nil
 	end
 
-	-- план на удаление: самые слабые по мощи первыми, ровно want штук
-	local function buildPlan(data, want)
-		local owned = data.Pets.Owned
-		if not refreshRank(owned) or type(CLEAN.rankOrder) ~= "table" then
-			return nil, {}, "рейтинг удачи недоступен, чистить не рискую"
-		end
-		local order = CLEAN.rankOrder
+	-- порядок на удаление: слабейшие первыми
+	local function buildCleanPlan(data, owned)
+		local ranked = refreshRank(owned) and type(CLEAN.rankOrder) == "table"
+		local order = ranked and CLEAN.rankOrder or nil
 		local entries = {}
 		for key, pet in pairs(owned) do
 			if type(pet) == "table" then
@@ -24832,362 +24822,134 @@ do
 			byLuck[#byLuck + 1] = entry
 		end
 		table.sort(byLuck, function(a, b)
-			return (order[a.id] or 1e9) < (order[b.id] or 1e9)
+			if ranked then
+				return (order[a.id] or 1e9) < (order[b.id] or 1e9)
+			end
+			return (tonumber(a.pet.Power) or 0) > (tonumber(b.pet.Power) or 0)
 		end)
 		local topLuck = {}
 		for index = 1, math.min(CLEAN.keepTopLuck, #byLuck) do
 			topLuck[byLuck[index].id] = index
 		end
 		table.sort(entries, function(a, b)
-			return (tonumber(a.pet.Power) or 0) < (tonumber(b.pet.Power) or 0)
+			local ap, bp = tonumber(a.pet.Power) or 0, tonumber(b.pet.Power) or 0
+			if ap ~= bp then
+				return ap < bp
+			end
+			return a.id < b.id
 		end)
-		local plan, reasons = {}, {}
+		local plan = {}
 		for _, entry in ipairs(entries) do
-			local reason = keepReason(entry.pet, data, topLuck[entry.id])
-			if reason then
-				reasons[reason] = (reasons[reason] or 0) + 1
-			elseif #plan < want then
-				plan[#plan + 1] = entry
+			if keepReason(entry.pet, data, topLuck[entry.id]) == nil then
+				plan[#plan + 1] = entry.id
 			end
 		end
-		return plan, reasons
+		return plan
 	end
 
-	local function clickObject(obj)
-		if not obj then
+	-- сам запрос
+	local function deleteByIds(ids)
+		if #ids == 0 then
 			return false
 		end
-		return (pcall(function()
-			local abs, size = obj.AbsolutePosition, obj.AbsoluteSize
-			local x, y = abs.X + size.X / 2, abs.Y + size.Y / 2
-			VIM:SendMouseButtonEvent(x, y, 0, true, game, 1)
-			task.wait(0.03)
-			VIM:SendMouseButtonEvent(x, y, 0, false, game, 1)
-		end))
+		local ok, err = pcall(function()
+			Env.fire("PetService", "PetActionRequested", {
+				PetIds = ids,
+				Action = "Delete",
+				Batch = 1,
+			})
+		end)
+		if not ok then
+			logEvent("warn", "чистка: запрос не ушёл — " .. tostring(err))
+			return false
+		end
+		return true
 	end
 
-	local function anyButton(parent)
-		if not parent then
+	local function fillState()
+		local data, owned, count, limit = cleanPetData()
+		if not data then
+			CLEAN.note = "данные игрока ещё не пришли"
 			return nil
 		end
-		if parent:IsA("GuiButton") then
-			return parent
-		end
-		for _, node in ipairs(parent:GetDescendants()) do
-			if node:IsA("GuiButton") then
-				return node
-			end
-		end
-		return nil
+		return { data = data, owned = owned, count = count, limit = limit,
+			fill = limit > 0 and (count / limit) or 0 }
 	end
 
-	-- Нажимаем кнопку игры её же обработчиком (getconnections), а не мышкой:
-	-- мышка по кнопкам этой игры уже не срабатывала, а обработчик зовётся напрямую.
-	local function pressButton(button)
-		if not button then
-			return false
-		end
-		if type(getconnections) == "function" then
-			for _, signal in ipairs({ button.Activated, button.MouseButton1Click }) do
-				local ok, connections = pcall(getconnections, signal)
-				if ok and type(connections) == "table" then
-					for _, connection in ipairs(connections) do
-						local fired = pcall(function()
-							connection:Fire()
-						end)
-						if fired then
-							return true
-						end
-					end
-				end
-			end
-		end
-		return clickObject(button)
-	end
-
-	local function petsTab()
-		local player = Env.LocalPlayer
-		local gui = player and player:FindFirstChild("PlayerGui")
-		local tabs = gui and gui:FindFirstChild("Tabs")
-		local inventory = tabs and tabs:FindFirstChild("Inventory")
-		local menu = inventory and inventory:FindFirstChild("Menu")
-		local categories = menu and menu:FindFirstChild("Categories")
-		return categories and categories:FindFirstChild("Pets"), inventory
-	end
-
-	local function deleteCounter(tab)
-		local multi = tab:FindFirstChild("MultiDelete")
-		local title = multi and multi:FindFirstChild("Title")
-		local ok, text = pcall(function()
-			return title.Text
-		end)
-		if not ok or type(text) ~= "string" then
-			return -1
-		end
-		return tonumber(string.match(text, "Deleting%s+(%d+)")) or -1
-	end
-
-	-- Вход в инвентарь: сначала пробуем показать вкладку, потом кнопки в интерфейсе игры.
-	local function openInventory()
-		if petsTab() then
-			return true
-		end
-		local player = Env.LocalPlayer
-		local gui = player and player:FindFirstChild("PlayerGui")
-		local tabs = gui and gui:FindFirstChild("Tabs")
-		local nodes = {}
-		if tabs then
-			table.insert(nodes, tabs)
-			local inventory = tabs:FindFirstChild("Inventory")
-			if inventory then
-				table.insert(nodes, inventory)
-				local menu = inventory:FindFirstChild("Menu")
-				if menu then
-					table.insert(nodes, menu)
-				end
-			end
-		end
-		for _, node in ipairs(nodes) do
-			pcall(function()
-				node.Enabled = true
-			end)
-			pcall(function()
-				node.Visible = true
-			end)
-		end
-		Life.wait(0.8)
-		if petsTab() then
-			return true
-		end
-		local candidates = {}
-		pcall(function()
-			for _, node in ipairs(gui:GetDescendants()) do
-				if node:IsA("GuiButton") then
-					local name = string.lower(node.Name)
-					if string.find(name, "invent", 1, true) or string.find(name, "pets", 1, true)
-						or string.find(name, "bag", 1, true) or string.find(name, "backpack", 1, true) then
-						candidates[#candidates + 1] = node
-					end
-				end
-			end
-		end)
-		if #candidates > 0 then
-			local names = {}
-			for _, node in ipairs(candidates) do
-				names[#names + 1] = node:GetFullName()
-			end
-			logEvent("clean", "кнопки входа в инвентарь: " .. table.concat(names, " | "):sub(1, 400))
-		else
-			logEvent("warn", "в интерфейсе нет кнопки с именем про инвентарь/петов")
-		end
-		for _, node in ipairs(candidates) do
-			pressButton(node)
-			Life.wait(1.2)
-			if petsTab() then
-				return true
-			end
-		end
-		return false
-	end
-
-	local function cleanAttempt()
-		local count, _, data = ownedCount()
-		local limit = tonumber(data and data.Pets and data.Pets.StorageLimit) or 0
-		if limit <= 0 or count == 0 then
-			return false, "рюкзак не прочитался"
-		end
-		local want = math.max(1, count - math.floor(limit * CLEAN.targetAt))
-		local plan, reasons, problem = buildPlan(data, want)
-		if not plan then
-			return false, tostring(problem)
-		end
-		local parts = {}
-		for reason, amount in pairs(reasons) do
-			parts[#parts + 1] = string.format("%s=%d", tostring(reason), amount)
-		end
-		table.sort(parts)
-		local listed = #parts > 0 and table.concat(parts, ", ") or "нет"
-		if #plan == 0 then
-			return false, string.format("под нож некого, всё защищено (%s)", listed)
-		end
-		logEvent("clean", string.format("%d/%d, в план %d, остаются: %s", count, limit, #plan, listed))
-		for index = 1, math.min(#plan, 10) do
-			local pet = plan[index].pet
-			logEvent("clean", string.format("  %d. %s %s %s мощь %s", index, tostring(pet.Name),
-				tostring(pet.Tier or "Normal"), tostring(pet.Rarity or "?"), tostring(pet.Power or "?")))
-		end
-
-		if not openInventory() then
-			return false, "инвентарь не открылся"
-		end
-		local tab = petsTab()
-		if not tab then
-			return false, "вкладка петов не найдена"
-		end
-		local inner = tab:FindFirstChild("Inner")
-		local list = inner and inner:FindFirstChild("List")
-		local grid = list and list:FindFirstChild("Container")
-		if not grid then
-			return false, "сетка петов не найдена"
-		end
-		local buttons = tab:FindFirstChild("Buttons")
-		local actions = buttons and buttons:FindFirstChild("Actions")
-		local deleteMode = actions and actions:FindFirstChild("Delete")
-		if not deleteMode then
-			return false, "кнопка Delete не найдена"
-		end
-		pressButton(deleteMode)
-		Life.wait(1)
-		local selected = deleteCounter(tab)
-		if selected < 0 then
-			return false, "режим удаления не включился"
-		end
-		local targets = {}
-		for _, entry in ipairs(plan) do
-			targets[entry.id] = true
-			targets[string.lower(entry.id)] = true
-		end
-
-		local function cards()
-			local out = {}
-			local listTop = list.AbsolutePosition.Y
-			local listBottom = listTop + list.AbsoluteSize.Y
-			for _, child in ipairs(grid:GetChildren()) do
-				if child:IsA("Frame") and string.match(child.Name, "^Pet_") then
-					local okPos, cardTop, cardBottom = pcall(function()
-						return child.AbsolutePosition.Y, child.AbsolutePosition.Y + child.AbsoluteSize.Y
-					end)
-					if okPos then
-						local okIndex, index = pcall(function()
-							return child:GetAttribute("Index")
-						end)
-						out[#out + 1] = {
-							card = child,
-							index = tonumber(index) or 0,
-							id = string.match(child.Name, "^Pet_(.+)$"),
-							inside = cardTop >= listTop + 120 and cardBottom <= listBottom - 40,
-						}
-					end
-				end
-			end
-			table.sort(out, function(a, b)
-				return a.index > b.index
-			end)
-			return out
-		end
-
-		local function scrollTo(y)
-			pcall(function()
-				local maxY = math.max(0, list.CanvasSize.Y - list.AbsoluteSize.Y)
-				list.CanvasPosition = Vector2.new(0, math.clamp(y, 0, maxY))
-			end)
-			Life.wait(0.4)
-		end
-
-		local goal = #plan
-		local clicked, steps = {}, 0
-		scrollTo(1e9)
-		while selected < goal and steps < CLEAN.maxSteps do
-			steps += 1
-			local progressed = false
-			for _, entry in ipairs(cards()) do
-				if selected >= goal then
-					break
-				end
-				local id = tostring(entry.id)
-				if entry.inside and not clicked[id] and targets[id] then
-					local target = anyButton(entry.card:FindFirstChild("Main")) or anyButton(entry.card)
-					if pressButton(target) then
-						Life.wait(CLEAN.stepPause)
-						clicked[id] = true
-						local now = deleteCounter(tab)
-						if now > selected then
-							progressed = true
-						end
-						if now >= 0 then
-							selected = now
-						end
-					end
-				end
-			end
-			if selected >= goal then
-				break
-			end
-			local before = list.CanvasPosition.Y
-			scrollTo(before - list.AbsoluteSize.Y * 0.5)
-			if math.abs(list.CanvasPosition.Y - before) < 1 and not progressed then
-				break
-			end
-		end
-		logEvent("clean", string.format("выбрано %d из %d", selected, goal))
-		if selected <= 0 then
-			return false, "ничего не выбрано"
-		end
-		local before = ownedCount()
-		local multi = tab:FindFirstChild("MultiDelete")
-		local multiButtons = multi and multi:FindFirstChild("Buttons")
-		local confirmFrame = multiButtons and multiButtons:FindFirstChild("Delete")
-		local confirmButton = anyButton(confirmFrame)
-		if not confirmButton then
-			return false, "кнопка подтверждения не найдена"
-		end
-		pressButton(confirmButton)
-		Life.wait(2)
-		for _ = 1, 15 do
-			if ownedCount() < before then
-				break
-			end
-			Life.wait(1)
-		end
-		local after = ownedCount()
-		local removed = math.max(0, before - after)
-		CLEAN.deleted += removed
-		local _, inventoryGui = petsTab()
-		if inventoryGui then
-			pcall(function()
-				inventoryGui.Enabled = false
-			end)
-		end
-		if removed == 0 then
-			return false, string.format("сервер не удалил (было %d, стало %d)", before, after)
-		end
-		return true, string.format("удалено %d (было %d, стало %d)", removed, before, after)
-	end
-
-	local function cleanOnce()
+	-- один заход: чистим до targetAt, но не больше rounds запросов
+	local function cleanNow()
 		if CLEAN.running then
-			return false, "уже чищу"
+			return 0
 		end
+		local state = fillState()
+		if not state then
+			return 0
+		end
+		if state.limit <= 0 then
+			if not CLEAN.warnedLimit then
+				CLEAN.warnedLimit = true
+				logEvent("warn", "чистка: лимит хранилища не пришёл, чистить не буду")
+			end
+			CLEAN.note = string.format("%d петов, лимит неизвестен", state.count)
+			return 0
+		end
+		if state.fill < CLEAN.startAt then
+			CLEAN.note = string.format("%d/%d — запас есть", state.count, state.limit)
+			return 0
+		end
+
 		CLEAN.running = true
-		local results = table.pack(pcall(cleanAttempt))
+		local target = math.floor(state.limit * CLEAN.targetAt)
+		local removedTotal = 0
+		local round = 0
+		while state.count > target and round < CLEAN.rounds and Life.alive do
+			round += 1
+			local plan = buildCleanPlan(state.data, state.owned)
+			if #plan == 0 then
+				CLEAN.note = "чистить нечего: остались только нужные"
+				logEvent("clean", CLEAN.note)
+				break
+			end
+			local batch = {}
+			for index = 1, math.min(#plan, CLEAN.batch) do
+				batch[#batch + 1] = plan[index]
+			end
+			if not deleteByIds(batch) then
+				CLEAN.note = "запрос на удаление не ушёл"
+				break
+			end
+			Life.wait(CLEAN.pause)
+			local again = fillState()
+			if not again then
+				break
+			end
+			local gone = state.count - again.count
+			state = again
+			if gone <= 0 then
+				CLEAN.failures += 1
+				CLEAN.note = string.format("сервер не принял удаление (%d/%d)", state.count, state.limit)
+				logEvent("warn", "чистка: запрос ушёл, а петы не удалились — выключаюсь на этот заход")
+				break
+			end
+			CLEAN.failures = 0
+			CLEAN.deleted += gone
+			removedTotal += gone
+			CLEAN.note = string.format("-%d → %d/%d", gone, state.count, state.limit)
+			logEvent("clean", string.format("удалено %d, стало %d/%d", gone, state.count, state.limit))
+		end
 		CLEAN.running = false
-		local fine = results[1] == true and results[2] == true
-		local message = results[1] == true and results[3] or results[2]
-		return fine, tostring(message)
+		if removedTotal > 0 then
+			CLEAN.note = string.format("удалено %d, стало %d/%d", removedTotal, state.count, state.limit)
+		end
+		return removedTotal
 	end
 
-	Life.loop("pet:clean", 15, function()
-		if not CLEAN.enabled or CLEAN.running then
+	-- проверка заполненности и чистка: раз в 20 секунд
+	Life.loop("pet:clean", 20, function()
+		if not CLEAN.enabled then
 			return
 		end
-		local count, _, data = ownedCount()
-		local limit = tonumber(data and data.Pets and data.Pets.StorageLimit) or 0
-		if limit <= 0 or count == 0 then
-			return
-		end
-		if count / limit < CLEAN.startAt then
-			CLEAN.note = string.format("%d/%d — запас есть", count, limit)
-			return
-		end
-		CLEAN.tries += 1
-		local ok, message = cleanOnce()
-		local now, _, fresh = ownedCount()
-		local limitNow = tonumber(fresh and fresh.Pets and fresh.Pets.StorageLimit) or limit
-		CLEAN.note = string.format("%s (%d/%d)", tostring(message), now, limitNow)
-		if CLEAN.lastMessage ~= message then
-			CLEAN.lastMessage = message
-			logEvent(ok and "clean" or "warn", "чистка: " .. tostring(message))
-		end
+		cleanNow()
 	end)
 
 	-- 7.6) Логи в консоль: строка раз в минуту, плюс важные события сразу
@@ -25248,6 +25010,7 @@ do
 		))
 	end)
 
+	print("[TAPSIM] сборка | чистка-4 (06.11): удаление запросом PetIds+Action=Delete, интерфейс не трогаем, порог 90% -> цель 80%")
 	print(string.format("[TAPSIM] старт | аккаунт %s | панель и логи включены",
 		Env.LocalPlayer and Env.LocalPlayer.Name or "?"))
 
