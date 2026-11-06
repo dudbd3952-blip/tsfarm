@@ -11128,6 +11128,9 @@ __modules["features/holdreveal"] = function(use) -- src/games/tapsim/features/ho
 -- с экрана (GONE_QUIET секунд) — или, страховки ради, пока полоска не продержится на нуле
 -- FALLBACK_ZERO секунд спустя FALLBACK_GAP секунд после заполнения (если игра переиспользует ту
 -- же карточку под следующее яйцо и не убирает её с экрана).
+-- v2: добавлена прямая страховка от флуда — если полоска на карточке УЖЕ полная, модуль не жмёт
+-- вообще (v1 в этой ситуации молчал только по таймингам, а старый отдельный скрипт жал повторно
+-- каждые 0.16 с и забивал лог).
 --
 -- В лог — одна короткая строка на карточку, а не поток. Всё остальное по требованию:
 --   getgenv().holdRevealState()   — что модуль видит сейчас (кнопка, полоска, состояние)
@@ -11137,7 +11140,7 @@ local Env = use("core/env")
 local Life = use("shared/life")
 local Ui = use("core/ui")
 
-local BUILD = "v1"
+local BUILD = "v2"
 
 local BUTTON_PATH = { "HatchScreen", "Main", "Info", "HatchEgg" }
 local FILLED = 0.98          -- полоска заполнена (доля ширины кнопки)
@@ -11147,8 +11150,8 @@ local RETRY_AT = 1.2         -- полоска стоит на нуле стол
 local RETRY_LIMIT = 2        -- не больше стольких повторов на одну карточку
 local GONE_QUIET = 1.5       -- карточка пропала на столько — считаем, что будет следующая
 local MIN_GAP = 3            -- после заполнения столько секунд вообще не жмём
-local FALLBACK_GAP = 8       -- страховка: следующее зажатие не раньше, чем через столько секунд
-local FALLBACK_ZERO = 3      -- и только если полоска всё это время на нуле
+local FALLBACK_GAP = 3       -- страховка: следующее зажатие не раньше, чем через столько секунд
+local FALLBACK_ZERO = 1      -- и только если полоска всё это время на нуле
 local BLIND_HOLD = 2.5       -- если полоску прочитать нельзя — держим столько и отпускаем
 
 local tab = Ui.Tabs.Pets
@@ -11499,6 +11502,15 @@ Life.loop("holdreveal:watch", POLL, function()
         end
     end
 
+    -- Страховка от того самого флуда: если полоска уже полная, второе зажатие не нужно —
+    -- эта карточка уже заполнена, ждём следующую (игра держит её на экране с полной полоской).
+    local filledNow = progressOf(button)
+    if filledNow and filledNow >= FILLED then
+        state.armed = false
+        state.filledAt = state.filledAt ~= 0 and state.filledAt or now
+        setStatus("полоска уже заполнена — жду следующую")
+        return
+    end
     setStatus("держу кнопку")
     local result, seconds, ratio = holdOnce(button)
     state.armed = false
