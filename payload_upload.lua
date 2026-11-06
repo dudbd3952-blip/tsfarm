@@ -4,8 +4,6 @@
 -- Изменено: панель, логи в консоль и на сервер, разгрузка рюкзака, автоудалёнт 50%, вебхук.
 -- Slopix Hub (Tap Simulator), built 2026-10-30 14:22 UTC by build.py. Edit the files in src/, not this one.
 local __modules, __cache, __loading = {}, {}, {}
--- Без интерфейса: панель не создаётся вообще. Всё остальное работает как обычно.
-local __NO_GUI = true
 local function use(name)
     local cached = __cache[name]
     if cached ~= nil then
@@ -9834,32 +9832,62 @@ local CONFIRM_PATH = { "Trading", "Trading", "Review", "Confirm", "Button" }
 -- ---------------------------------------------------------------------------------------------
 -- «Hold to Reveal»: карточка после выпадения секрета
 -- ---------------------------------------------------------------------------------------------
--- После секрета игра показывает карточку «Hold to Reveal!» и ждёт, пока игрок зажмёт кнопку.
--- Пока карточка на экране, окно запроса на трейд под ней не видно и не нажимается, поэтому
--- её надо закрывать самим и как можно быстрее. Ищем надпись, а не путь: имя узла неизвестно.
+-- После секрета игра показывает карточку «Hold to Reveal!» и ждёт, пока игрок зажмёт кнопку:
+-- держать надо до тех пор, пока карточка не исчезнет (бывает и 10 секунд). Пока она висит,
+-- окно запроса на трейд под ней не видно и не нажимается. Имя узла неизвестно, поэтому ищем
+-- по тексту, а если текста нет (картинка) — по имени узла.
 
-local REVEAL_WORDS = { "hold to reveal", "hold to open", "зажми", "удерживай" }
-local REVEAL_HOLD = 1.2 -- сколько держим кнопку, секунды
+local REVEAL_WORDS = { "hold to reveal", "hold to open", "hold to unlock", "зажми", "удерживай" }
+local REVEAL_NAMES = { "reveal", "hold", "hatchcard" }
+local REVEAL_MAX_HOLD = 12 -- сколько максимум держим кнопку, секунды
 
 local revealLabel = nil
 local revealBusy = false
 
 local function isShown(node)
     local ok, shown = pcall(function()
+        -- у ScreenGui решает Enabled: Visible на нём игра иногда держит false, хотя экран виден
         if node:IsA("ScreenGui") then
-            return node.Enabled and node.Visible ~= false
+            return node.Enabled == true
         end
         return node.Visible ~= false
     end)
     return ok and shown == true
 end
 
-local function labelMatches(text)
+local function normText(text)
     if type(text) ~= "string" or text == "" then
+        return ""
+    end
+    local ok, low = pcall(function()
+        return (string.lower(text):gsub("%s+", " "))
+    end)
+    return ok and low or ""
+end
+
+local function labelMatches(text)
+    local low = normText(text)
+    if low == "" then
         return false
     end
-    local low = string.lower(text)
     for _, word in ipairs(REVEAL_WORDS) do
+        if string.find(low, word, 1, true) then
+            return true
+        end
+    end
+    -- «Hold to\nReveal!» и прочие переносы строк
+    return string.find(low, "hold", 1, true) ~= nil and string.find(low, "reveal", 1, true) ~= nil
+end
+
+local function nameMatches(node)
+    local ok, name = pcall(function()
+        return node.Name
+    end)
+    if not ok or type(name) ~= "string" then
+        return false
+    end
+    local low = string.lower(name)
+    for _, word in ipairs(REVEAL_NAMES) do
         if string.find(low, word, 1, true) then
             return true
         end
@@ -9874,30 +9902,43 @@ local function textOf(node)
     return ok and text or nil
 end
 
-local function findRevealLabel()
-    if revealLabel and revealLabel.Parent and labelMatches(textOf(revealLabel)) and isShown(revealLabel) then
-        return revealLabel
-    end
-    revealLabel = nil
+local function roots()
+    local list = {}
     local gui = playerGui()
-    if not gui then
-        return nil
+    if gui then
+        list[#list + 1] = gui
     end
+    pcall(function()
+        local core = game:GetService("CoreGui")
+        if core then
+            list[#list + 1] = core
+        end
+    end)
+    return list
+end
+
+-- Обход всех включённых экранов: сначала ищем надпись, потом (если надписи нет) кнопку по имени.
+local function searchReveal(byName)
     local queue, head, seen = {}, 1, 0
-    for _, child in ipairs(gui:GetChildren()) do
-        if child:IsA("ScreenGui") and isShown(child) then
-            queue[#queue + 1] = child
+    for _, root in ipairs(roots()) do
+        for _, child in ipairs(root:GetChildren()) do
+            if child:IsA("ScreenGui") and isShown(child) then
+                queue[#queue + 1] = child
+            end
         end
     end
-    while head <= #queue and seen < 8000 do
+    while head <= #queue and seen < 12000 do
         local node = queue[head]
         head += 1
         seen += 1
-        if labelMatches(textOf(node)) then
-            revealLabel = node
-            return node
-        end
         if not node:IsA("GuiObject") or isShown(node) then
+            if byName then
+                if node:IsA("GuiButton") and nameMatches(node) then
+                    return node
+                end
+            elseif labelMatches(textOf(node)) then
+                return node
+            end
             for _, child in ipairs(node:GetChildren()) do
                 if child:IsA("GuiObject") then
                     queue[#queue + 1] = child
@@ -9906,6 +9947,20 @@ local function findRevealLabel()
         end
     end
     return nil
+end
+
+local function findRevealLabel()
+    if revealLabel and revealLabel.Parent and isShown(revealLabel) then
+        return revealLabel
+    end
+    revealLabel = nil
+    local node = searchReveal(false) or searchReveal(true)
+    revealLabel = node
+    return node
+end
+
+local function revealOnScreen()
+    return revealLabel ~= nil and revealLabel.Parent ~= nil
 end
 
 -- Чем зажимать: ближайшая кнопка-родитель надписи, иначе кнопка рядом, иначе сама надпись.
@@ -9932,6 +9987,9 @@ local function revealTarget(label)
                 return child, "кнопка рядом"
             end
         end
+    end
+    if label:IsA("GuiButton") then
+        return label, "сама кнопка"
     end
     return label, "сама надпись"
 end
@@ -9963,9 +10021,9 @@ local function fireConnections(button, signalName)
     return fired
 end
 
--- Зажимаем двумя способами сразу: обработчики кнопки (MouseButton1Down/Up) и настоящее
--- нажатие мышью через VirtualInputManager — у «держи» бывает и тот, и другой вариант.
-local function holdTarget(target, seconds)
+-- Держим до исчезновения карточки (и обработчиками кнопки, и настоящей мышью), максимум
+-- REVEAL_MAX_HOLD секунд, потом отпускаем.
+local function holdUntilGone(target)
     Env.elevate()
     local handlers = fireConnections(target, "MouseButton1Down")
     local vim, x, y = nil, 0, 0
@@ -9980,9 +10038,14 @@ local function holdTarget(target, seconds)
         end)
     end
     if handlers == 0 and not vim then
-        return false
+        return false, false
     end
-    Life.wait(seconds)
+    local deadline = os.clock() + REVEAL_MAX_HOLD
+    local gone = not revealOnScreen()
+    while not gone and os.clock() < deadline do
+        Life.wait(0.25)
+        gone = not revealOnScreen()
+    end
     if vim then
         pcall(function()
             vim:SendMouseButtonEvent(x, y, 0, false, game, 1)
@@ -9990,7 +10053,7 @@ local function holdTarget(target, seconds)
     end
     fireConnections(target, "MouseButton1Up")
     Env.elevate()
-    return true
+    return true, gone
 end
 
 local function clearReveal(why)
@@ -9998,30 +10061,79 @@ local function clearReveal(why)
         return false
     end
     revealBusy = true
-    local held = 0
+    local held, gone = 0, false
     for _ = 1, 3 do
         local label = findRevealLabel()
         if not label then
             break
         end
         local target, kind = revealTarget(label)
-        log("reveal: зажимаю %s (%s), повод: %s", kind, tostring(target:GetFullName()), tostring(why))
-        if not holdTarget(target, REVEAL_HOLD) then
+        log("reveal: держу %s (%s), повод: %s", kind, tostring(target:GetFullName()), tostring(why))
+        local ok, finished = holdUntilGone(target)
+        if not ok then
+            log("reveal: нечем нажать — у кнопки нет ни обработчиков, ни VirtualInputManager")
             break
         end
         held += 1
-        Life.wait(0.7)
+        gone = finished
+        if finished then
+            break
+        end
+        Life.wait(0.5)
     end
     revealBusy = false
     if held > 0 then
-        log("reveal: карточка закрыта (подходов %d)", held)
+        log("reveal: отпустил (подходов %d, карточка %s)", held, gone and "ушла" or "ещё на экране")
     end
     return held > 0
+end
+
+-- Ручная проверка: напечатать все надписи на экране с их путями. Нужна, если автомат не находит
+-- карточку: запускается в консоли  getgenv().handoverDumpText()
+local function dumpText()
+    local total, screens = 0, 0
+    local queue, head = {}, 1
+    for _, root in ipairs(roots()) do
+        for _, child in ipairs(root:GetChildren()) do
+            if child:IsA("ScreenGui") then
+                screens += 1
+                print(string.format("[handover] экран %s | Enabled=%s", child:GetFullName(), tostring(child.Enabled)))
+                if isShown(child) then
+                    queue[#queue + 1] = child
+                end
+            end
+        end
+    end
+    while head <= #queue and total < 400 do
+        local node = queue[head]
+        head += 1
+        local okText, text = pcall(function()
+            return node.Text
+        end)
+        if okText and type(text) == "string" and text ~= "" then
+            total += 1
+            print(string.format("[handover] текст %s | \"%s\"", node:GetFullName(), text))
+        end
+        for _, child in ipairs(node:GetChildren()) do
+            if child:IsA("GuiObject") then
+                queue[#queue + 1] = child
+            end
+        end
+    end
+    print(string.format("[handover] экранов %d, надписей %d", screens, total))
+end
+
+if type(Env.genv) == "table" then
+    Env.genv.handoverDumpText = dumpText
+    Env.genv.handoverClearReveal = function()
+        return clearReveal("вручную")
+    end
 end
 
 Life.loop("handover:reveal", 1.5, function()
     clearReveal("проверка")
 end)
+log("сторож «Hold to Reveal» запущен (проверка каждые 1.5 с)")
 
 -- ---------------------------------------------------------------------------------------------
 -- pets
@@ -10664,7 +10776,6 @@ setStatus("ждём запрос от банка")
 log("модуль готов: включён=%s, жду трейд от %s", tostring(moduleEnabled()), tostring(BANK_NAMES[1]))
 return {}
 end
-
 
 __modules["main"] = function(use) -- src/games/tapsim/main.luau
 -- Entry point. Core first, then features in tab order, then settings (autoload last).
@@ -13370,9 +13481,6 @@ Instance.Parent = PlayerGui
 end
 end
 local function ParentUI(UI: Instance, SkipHiddenUI: boolean?)
-if __NO_GUI then
-return
-end
 if SkipHiddenUI then
 SafeParentUI(UI, CoreGui)
 return
@@ -25000,7 +25108,8 @@ do
 	local PING_ID = "1526170419038519377"
 	local POWER_THRESHOLD = 10000000 -- как в трейд-посте: секреты и всё, что выше 10M Power
 	local NOTIFY_POWER_PETS = true
-	local FULLSCREEN = true -- true = панель на весь экран, чёрная и непрозрачная
+	local FULLSCREEN = false -- false = маленькая плашка в углу; полноэкранная чёрная панель
+-- перекрывала весь экран и, главное, съедала нажатия мыши (у Frame был Active = true)
 	local HATCH_DELETE_ABOVE = 50 -- % : удаляем при вылупе только самое частое (>=50%), остальное идёт в крафт
 	local CRAFT_MIN_CHANCE = 50 -- % : в машины попадают только петы с шансом выпадения не ниже этого
 
@@ -26216,17 +26325,23 @@ do
 	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 	local parentGui = (Env.guiParent and Env.guiParent()) or game:GetService("CoreGui")
 	gui.Parent = parentGui
+	gui.Enabled = false -- панель скрыта; RightShift показывает/прячет
 
 	local main = Instance.new("Frame")
 	main.Name = "Main"
 	main.AnchorPoint = FULLSCREEN and Vector2.new(0, 0) or Vector2.new(0.5, 0.5)
 	main.Position = FULLSCREEN and UDim2.fromOffset(0, 0) or UDim2.fromScale(0.5, 0.5)
-	main.Size = FULLSCREEN and UDim2.fromScale(1, 1) or UDim2.fromOffset(340, 0)
+	main.Size = FULLSCREEN and UDim2.fromScale(1, 1) or UDim2.fromOffset(300, 0)
+	if not FULLSCREEN then
+		-- в угол, чтобы не лежать поверх карточек игры
+		main.AnchorPoint = Vector2.new(0, 0)
+		main.Position = UDim2.fromOffset(8, 8)
+	end
 	main.AutomaticSize = FULLSCREEN and Enum.AutomaticSize.None or Enum.AutomaticSize.Y
 	main.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
 	main.BackgroundTransparency = FULLSCREEN and 0 or 0.15
 	main.BorderSizePixel = 0
-	main.Active = true
+	main.Active = false -- не перехватывать мышь: иначе панель ест нажатия по игре
 	main.Parent = gui
 
 	local pad = Instance.new("UIPadding")
@@ -26386,59 +26501,5 @@ do
 		storageRow.TextColor3 = (limit and petCount / limit > 0.9) and Color3.fromRGB(235, 130, 100)
 			or Color3.fromRGB(240, 240, 245)
 	end)
-end
--- ===== отчёт без панели: что включено и что фармится =====
-do
-	local okUi, UiX = pcall(use, "core/ui")
-	if okUi and type(UiX) == "table" and UiX.Library then
-		task.delay(20, function()
-			local toggles = UiX.Library.Toggles or {}
-			local on, off = {}, {}
-			for name, toggle in pairs(toggles) do
-				local okv, value = pcall(function()
-					return toggle.Value
-				end)
-				if okv and value == true then
-					on[#on + 1] = tostring(name)
-				else
-					off[#off + 1] = tostring(name)
-				end
-			end
-			table.sort(on)
-			table.sort(off)
-			print(string.format("[TAPSIM] без панели | включено %d из %d", #on, #on + #off))
-			local line = {}
-			for index = 1, #on do
-				line[#line + 1] = on[index]
-				if #line == 6 or index == #on then
-					print("[TAPSIM]   вкл: " .. table.concat(line, ", "))
-					line = {}
-				end
-			end
-			if #off > 0 then
-				local tail = {}
-				for index = 1, #off do
-					tail[#tail + 1] = off[index]
-					if #tail == 8 or index == #off then
-						print("[TAPSIM]   выкл: " .. table.concat(tail, ", "))
-						tail = {}
-					end
-				end
-			end
-		end)
-		local okLife, Life = pcall(use, "shared/life")
-		if okLife and type(Life) == "table" and Life.loop then
-			Life.loop("console:farm", 180, function()
-				local player = game:GetService("Players").LocalPlayer
-				if not player then
-					return
-				end
-				print(string.format("[TAPSIM] фарм | остров=%s яйцо=%s открыто яиц=%s",
-					tostring(player:GetAttribute("CurrentIsland")),
-					tostring(player:GetAttribute("TAPSIM_Egg")),
-					tostring(player:GetAttribute("TS2EggsOpened"))))
-			end)
-		end
-	end
 end
 return Hub
