@@ -24526,17 +24526,13 @@ do
 					changed += 1
 				end
 				PRICES[key] = number
-				-- выгода яиц считается по SECRET_TOKENS: подтягиваем и её
-				if SECRET_TOKENS[name] ~= nil and SECRET_TOKENS[name] ~= number then
-					SECRET_TOKENS[name] = number
-				end
 			end
 		end
 		logEvent("prices", string.format("живые цены с demand.gg: %d петов (новых %d, изменилось %d)",
 			fresh, added, changed))
 		return true
 	end
-	syncPrices()
+	pcall(syncPrices)
 	Life.loop("prices:sync", 6 * 3600, function()
 		pcall(syncPrices)
 	end)
@@ -25221,7 +25217,7 @@ do
 		))
 	end)
 
-	print("[TAPSIM] сборка | чистка-11 (06.11): Godly в счёте; экипировка каждые 2 мин")
+	print("[TAPSIM] сборка | чистка-12 (06.11): починка живых цен; экипировка каждые 2 мин")
 	print(string.format("[TAPSIM] старт | аккаунт %s | панель и логи включены",
 		Env.LocalPlayer and Env.LocalPlayer.Name or "?"))
 
