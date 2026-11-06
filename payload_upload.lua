@@ -9728,13 +9728,6 @@ local box = tab:AddGroupbox({ Side = "Right", Name = "Handover", IconName = "pac
 box:AddToggle("Handover", {
     Text = "Отдавать секретов и Godly банку",
     Default = true,
-    Callback = function(state)
-        -- the switch keeps its own flag: the hub window is torn down by this build,
-        -- and a toggle that no longer exists must not silently switch the module off
-        if Env.genv then
-            Env.genv.__handoverEnabled = state
-        end
-    end,
     Tooltip = "Ждёт трейд от банка: пауза фарма, снятие петов с команды, приём, оффер, READY и CONFIRM. После сделки возвращает лучших петов и продолжает фарм.",
 })
 local statusLabel = box:AddLabel("Handover: ждём запрос от банка", true)
@@ -9828,312 +9821,6 @@ local ACCEPT_PATH = { "Tabs", "TradeQuest", "Menu", "Accept", "Button" }
 local DECLINE_PATH = { "Tabs", "TradeQuest", "Menu", "Decline", "Button" }
 local READY_PATH = { "Trading", "Trading", "Build", "Actions", "Ready", "Button" }
 local CONFIRM_PATH = { "Trading", "Trading", "Review", "Confirm", "Button" }
-
--- ---------------------------------------------------------------------------------------------
--- «Hold to Reveal»: карточка после выпадения секрета
--- ---------------------------------------------------------------------------------------------
--- После секрета игра показывает карточку «Hold to Reveal!» и ждёт, пока игрок зажмёт кнопку:
--- держать надо до тех пор, пока карточка не исчезнет (бывает и 10 секунд). Пока она висит,
--- окно запроса на трейд под ней не видно и не нажимается. Имя узла неизвестно, поэтому ищем
--- по тексту, а если текста нет (картинка) — по имени узла.
-
-local REVEAL_WORDS = { "hold to reveal", "hold to open", "hold to unlock", "зажми", "удерживай" }
-local REVEAL_NAMES = { "reveal", "hold", "hatchcard" }
-local REVEAL_MAX_HOLD = 12 -- сколько максимум держим кнопку, секунды
-
-local revealLabel = nil
-local revealBusy = false
-
-local function isShown(node)
-    local ok, shown = pcall(function()
-        -- у ScreenGui решает Enabled: Visible на нём игра иногда держит false, хотя экран виден
-        if node:IsA("ScreenGui") then
-            return node.Enabled == true
-        end
-        return node.Visible ~= false
-    end)
-    return ok and shown == true
-end
-
-local function normText(text)
-    if type(text) ~= "string" or text == "" then
-        return ""
-    end
-    local ok, low = pcall(function()
-        return (string.lower(text):gsub("%s+", " "))
-    end)
-    return ok and low or ""
-end
-
-local function labelMatches(text)
-    local low = normText(text)
-    if low == "" then
-        return false
-    end
-    for _, word in ipairs(REVEAL_WORDS) do
-        if string.find(low, word, 1, true) then
-            return true
-        end
-    end
-    -- «Hold to\nReveal!» и прочие переносы строк
-    return string.find(low, "hold", 1, true) ~= nil and string.find(low, "reveal", 1, true) ~= nil
-end
-
-local function nameMatches(node)
-    local ok, name = pcall(function()
-        return node.Name
-    end)
-    if not ok or type(name) ~= "string" then
-        return false
-    end
-    local low = string.lower(name)
-    for _, word in ipairs(REVEAL_NAMES) do
-        if string.find(low, word, 1, true) then
-            return true
-        end
-    end
-    return false
-end
-
-local function textOf(node)
-    local ok, text = pcall(function()
-        return node.Text
-    end)
-    return ok and text or nil
-end
-
-local function roots()
-    local list = {}
-    local gui = playerGui()
-    if gui then
-        list[#list + 1] = gui
-    end
-    pcall(function()
-        local core = game:GetService("CoreGui")
-        if core then
-            list[#list + 1] = core
-        end
-    end)
-    return list
-end
-
--- Обход всех включённых экранов: сначала ищем надпись, потом (если надписи нет) кнопку по имени.
-local function searchReveal(byName)
-    local queue, head, seen = {}, 1, 0
-    for _, root in ipairs(roots()) do
-        for _, child in ipairs(root:GetChildren()) do
-            if child:IsA("ScreenGui") and isShown(child) then
-                queue[#queue + 1] = child
-            end
-        end
-    end
-    while head <= #queue and seen < 12000 do
-        local node = queue[head]
-        head += 1
-        seen += 1
-        if not node:IsA("GuiObject") or isShown(node) then
-            if byName then
-                if node:IsA("GuiButton") and nameMatches(node) then
-                    return node
-                end
-            elseif labelMatches(textOf(node)) then
-                return node
-            end
-            for _, child in ipairs(node:GetChildren()) do
-                if child:IsA("GuiObject") then
-                    queue[#queue + 1] = child
-                end
-            end
-        end
-    end
-    return nil
-end
-
-local function findRevealLabel()
-    if revealLabel and revealLabel.Parent and isShown(revealLabel) then
-        return revealLabel
-    end
-    revealLabel = nil
-    local node = searchReveal(false) or searchReveal(true)
-    revealLabel = node
-    return node
-end
-
-local function revealOnScreen()
-    return revealLabel ~= nil and revealLabel.Parent ~= nil
-end
-
--- Чем зажимать: ближайшая кнопка-родитель надписи, иначе кнопка рядом, иначе сама надпись.
-local function revealTarget(label)
-    local node = label
-    for _ = 1, 6 do
-        local parent = node.Parent
-        if not parent or parent:IsA("ScreenGui") or parent:IsA("PlayerGui") then
-            break
-        end
-        node = parent
-        if node:IsA("GuiButton") then
-            return node, "кнопка над надписью"
-        end
-    end
-    node = label
-    for _ = 1, 3 do
-        node = node.Parent
-        if not node or node:IsA("ScreenGui") then
-            break
-        end
-        for _, child in ipairs(node:GetDescendants()) do
-            if child:IsA("GuiButton") and isShown(child) then
-                return child, "кнопка рядом"
-            end
-        end
-    end
-    if label:IsA("GuiButton") then
-        return label, "сама кнопка"
-    end
-    return label, "сама надпись"
-end
-
-local function fireConnections(button, signalName)
-    local getconnections = (Env.genv or {}).getconnections
-    if type(getconnections) ~= "function" then
-        return 0
-    end
-    local okSignal, signal = pcall(function()
-        return button[signalName]
-    end)
-    if not okSignal or not signal then
-        return 0
-    end
-    local okList, list = pcall(getconnections, signal)
-    if not okList or type(list) ~= "table" then
-        return 0
-    end
-    local fired = 0
-    for _, connection in ipairs(list) do
-        local hasFire = pcall(function()
-            return connection.Fire
-        end)
-        if connection.Enabled ~= false and hasFire and pcall(connection.Fire) then
-            fired += 1
-        end
-    end
-    return fired
-end
-
--- Держим до исчезновения карточки (и обработчиками кнопки, и настоящей мышью), максимум
--- REVEAL_MAX_HOLD секунд, потом отпускаем.
-local function holdUntilGone(target)
-    Env.elevate()
-    local handlers = fireConnections(target, "MouseButton1Down")
-    local vim, x, y = nil, 0, 0
-    pcall(function()
-        local pos = target.AbsolutePosition + target.AbsoluteSize * 0.5
-        x, y = math.floor(pos.X), math.floor(pos.Y)
-        vim = game:GetService("VirtualInputManager")
-    end)
-    if vim then
-        pcall(function()
-            vim:SendMouseButtonEvent(x, y, 0, true, game, 1)
-        end)
-    end
-    if handlers == 0 and not vim then
-        return false, false
-    end
-    local deadline = os.clock() + REVEAL_MAX_HOLD
-    local gone = not revealOnScreen()
-    while not gone and os.clock() < deadline do
-        Life.wait(0.25)
-        gone = not revealOnScreen()
-    end
-    if vim then
-        pcall(function()
-            vim:SendMouseButtonEvent(x, y, 0, false, game, 1)
-        end)
-    end
-    fireConnections(target, "MouseButton1Up")
-    Env.elevate()
-    return true, gone
-end
-
-local function clearReveal(why)
-    if revealBusy then
-        return false
-    end
-    revealBusy = true
-    local held, gone = 0, false
-    for _ = 1, 3 do
-        local label = findRevealLabel()
-        if not label then
-            break
-        end
-        local target, kind = revealTarget(label)
-        log("reveal: держу %s (%s), повод: %s", kind, tostring(target:GetFullName()), tostring(why))
-        local ok, finished = holdUntilGone(target)
-        if not ok then
-            log("reveal: нечем нажать — у кнопки нет ни обработчиков, ни VirtualInputManager")
-            break
-        end
-        held += 1
-        gone = finished
-        if finished then
-            break
-        end
-        Life.wait(0.5)
-    end
-    revealBusy = false
-    if held > 0 then
-        log("reveal: отпустил (подходов %d, карточка %s)", held, gone and "ушла" or "ещё на экране")
-    end
-    return held > 0
-end
-
--- Ручная проверка: напечатать все надписи на экране с их путями. Нужна, если автомат не находит
--- карточку: запускается в консоли  getgenv().handoverDumpText()
-local function dumpText()
-    local total, screens = 0, 0
-    local queue, head = {}, 1
-    for _, root in ipairs(roots()) do
-        for _, child in ipairs(root:GetChildren()) do
-            if child:IsA("ScreenGui") then
-                screens += 1
-                print(string.format("[handover] экран %s | Enabled=%s", child:GetFullName(), tostring(child.Enabled)))
-                if isShown(child) then
-                    queue[#queue + 1] = child
-                end
-            end
-        end
-    end
-    while head <= #queue and total < 400 do
-        local node = queue[head]
-        head += 1
-        local okText, text = pcall(function()
-            return node.Text
-        end)
-        if okText and type(text) == "string" and text ~= "" then
-            total += 1
-            print(string.format("[handover] текст %s | \"%s\"", node:GetFullName(), text))
-        end
-        for _, child in ipairs(node:GetChildren()) do
-            if child:IsA("GuiObject") then
-                queue[#queue + 1] = child
-            end
-        end
-    end
-    print(string.format("[handover] экранов %d, надписей %d", screens, total))
-end
-
-if type(Env.genv) == "table" then
-    Env.genv.handoverDumpText = dumpText
-    Env.genv.handoverClearReveal = function()
-        return clearReveal("вручную")
-    end
-end
-
-Life.loop("handover:reveal", 1.5, function()
-    clearReveal("проверка")
-end)
-log("сторож «Hold to Reveal» запущен (проверка каждые 1.5 с)")
 
 -- ---------------------------------------------------------------------------------------------
 -- pets
@@ -10530,26 +10217,13 @@ end
 -- the whole handover
 -- ---------------------------------------------------------------------------------------------
 
--- Отдельный флаг, а не тумблер панели: в этой сборке окно хаба гасится
--- (killHubGui), и пропавший тумблер раньше молча выключал весь модуль.
-if type(Env.genv) == "table" and Env.genv.__handoverEnabled == nil then
-    Env.genv.__handoverEnabled = true
-end
-
-local function moduleEnabled()
-    if type(Env.genv) == "table" and Env.genv.__handoverEnabled == false then
-        return false
-    end
-    return true
-end
-
 local function runHandover(name, fromId)
     if state.busy then
         log("уже в сделке — пропускаю")
         return
     end
-    if not moduleEnabled() then
-        log("handover выключен — трейд не отвечаю (getgenv().__handoverEnabled = true)")
+    if not Ui.on("Handover") then
+        log("модуль выключен в панели — трейд не отвечаю")
         return
     end
     state.busy = true
@@ -10560,9 +10234,6 @@ local function runHandover(name, fromId)
         pauseFarm()
         log("запрос от %s (id=%s)", tostring(name), tostring(fromId))
 
-        -- карточка «Hold to Reveal» может висеть поверх окна запроса: убираем её до Accept
-        clearReveal("пришёл запрос")
-
         unequipValuables()
 
         local accept = resolvePath(ACCEPT_PATH)
@@ -10571,19 +10242,7 @@ local function runHandover(name, fromId)
         end
 
         local deadline = os.clock() + ACCEPT_WINDOW
-        local nextReveal, nextAccept, presses = 0, os.clock() + 2.5, 1
         while os.clock() < deadline and not state.started do
-            if os.clock() >= nextReveal then
-                nextReveal = os.clock() + 1
-                clearReveal("ждём открытия сессии")
-            end
-            if os.clock() >= nextAccept and presses < 5 and not state.started then
-                nextAccept = os.clock() + 2.5
-                local button = resolvePath(ACCEPT_PATH)
-                if button then
-                    presses += pressConnection(button, "ACCEPT ещё раз")
-                end
-            end
             task.wait(0.2)
         end
         if not state.started then
@@ -10625,33 +10284,9 @@ Life.connect(tradeUpdate.OnClientEvent, function(payload)
     end
     local kind = tostring(payload.Type)
     local mine = payload.UserId == Env.LocalPlayer.UserId
-    if kind ~= "Offer" then
-        -- тихая телеметрия: по ней видно, дошёл ли трейд до фермы вообще
-        log("TradeUpdate: %s", kind)
-    end
 
     if kind == "Request" then
         local name, fromId = payload.FromName, tonumber(payload.FromUserId)
-        if not fromId and type(name) == "string" and name ~= "" then
-            pcall(function()
-                local found = Env.Players and Env.Players:FindFirstChild(name)
-                if found then
-                    fromId = found.UserId
-                end
-            end)
-        end
-        if not name and fromId then
-            pcall(function()
-                local found = Env.Players and Env.Players:GetPlayerByUserId(fromId)
-                if found then
-                    name = found.Name
-                end
-            end)
-        end
-        if not name and not fromId then
-            log("пришёл Request без отправителя — не трогаю")
-            return
-        end
         if not senderAllowed(name, fromId) then
             log("запрос от %s — это не банк, отказ", tostring(name))
             local decline = resolvePath(DECLINE_PATH)
@@ -10702,57 +10337,39 @@ end, "handover:trade")
 
 -- Safety net for a request that arrived before this module was loaded, or while the hub was
 -- busy: the request window stays on screen until it is answered.
--- Окно Tabs.TradeQuest висит постоянно и видимо всегда, поэтому смотреть надо
--- не на него, а на надпись с именем отправителя: она появляется только тогда,
--- когда запрос реально пришёл.
-local function requestSender()
+local function requestWindowOpen()
     local gui = playerGui()
     local tabs = gui and gui:FindFirstChild("Tabs")
     local quest = tabs and tabs:FindFirstChild("TradeQuest")
     if not quest then
-        return nil
+        return false
     end
+    local visible = true
+    pcall(function()
+        visible = quest.Visible
+    end)
+    return visible == true
+end
+
+function checkPanelNowResponse()
+    if state.busy or not requestWindowOpen() then
+        setStatus("окна запроса нет")
+        return
+    end
+    local quest = playerGui():FindFirstChild("Tabs"):FindFirstChild("TradeQuest")
     local sent = quest:FindFirstChild("PlayerSent")
     local text = ""
     pcall(function()
         text = tostring(sent and sent.Text or "")
     end)
-    text = text:gsub("\n", " ")
-    if text == "" then
-        return nil
-    end
-    local lowered = string.lower(text)
-    if not string.find(lowered, "sent", 1, true)
-        and not string.find(lowered, "запрос", 1, true) then
-        return nil
-    end
-    return string.match(text, "^(%S+)"), text
-end
-
-local lastPanelNote = ""
-
-function checkPanelNowResponse()
-    if state.busy then
-        return
-    end
-    local name, text = requestSender()
-    if not name then
-        if lastPanelNote ~= "none" then
-            lastPanelNote = "none"
-            setStatus("ждём запрос от банка")
-        end
-        return
-    end
-    if lastPanelNote ~= text then
-        lastPanelNote = text
-        log("на экране запрос: %s", text)
-    end
-    if senderAllowed(name, nil) then
+    log("окно запроса на экране: %s", text)
+    local name = string.match(text, "^(%S+)")
+    if name and senderAllowed(name, nil) then
         task.spawn(function()
             runHandover(name, nil)
         end)
     else
-        setStatus("запрос не от банка: " .. name)
+        setStatus("запрос не от банка")
     end
 end
 
@@ -10760,20 +10377,16 @@ Life.loop("handover:poll", POLL_SECONDS, function()
     if state.busy then
         return
     end
-    -- страховка на случай, если событие TradeUpdate не дошло: смотрим надпись с ником
-    if state.pending and os.clock() - state.pendingAt > 8 then
-        local pending = state.pending
+    -- the request window stays on screen until it is answered, so this catches a request
+    -- that arrived before the module was loaded or while the hub was busy
+    if requestWindowOpen() then
+        checkPanelNowResponse()
+    elseif state.pending then
         state.pending = nil
-        task.spawn(function()
-            runHandover(pending.name, pending.id)
-        end)
-        return
     end
-    checkPanelNowResponse()
 end)
 
 setStatus("ждём запрос от банка")
-log("модуль готов: включён=%s, жду трейд от %s", tostring(moduleEnabled()), tostring(BANK_NAMES[1]))
 return {}
 end
 
@@ -25108,8 +24721,7 @@ do
 	local PING_ID = "1526170419038519377"
 	local POWER_THRESHOLD = 10000000 -- как в трейд-посте: секреты и всё, что выше 10M Power
 	local NOTIFY_POWER_PETS = true
-	local FULLSCREEN = false -- false = маленькая плашка в углу; полноэкранная чёрная панель
--- перекрывала весь экран и, главное, съедала нажатия мыши (у Frame был Active = true)
+	local FULLSCREEN = true -- true = панель на весь экран, чёрная и непрозрачная
 	local HATCH_DELETE_ABOVE = 50 -- % : удаляем при вылупе только самое частое (>=50%), остальное идёт в крафт
 	local CRAFT_MIN_CHANCE = 50 -- % : в машины попадают только петы с шансом выпадения не ниже этого
 
@@ -26325,23 +25937,17 @@ do
 	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 	local parentGui = (Env.guiParent and Env.guiParent()) or game:GetService("CoreGui")
 	gui.Parent = parentGui
-	gui.Enabled = false -- панель скрыта; RightShift показывает/прячет
 
 	local main = Instance.new("Frame")
 	main.Name = "Main"
 	main.AnchorPoint = FULLSCREEN and Vector2.new(0, 0) or Vector2.new(0.5, 0.5)
 	main.Position = FULLSCREEN and UDim2.fromOffset(0, 0) or UDim2.fromScale(0.5, 0.5)
-	main.Size = FULLSCREEN and UDim2.fromScale(1, 1) or UDim2.fromOffset(300, 0)
-	if not FULLSCREEN then
-		-- в угол, чтобы не лежать поверх карточек игры
-		main.AnchorPoint = Vector2.new(0, 0)
-		main.Position = UDim2.fromOffset(8, 8)
-	end
+	main.Size = FULLSCREEN and UDim2.fromScale(1, 1) or UDim2.fromOffset(340, 0)
 	main.AutomaticSize = FULLSCREEN and Enum.AutomaticSize.None or Enum.AutomaticSize.Y
 	main.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
 	main.BackgroundTransparency = FULLSCREEN and 0 or 0.15
 	main.BorderSizePixel = 0
-	main.Active = false -- не перехватывать мышь: иначе панель ест нажатия по игре
+	main.Active = true
 	main.Parent = gui
 
 	local pad = Instance.new("UIPadding")
