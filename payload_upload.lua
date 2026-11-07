@@ -9744,7 +9744,7 @@ local Env = use("core/env")
 local Life = use("shared/life")
 local Ui = use("core/ui")
 
-local BUILD = "v16"
+local BUILD = "v17"
 
 local BANK_NAMES = { "Riglafsma" }
 local BANK_IDS = { 11747325739 }
@@ -10459,36 +10459,98 @@ local function acceptTrade(name)
             stage = "ждём следующий трейд"
             return
         end
-        press(accept, "ACCEPT")
-
-        -- Признак открытой сессии — только событие сервера. По GUI судить нельзя.
-        local startedAt = os.clock()
-        local nextPress = os.clock() + 2.5
-        local presses = 1
-        while os.clock() - startedAt < ACCEPT_TIMEOUT do
-            if startedEvent then
-                break
+        -- Принять сделку: способы ЧЕРЕДУЮТСЯ и каждый проверяется по Started.
+        -- 22:14 (v16): обработчики жать жались (2), а Started за 25 с не пришёл — нажатие
+        -- проходило мимо. Поэтому теперь: обработчики -> настоящая мышь -> firesignal ->
+        -- родной запрос, и после КАЖДОЙ попытки ждём Started.
+        local function clickAccept(kind)
+            local buttonNow = findAcceptButton()
+            if not buttonNow then
+                return false
             end
-            if os.clock() >= nextPress and presses < 10 then
-                nextPress = os.clock() + 2.5
-                local again = findAcceptButton()
-                if again then
-                    presses += press(again, "ACCEPT ещё раз") or 0
+            if kind == "handlers" then
+                return (press(buttonNow, "ACCEPT (обработчики)") or 0) > 0
+            elseif kind == "mouse" then
+                local pos = buttonNow.AbsolutePosition + buttonNow.AbsoluteSize * 0.5
+                local x, y = math.floor(pos.X), math.floor(pos.Y)
+                local ok, err = pcall(function()
+                    local vim = game:GetService("VirtualInputManager")
+                    vim:SendMouseButtonEvent(x, y, 0, true, game, 1)
+                    task.wait(0.08)
+                    vim:SendMouseButtonEvent(x, y, 0, false, game, 1)
+                end)
+                log("ACCEPT (мышь %d,%d) — visible=%s active=%s", x, y,
+                    tostring(buttonNow.Visible), tostring(buttonNow.Active))
+                return ok and true or false
+            elseif kind == "signal" then
+                local genv2 = Env.genv or {}
+                local fired = 0
+                if type(genv2.firesignal) == "function" then
+                    for _, signalName in ipairs({ "Activated", "MouseButton1Click", "MouseButton1Down" }) do
+                        local okSignal, signal = pcall(function()
+                            return buttonNow[signalName]
+                        end)
+                        if okSignal and signal and pcall(genv2.firesignal, signal) then
+                            fired += 1
+                        end
+                    end
                 end
+                log("ACCEPT (firesignal %d)", fired)
+                return fired > 0
+            elseif kind == "remote" then
+                local sent = false
+                for _, payload in ipairs({ { Action = "Accept" }, { Action = "Accepted" },
+                    { Action = "Accept", Accepted = true } }) do
+                    if fireRemote("TradingService", "TradeRequested", payload) then
+                        sent = true
+                    end
+                end
+                log("ACCEPT (запрос TradeRequested Action=Accept) — %s", tostring(sent))
+                return sent
             end
-            task.wait(0.25)
+            return false
+        end
+
+        local methods = { "handlers", "mouse", "signal", "remote" }
+        local startedAt = os.clock()
+        local attempt = 0
+        local winner = nil
+        task.wait(0.25) -- панель запроса успевает собраться
+        while os.clock() - startedAt < ACCEPT_TIMEOUT and not startedEvent do
+            attempt += 1
+            local method = methods[((attempt - 1) % #methods) + 1]
+            clickAccept(method)
+            local untilAt = os.clock() + 1.2
+            while os.clock() < untilAt and not startedEvent do
+                task.wait(0.05)
+            end
+            if startedEvent then
+                winner = method
+                log("сделку принял способ: %s (попытка %d)", method, attempt)
+            end
         end
 
         if not startedEvent then
-            log("событие Started не пришло за %d с (Accept нажат %d раз). Петов не выкладываю — "
-                .. "без подтверждения сервера это была бы пустая сделка", ACCEPT_TIMEOUT, presses)
+            -- диагностика: почему не принялось
+            local buttonNow = findAcceptButton()
+            local tabGui = resolvePath({ "Tabs", "TradeQuest" })
+            log("диагностика Accept: узел=%s visible=%s active=%s живых_обработчиков=%d панель_TradeQuest=%s",
+                buttonNow and "есть" or "нет",
+                buttonNow and tostring(buttonNow.Visible) or "-",
+                buttonNow and tostring(buttonNow.Active) or "-",
+                liveConnections(buttonNow),
+                tabGui and tostring(isShown(tabGui)) or "нет")
+            log("диагностика: последняя стадия TradeUpdate = %s, sawReview=%s", tostring(lastStage),
+                tostring(sawReview))
+            log("событие Started не пришло за %d с (попыток нажать: %d). Петов не выкладываю — "
+                .. "без подтверждения сервера это была бы пустая сделка", ACCEPT_TIMEOUT, attempt)
             busy = false
             resumeFarm()
             stage = "ждём следующий трейд"
             return
         end
 
-        log("сессия открыта (Started)")
+        log("сессия открыта (Started) через способ %s", tostring(winner))
         task.wait(1.5)
         handover()
         -- фарм вернёт событие Completed/Cancelled, там же снимется busy
