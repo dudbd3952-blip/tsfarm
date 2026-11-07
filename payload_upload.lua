@@ -9744,7 +9744,7 @@ local Env = use("core/env")
 local Life = use("shared/life")
 local Ui = use("core/ui")
 
-local BUILD = "v17"
+local BUILD = "v18"
 
 local BANK_NAMES = { "Riglafsma" }
 local BANK_IDS = { 11747325739 }
@@ -25599,6 +25599,21 @@ do
 		end
 		print(string.format("[TAPSIM] %s | %s", kind, text))
 	end -- false = слать только секретов (если крафт спамит уведомлениями)
+
+	-- яйца/мин по окну ROLL_WINDOW: не зависит от логина, похода к стенду и чистки
+	local function windowRate()
+		local now = os.clock()
+		local cutoff = now - ROLL_WINDOW
+		local sum = 0
+		for _, item in ipairs(LOG.window) do
+			if item.at >= cutoff then
+				sum += item.rolls
+			end
+		end
+		local span = math.min(ROLL_WINDOW, math.max(1, now - LOG.started))
+		return sum * 60 / span
+	end
+
 	-- ========================================================================
 
 	-- 1) ФЕРМА ЯИЦ: включаем только то, что нужно яйцам, всё остальное глушим.
@@ -26883,20 +26898,6 @@ do
 	end)
 
 	-- 7.6) Логи в консоль: строка раз в минуту, плюс важные события сразу
-	-- яйца/мин по окну ROLL_WINDOW: не зависит от логина, похода к стенду и чистки
-	local function windowRate()
-		local now = os.clock()
-		local cutoff = now - ROLL_WINDOW
-		local sum = 0
-		for _, item in ipairs(LOG.window) do
-			if item.at >= cutoff then
-				sum += item.rolls
-			end
-		end
-		local span = math.min(ROLL_WINDOW, math.max(1, now - LOG.started))
-		return sum * 60 / span
-	end
-
 	local lastReport = { eggs = 0, pets = 0, at = os.clock() }
 	Life.loop("log:console", 60, function()
 		local data = Env.data()
