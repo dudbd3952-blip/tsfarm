@@ -5190,7 +5190,8 @@ Life.spawn("hatch:auto", function()
             end
         end
         applyAutoDelete(egg)
-        Ui.status = "Auto hatching " .. egg
+        -- в статусе видно, сколько яиц уходит в одном запросе: 3 (или 8 с пассом), 1 — если монет мало
+        Ui.status = string.format("Auto hatching %s x%d", egg, count)
         local result = hatch(egg, count)
         active = true
         if not result then
@@ -7175,7 +7176,8 @@ return {}
 end
 __modules["features/pets"] = function(use) -- src/games/tapsim/features/pets.luau
 -- Pets tab (right): keep your strongest pets equipped. The game ranks and swaps them for you with
--- PetActionRequested { Action = "EquipBest" }, so firing it as new pets hatch means the team is
+-- PetActionRequested { Action = "EquipBest", Mode = "Clicks"|"Luck"|"Gems" }, so firing it as new pets
+-- hatch means the team is kept full. Без поля Mode сервер запрос молча глотает, и команда стоит пустой.
 -- always your highest-power four without opening the inventory.
 
 local Env = use("core/env")
@@ -7185,8 +7187,24 @@ local Ui = use("core/ui")
 local tab = Ui.Tabs.Pets
 local box = tab:AddGroupbox({ Side = "Right", Name = "Auto equip", IconName = "star" })
 
-local function equipBest()
-    Env.fire("PetService", "PetActionRequested", { Action = "EquipBest" })
+-- Рабочий зов — с полем Mode. Без Mode сервер запрос молча глотает, и команда не набирается
+-- (сверено с открытым TapFarm: PetActionRequested:Fire({Action="EquipBest", Mode=…})).
+-- Режимы игры: Luck (удача при открытии яиц), Clicks (клики), Gems (гемы).
+local EQUIP_MODES = { "Luck", "Clicks", "Gems" }
+local EQUIP_MODE = EQUIP_MODES[1] -- по просьбе: команда набирается под удачу
+
+local function equipModeNow()
+    local options = Ui and Ui.Options or nil
+    local option = options and options.EquipMode or nil
+    local value = option and option.Value or nil
+    if type(value) == "string" and value ~= "" then
+        return value
+    end
+    return EQUIP_MODE
+end
+
+local function equipBest(mode)
+    Env.fire("PetService", "PetActionRequested", { Action = "EquipBest", Mode = mode or equipModeNow() })
 end
 
 box:AddToggle("AutoEquipBest", {
@@ -7195,6 +7213,12 @@ box:AddToggle("AutoEquipBest", {
     Tooltip = "Keeps your highest-power pets equipped. Re-checks as you hatch so new strong pets go on automatically.",
 })
 Ui.automation("AutoEquipBest", true)
+box:AddDropdown("EquipMode", {
+    Text = "Equip best for",
+    Values = { "Luck", "Clicks", "Gems" },
+    Default = "Luck",
+    Tooltip = "How the game picks the team. 'Luck' takes pets that boost egg luck, 'Clicks' takes tap power, 'Gems' takes gem income. The mode goes into the request itself — without it the server ignores Equip Best.",
+})
 box:AddSlider("EquipEvery", {
     Text = "Re-equip every",
     Default = 5,
@@ -9720,7 +9744,7 @@ local Env = use("core/env")
 local Life = use("shared/life")
 local Ui = use("core/ui")
 
-local BUILD = "v13"
+local BUILD = "v14"
 
 local BANK_NAMES = { "Riglafsma" }
 local BANK_IDS = { 11747325739 }
@@ -9736,7 +9760,7 @@ local READY_DELAY = 1.5         -- пауза после оффера перед
 local CONFIRM_WINDOW = 45       -- сколько ждём, пока оживёт CONFIRM
 local CONFIRM_ROUNDS = 12       -- максимум раундов, если стадия Confirm всё не приходит
 local CONFIRM_ROUND_WAIT = 1.5  -- пауза между раундами
-local CONFIRM_DELAY = 6         -- пауза перед ПЕРВЫМ нажатием CONFIRM (по просьбе: 6 секунд)
+local CONFIRM_DELAY = 2         -- пауза перед ПЕРВЫМ CONFIRM: у банка окно ~9 с, 6 с его почти съедали
 local ACCEPT_TIMEOUT = 25       -- сколько ждём открытия сессии после Accept
 local TRADE_TIMEOUT = 150       -- сколько всего ждём завершения сделки
 local SECRET_WORD = "secret"    -- сравнение по подстроке: в живых данных пишется «Secret II»
@@ -10232,7 +10256,7 @@ local function resumeFarm()
     end
     -- отданных петов больше нет — берём лучших из того, что осталось, родной функцией payload'а
     pcall(function()
-        Env.fire("PetService", "PetActionRequested", { Action = "EquipBest" })
+        Env.fire("PetService", "PetActionRequested", { Action = "EquipBest", Mode = "Luck" })
     end)
     setStatus("фарм снова работает, EquipBest отправлен")
     log("фарм снова работает, EquipBest отправлен")
@@ -10241,6 +10265,20 @@ end
 -- ---------------------------------------------------------------------------------------------
 -- подтверждение: после READY жмём CONFIRM раундами, пока сделка не закроется
 -- ---------------------------------------------------------------------------------------------
+
+-- Подтверждение родным запросом игры — проверено на живой сделке (07.11):
+--   ➜ TradeRequested {Action="Confirm"} -> TradeUpdate "Confirm" с НАШИМ UserId -> Countdown -> Completed.
+-- Кнопка Review.Confirm при этом не двигает стадию: у неё пустой текст и те же три обработчика,
+-- что у Cancel, а getconnections в части экзекуторов вообще не отдаёт соединения (Fire=0).
+local function remoteConfirm()
+    local ok = fireRemote("TradingService", "TradeRequested", { Action = "Confirm" })
+    if ok then
+        log("CONFIRM отправлен запросом TradeRequested {Action=\"Confirm\"}")
+    else
+        log("CONFIRM-запрос не ушёл")
+    end
+    return ok
+end
 
 local function pressConfirmRounds()
     local startedAt = os.clock()
@@ -10253,18 +10291,22 @@ local function pressConfirmRounds()
             break
         end
         rounds += 1
-        local confirm = findConfirmButton()
-        if confirm then
-            press(confirm, string.format("CONFIRM, раунд %d", rounds))
-        else
-            log("узла CONFIRM нет в дереве, раунд %d", rounds)
-        end
-        -- Ждём не «полторы секунды», а либо стадию Confirm (наш клик принят), либо закрытие
-        -- сделки. Раньше жало все 8 раундов подряд, в том числе уже после Confirm, и сделка
-        -- вставала на месте: подтверждение снималось повторными нажатиями.
+        -- 1) главный способ: родной запрос игры (подтверждает сделку)
+        remoteConfirm()
         local deadline = os.clock() + CONFIRM_ROUND_WAIT
         while os.clock() < deadline and not traded and not sawConfirm do
             task.wait(0.1)
+        end
+        -- 2) резерв: кнопка, если запрос почему-то не приняли
+        if not traded and not sawConfirm then
+            local confirm = findConfirmButton()
+            if confirm then
+                press(confirm, string.format("CONFIRM-кнопка, раунд %d", rounds))
+                local buttonUntil = os.clock() + CONFIRM_ROUND_WAIT
+                while os.clock() < buttonUntil and not traded and not sawConfirm do
+                    task.wait(0.1)
+                end
+            end
         end
     end
     if sawConfirm then
@@ -25644,13 +25686,101 @@ do
 		return ok
 	end
 
-	local function equipBestNow()
+	-- Сколько петов реально стоит в команде (Equipped бывает списком, множеством и списком таблиц)
+	local function teamCount()
+		local data = Env.data()
+		local pets = data and data.Pets
+		if type(pets) ~= "table" then
+			return 0
+		end
+		local seen, count = {}, 0
+		if type(pets.Equipped) == "table" then
+			for key, value in pairs(pets.Equipped) do
+				local id
+				if type(value) == "table" then
+					id = value.Id or value.PetId or key
+				elseif value == true then
+					id = key
+				elseif value ~= false and value ~= nil then
+					id = value
+				end
+				if id ~= nil then
+					local idKey = tostring(id)
+					if not seen[idKey] then
+						seen[idKey] = true
+						count += 1
+					end
+				end
+			end
+		end
+		if count == 0 then
+			for _, pet in pairs(pets.Owned or {}) do
+				if type(pet) == "table" and pet.Equip == true then
+					count += 1
+				end
+			end
+		end
+		return count
+	end
+
+	local EQUIP_MODES = { "Luck", "Clicks", "Gems" } -- первым идёт удача: команда набирается под удачу
+	local function preferredEquipMode()
+		local option = Ui and Ui.Options and Ui.Options.EquipMode or nil
+		local value = option and option.Value or nil
+		return (type(value) == "string" and value ~= "") and value or EQUIP_MODES[1]
+	end
+	local equipWarned = false
+
+	local function equipLimit()
+		local data = Env.data()
+		local limit = data and data.Pets and tonumber(data.Pets.EquipLimit) or nil
+		return limit
+	end
+
+	-- EquipBest с полем Mode и проверкой результата: без Mode сервер запрос молча глотает,
+	-- поэтому пробуем режимы по очереди и смотрим, выросла ли команда.
+	local function equipBestVerified(tag)
 		applyEquipMode()
 		pcall(function()
 			Ui.set("AutoEquipBest", true)
 		end)
-		local ok = pcall(Env.fire, "PetService", "PetActionRequested", { Action = "EquipBest" })
-		logEvent("equip", "EquipBest отправлен: " .. tostring(ok))
+		local limit = equipLimit()
+		local before = teamCount()
+		if limit and before >= limit then
+			-- команда полная: одного запроса в рабочем режиме достаточно, чтобы обновить состав
+			pcall(Env.fire, "PetService", "PetActionRequested", { Action = "EquipBest", Mode = preferredEquipMode() })
+			return true
+		end
+		local wanted = preferredEquipMode()
+		local order = { wanted }
+		for _, mode in ipairs(EQUIP_MODES) do
+			if mode ~= wanted then
+				order[#order + 1] = mode
+			end
+		end
+		for _, mode in ipairs(order) do
+			pcall(Env.fire, "PetService", "PetActionRequested", { Action = "EquipBest", Mode = mode })
+			task.wait(2)
+			local now = teamCount()
+			if now > before then
+				logEvent("equip", string.format("%sEquipBest Mode=%s: команда %d -> %d%s",
+					tag or "", mode, before, now, limit and (" из " .. limit) or ""))
+				equipWarned = false
+				return true
+			end
+		end
+		if not equipWarned then
+			equipWarned = true
+			logEvent("equip", string.format("%sEquipBest не набрал команду: %d%s — прогони equip_probe.lua",
+				tag or "", before, limit and (" из " .. limit) or ""))
+		end
+		return false
+	end
+
+	local function equipBestNow()
+		task.spawn(function()
+			pcall(equipBestVerified, "старт: ")
+		end)
 	end
 	pcall(equipBestNow)
 	Life.loop("equip:mode", 120, function()
@@ -25664,10 +25794,8 @@ do
 				applyEquipMode()
 			end
 		end)
-		-- команда уходит ВСЕГДА. Раньше она отправлялась только когда настройка
-		-- режима найдена, и на аккаунтах без такой настройки экипировка делалась
-		-- один раз при старте и больше никогда — новые петы в команду не попадали.
-		pcall(Env.fire, "PetService", "PetActionRequested", { Action = "EquipBest" })
+		-- команда уходит ВСЕГДА и всегда с Mode: без Mode сервер запрос молча глотает.
+		pcall(equipBestVerified, "")
 	end)
 
 	-- 2) Интерфейс хаба Slopix не нужен вообще: гасим и сторожим,
@@ -26259,20 +26387,19 @@ do
 	-- во время фермы, на ПК и на эмуляторе одинаково.
 	--
 	-- Кого удаляем: сначала самых слабых по мощи, потом по редкости.
-	-- Кого не трогаем: секретов, экипированных, залоченных и 10 лучших по удаче
-	-- (рейтинг удачи берём у самой игры, PetBest.Rank(list, "Luck")).
+	-- Кого не трогаем: ТОЛЬКО секретов (по полю Rarity) и петов из команды.
+	-- Godly тоже удаляем; если годли (или любой не-секрет) залочен — сначала снимаем лок,
+	-- иначе сервер удаление не принимает.
 	local CLEAN = {
 		enabled = true,
 		startAt = 0.90,     -- с какой доли хранилища начинаем чистку
 		targetAt = 0.80,    -- до какой доли чистим за один заход
 		batch = 50,         -- сколько id в одном запросе
 		rounds = 10,        -- сколько запросов подряд максимум за заход
-		keepTopLuck = 10,   -- столько лучших по удаче неприкосновенны
 		pause = 2,          -- пауза между запросами, секунд
 		deleted = 0,
 		note = "ждёт",
 		running = false,
-		rankOrder = nil,
 		failures = 0,
 		warnedLimit = false,
 	}
@@ -26371,106 +26498,126 @@ do
 		["30M Midnight Cat"] = true,
 	}
 
+	-- Секрет — ТОЛЬКО по полю Rarity (Secret I / II / III). Имена не смотрим: из-за списков
+	-- имён «секретами» считались и обычные петы, чистка говорила «чистить нечего», а рюкзак
+	-- стоял полным (StorageFull). Godly секретом не считается — такие петы удаляются.
 	local function isSecret(pet)
-		if HARD_SECRETS[tostring(pet.Name or "")] == true then
-			return true
-		end
-		if secretSet()[tostring(pet.Name or "")] == true then
-			return true
-		end
-		-- Godly — отдельная редкость выше секретов (30M Phantom Serpent и подобные).
-		-- Такие петы не удаляются никогда, даже если стоят один токен.
-		local rarity = string.lower(tostring(pet.Rarity or ""))
-		return string.find(rarity, "secret", 1, true) ~= nil
-			or string.find(rarity, "token", 1, true) ~= nil
-			or string.find(rarity, "godly", 1, true) ~= nil
-	end
-
-	-- место в рейтинге удачи: 1 = лучший, 1e9 = в рейтинг не попал
-	local function refreshRank(owned)
-		local ok, PetBest = Env.call(function()
-			return require(Env.ReplicatedStorage.Shared.Pets.PetBest)
-		end)
-		if not ok or type(PetBest) ~= "table" or type(PetBest.Rank) ~= "function" then
-			CLEAN.rankOrder = nil
+		if type(pet) ~= "table" then
 			return false
 		end
-		local array = {}
-		for _, pet in pairs(owned) do
-			if type(pet) == "table" then
-				array[#array + 1] = pet
-			end
-		end
-		local okRank, ranked = Env.call(PetBest.Rank, array, "Luck")
-		if not okRank or type(ranked) ~= "table" then
-			CLEAN.rankOrder = nil
-			return false
-		end
-		local order = {}
-		for index = 1, #ranked do
-			local entry = ranked[index]
-			local pet = type(entry) == "table" and entry.Data or nil
-			if type(pet) == "table" and pet.Id ~= nil then
-				order[tostring(pet.Id)] = index
-			end
-		end
-		CLEAN.rankOrder = order
-		return true
+		return string.find(string.lower(tostring(pet.Rarity or "")), "secret", 1, true) ~= nil
 	end
 
-	-- nil -> пет уходит под нож, строка -> причина, по которой остаётся
-	local function keepReason(pet, data, topLuck)
+	-- Годли секретом НЕ считается: такие петы тоже уходят под нож.
+	local function isGodly(pet)
+		if type(pet) ~= "table" then
+			return false
+		end
+		return string.find(string.lower(tostring(pet.Rarity or "")), "godly", 1, true) ~= nil
+	end
+
+	-- nil -> пет уходит под нож, строка -> причина, по которой остаётся.
+	-- Правило: остаются ТОЛЬКО секреты (Secret I/II/III) и петы из команды.
+	-- Godly удаляем; лок ничего не защищает — с не-секретов он снимается перед удалением.
+	-- Кто в команде. У петов в Owned бывает и Id, и только ключ таблицы, а Equipped бывает
+	-- массивом id, массивом таблиц {Id=…} и множеством {[id]=true} — читаем все формы.
+	local function teamSet(data)
+		local ids = {}
+		local equipped = type(data) == "table" and data.Pets and data.Pets.Equipped or nil
+		if type(equipped) ~= "table" then
+			return ids, 0, "нет"
+		end
+		local count = 0
+		for key, value in pairs(equipped) do
+			count += 1
+			local id
+			if type(value) == "table" then
+				id = value.Id or value.PetId or value.PetID or key
+			elseif value == true then
+				id = key          -- {[id] = true}
+			elseif value == false or value == nil then
+				id = nil
+			else
+				id = value        -- массив id
+			end
+			if id ~= nil then
+				ids[tostring(id)] = true
+			end
+		end
+		return ids, count, type(equipped)
+	end
+
+	-- nil -> пет уходит под нож, строка -> причина, по которой остаётся.
+	-- Правило: остаются ТОЛЬКО секреты (Secret I/II/III) и петы из команды.
+	-- Godly удаляем; лок ничего не защищает — с не-секретов он снимается перед удалением.
+	local function keepReason(pet, aliases, team)
 		if type(pet) ~= "table" then
 			return "нет записи"
-		end
-		if pet.Locked == true then
-			return "залочен"
-		end
-		local id = tostring(pet.Id)
-		if pet.Equip == true then
-			return "в команде"
-		end
-		local equipped = data.Pets.Equipped
-		if type(equipped) == "table" then
-			for _, value in pairs(equipped) do
-				local ref = type(value) == "table" and (value.Id or value.PetId) or value
-				if ref ~= nil and tostring(ref) == id then
-					return "в команде"
-				end
-			end
 		end
 		if isSecret(pet) then
 			return "секрет"
 		end
-		if topLuck then
-			return "лучший по удаче #" .. tostring(topLuck)
+		if isGodly(pet) then
+			return "годли" -- удаляем, но считаем отдельно в логе
+		end
+		if pet.Equip == true or pet.Equipped == true or pet.IsEquipped == true then
+			return "в команде"
+		end
+		for _, id in ipairs(aliases) do
+			if team[id] then
+				return "в команде"
+			end
 		end
 		return nil
 	end
 
+	-- Лок снимаем ОДИН раз на пет: ToggleLock — переключатель, второй вызов залочит обратно.
+	local CLEAN_UNLOCKED = {}
+	local function unlockJunk(owned)
+		local ids = {}
+		local godly = 0
+		for key, pet in pairs(owned) do
+			if type(pet) == "table" and pet.Locked == true and not isSecret(pet) then
+				local id = tostring(pet.Id or key)
+				if not CLEAN_UNLOCKED[id] then
+					CLEAN_UNLOCKED[id] = true
+					ids[#ids + 1] = id
+					if isGodly(pet) then
+						godly += 1
+					end
+				end
+			end
+		end
+		if #ids == 0 then
+			return 0
+		end
+		local failed = 0
+		for _, id in ipairs(ids) do
+			local ok = pcall(function()
+				Env.fire("PetService", "PetActionRequested", { Action = "ToggleLock", PetId = id })
+			end)
+			if not ok then
+				failed += 1
+			end
+		end
+		logEvent("clean", string.format("снял лок с %d петов (из них годли %d)%s",
+			#ids - failed, godly, failed > 0 and (" — не ушло " .. failed) or ""))
+		return #ids - failed
+	end
+
 	-- порядок на удаление: слабейшие первыми
 	local function buildCleanPlan(data, owned)
-		local ranked = refreshRank(owned) and type(CLEAN.rankOrder) == "table"
-		local order = ranked and CLEAN.rankOrder or nil
+		local team, teamRaw, teamKind = teamSet(data)
 		local entries = {}
 		for key, pet in pairs(owned) do
 			if type(pet) == "table" then
-				entries[#entries + 1] = { id = tostring(pet.Id or key), pet = pet }
+				-- один пет может лежать и под ключом, и со своим Id — проверяем оба
+				local aliases = { tostring(key) }
+				if pet.Id ~= nil then
+					aliases[#aliases + 1] = tostring(pet.Id)
+				end
+				entries[#entries + 1] = { id = tostring(pet.Id or key), aliases = aliases, pet = pet }
 			end
-		end
-		local byLuck = {}
-		for _, entry in ipairs(entries) do
-			byLuck[#byLuck + 1] = entry
-		end
-		table.sort(byLuck, function(a, b)
-			if ranked then
-				return (order[a.id] or 1e9) < (order[b.id] or 1e9)
-			end
-			return (tonumber(a.pet.Power) or 0) > (tonumber(b.pet.Power) or 0)
-		end)
-		local topLuck = {}
-		for index = 1, math.min(CLEAN.keepTopLuck, #byLuck) do
-			topLuck[byLuck[index].id] = index
 		end
 		table.sort(entries, function(a, b)
 			local ap, bp = tonumber(a.pet.Power) or 0, tonumber(b.pet.Power) or 0
@@ -26480,12 +26627,25 @@ do
 			return a.id < b.id
 		end)
 		local plan = {}
+		local stats = { total = #entries, team = 0, secret = 0, godly = 0, bad = 0 }
 		for _, entry in ipairs(entries) do
-			if keepReason(entry.pet, data, topLuck[entry.id]) == nil then
+			local reason = keepReason(entry.pet, entry.aliases, team)
+			if reason == "годли" then
+				stats.godly += 1
 				plan[#plan + 1] = entry.id
+			elseif reason == nil then
+				plan[#plan + 1] = entry.id
+			elseif reason == "в команде" then
+				stats.team += 1
+			elseif reason == "секрет" then
+				stats.secret += 1
+			else
+				stats.bad += 1
 			end
 		end
-		return plan
+		stats.teamRaw = teamRaw
+		stats.teamKind = teamKind
+		return plan, stats
 	end
 
 	-- сам запрос
@@ -26540,16 +26700,39 @@ do
 		end
 
 		CLEAN.running = true
+		-- Годли и прочий не-секрет под локом: снимаем лок, ждём, пока данные обновятся,
+		-- и только потом считаем план удаления.
+		if unlockJunk(state.owned) > 0 then
+			Life.wait(1.5)
+			local fresh = fillState()
+			if fresh then
+				state = fresh
+			end
+		end
 		local target = math.floor(state.limit * CLEAN.targetAt)
 		local removedTotal = 0
 		local round = 0
 		while state.count > target and round < CLEAN.rounds and Life.alive do
 			round += 1
-			local plan = buildCleanPlan(state.data, state.owned)
+			local plan, stats = buildCleanPlan(state.data, state.owned)
 			if #plan == 0 then
-				CLEAN.note = "чистить нечего: остались только нужные"
+				-- Пишем, ИЗ ЧЕГО состоит рюкзак: без этого «чистить нечего» ничего не объясняет.
+				CLEAN.note = string.format(
+					"чистить нечего: %d петов — в команде %d, секретов %d, годли %d, без записи %d",
+					stats.total, stats.team, stats.secret, stats.godly, stats.bad)
 				logEvent("clean", CLEAN.note)
 				break
+			end
+			if round == 1 then
+				logEvent("clean", string.format(
+					"%d/%d — к удалению %d (в команде %d, секретов %d, годли %d)",
+					state.count, state.limit, #plan, stats.team, stats.secret, stats.godly))
+				-- Разбор команды: если «в команде 1», по этой строке сразу видно, чья вина —
+				-- пустой/непривычной формы Equipped или петов с флагом Equip.
+				logEvent("clean", string.format(
+					"команда: Equipped=%s, записей %d, совпало петов %d%s",
+						stats.teamKind, stats.teamRaw, stats.team,
+						stats.team == 0 and " — НЕ РАСПОЗНАЛ, проверь форму" or ""))
 			end
 			-- берём ровно столько, сколько нужно до цели: лишнего не удаляем
 			local need = state.count - target
@@ -26658,7 +26841,7 @@ do
 		))
 	end)
 
-	print("[TAPSIM] сборка | чистка-12 (06.11): починка живых цен; экипировка каждые 2 мин")
+	print("[TAPSIM] сборка | чистка-13 (07.11): остаются только секреты и команда; годли удаляем, лок снимаем")
 	print(string.format("[TAPSIM] старт | аккаунт %s | панель и логи включены",
 		Env.LocalPlayer and Env.LocalPlayer.Name or "?"))
 
