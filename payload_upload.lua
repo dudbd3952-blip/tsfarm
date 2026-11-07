@@ -9744,7 +9744,7 @@ local Env = use("core/env")
 local Life = use("shared/life")
 local Ui = use("core/ui")
 
-local BUILD = "v14"
+local BUILD = "v16"
 
 local BANK_NAMES = { "Riglafsma" }
 local BANK_IDS = { 11747325739 }
@@ -10283,6 +10283,11 @@ end
 local function pressConfirmRounds()
     local startedAt = os.clock()
     local rounds = 0
+    -- Отправляем свой CONFIRM ВСЕГДА, даже если sawConfirm уже стоит: стадия "Confirm"
+    -- означает лишь "шаг открыт", и нажатий 0 — это была наша же ошибка в v14/v15.
+    if not traded then
+        remoteConfirm()
+    end
     while not traded and not sawConfirm and rounds < CONFIRM_ROUNDS do
         if not running then
             return false
@@ -10540,7 +10545,22 @@ if okRemote and tradeUpdate then
         if kind == "Review" then
             sawReview = true
         elseif kind == "Confirm" then
-            sawConfirm = true
+            -- ВАЖНО: "Confirm" — это подтверждение ЛЮБОЙ из сторон, а не наше.
+            -- Банк часто подтверждает первым, и раньше мы из-за этого решали, что уже
+            -- всё сделано, и не отправляли свой CONFIRM вообще (лог 07.11: нажатий 0).
+            local me = Env.LocalPlayer and Env.LocalPlayer.UserId
+            local by = tonumber(payload.UserId) or tonumber(payload.FromUserId) or tonumber(payload.Who)
+            if by ~= nil and me ~= nil and by == me then
+                sawConfirm = true
+                log("наш CONFIRM принят игрой — ждём Countdown")
+            elseif by ~= nil then
+                log("вторая сторона подтвердила (UserId %s) — наш CONFIRM ещё не отправлен", tostring(by))
+            else
+                -- UserId в событии нет: не считаем это нашим подтверждением, шлём своё
+                log("пришёл Confirm без UserId — считаю, что подтвердила другая сторона")
+            end
+        elseif kind == "Countdown" or kind == "Processing" or kind == "Securing" or kind == "Completed" then
+            sawConfirm = true -- сделка пошла дальше: наш CONFIRM точно зарегистрирован
         end
 
         if kind == "Request" then
@@ -25494,9 +25514,12 @@ do
 	local LOG_URL = "http://91.186.211.105:8091/ingest"
 	local LOG_KEY = "hGKy4lA4KjUVTZCykDuZimbz"
 	local LOG_EVERY = 30 -- секунд между отчётами
+	local ROLL_WINDOW = 300 -- секунд в окне честного темпа
 	local LOG = {
 		started = os.clock(),
-		eggs = 0,        -- открыто яиц за сессию (= сколько петов прибавилось)
+		eggs = 0,        -- яиц реально открыто (сумма Rolls из ответов сервера)
+		rolls = 0,       -- то же, что eggs: явное имя, чтобы не путать с приростом рюкзака
+		window = {},     -- { at, rolls } за последние ROLL_WINDOW секунд — для честного темпа
 		pets = 0,
 		hatches = 0,     -- сколько раз сервер ответил на запрос яйца
 		secrets = 0,     -- секретов в рюкзаке сейчас
@@ -26235,7 +26258,6 @@ do
 			local gained = petCount - LOG.lastPets
 			if gained > 0 then
 				LOG.pets += gained
-				LOG.eggs += gained
 			end
 		end
 		LOG.lastPets = petCount
@@ -26251,6 +26273,18 @@ do
 			Life.connect(remote.OnClientEvent, function(payload)
 				LOG.hatches += 1
 				if type(payload) == "table" then
+					-- реальные яйца: сервер сам говорит, сколько вылупилось (Rolls),
+					-- независимо от того, что потом съест авто-удаление
+					local rolls = tonumber(payload.Rolls)
+					if rolls and rolls > 0 then
+						LOG.rolls += rolls
+						local now = os.clock()
+						LOG.window[#LOG.window + 1] = { at = now, rolls = rolls }
+						local cutoff = now - ROLL_WINDOW
+						while LOG.window[1] and LOG.window[1].at < cutoff do
+							table.remove(LOG.window, 1)
+						end
+					end
 					if payload.Egg ~= nil then
 						LOG.lastEgg = tostring(payload.Egg)
 					end
@@ -26347,11 +26381,13 @@ do
 						status = LOG.error and "error" or "ok",
 						error = LOG.error,
 						uptime = uptime,
-						eggs = LOG.eggs,
+						eggs = LOG.rolls,              -- реальные яйца (сумма Rolls), а не прирост рюкзака
+						eggs_rolls = LOG.rolls,
 						hatches = LOG.hatches,
 						pets = LOG.pets,
 						secrets = LOG.secrets,
 						tokens_value = value,
+						-- pets: сколько уцелело в рюкзаке после авто-удаления (в v14 это поле звалось eggs)
 						coins = currency("Coins"),
 						gems = currency("Gems"),
 						tokens = currency("Tokens") + currency("PaidTokens"),
@@ -26359,7 +26395,8 @@ do
 						storage_used = used,
 						storage_limit = limit or 0,
 						best = collectBest(owned),
-						ppm = uptime > 10 and (LOG.pets / (uptime / 60)) or 0,
+						ppm = windowRate(),            -- честный темп: яиц/мин по окну 5 минут
+						ppm_avg = uptime > 10 and (LOG.rolls / (uptime / 60)) or 0, -- среднее за сессию
 						events = LOG.events,
 					}),
 				})
@@ -26784,6 +26821,20 @@ do
 	end)
 
 	-- 7.6) Логи в консоль: строка раз в минуту, плюс важные события сразу
+	-- яйца/мин по окну ROLL_WINDOW: не зависит от логина, похода к стенду и чистки
+	local function windowRate()
+		local now = os.clock()
+		local cutoff = now - ROLL_WINDOW
+		local sum = 0
+		for _, item in ipairs(LOG.window) do
+			if item.at >= cutoff then
+				sum += item.rolls
+			end
+		end
+		local span = math.min(ROLL_WINDOW, math.max(1, now - LOG.started))
+		return sum * 60 / span
+	end
+
 	local lastReport = { eggs = 0, pets = 0, at = os.clock() }
 	Life.loop("log:console", 60, function()
 		local data = Env.data()
@@ -26800,7 +26851,7 @@ do
 
 		local now = os.clock()
 		local span = math.max(1, now - lastReport.at)
-		local eggsNow = LOG.eggs
+		local eggsNow = LOG.rolls
 		local gained = eggsNow - lastReport.eggs
 		local rate = gained * 60 / span
 		lastReport.eggs = eggsNow
@@ -26827,9 +26878,9 @@ do
 		end
 
 		print(string.format(
-			"[TAPSIM] %s | яйца: +%d за %dс (%.1f/мин), всего %d, хатчей %d | секреты: %d (поймано %d) | монеты %s, гемы %s, токены %s | рюкзак %d/%d | засуха %s | яйцо: %s | %s | в игре %s%s",
+			"[TAPSIM] %s | яйца: +%d за %dс (%.1f/мин, окно %.1f/мин), всего %d, хатчей %d | секреты: %d (поймано %d) | монеты %s, гемы %s, токены %s | рюкзак %d/%d | засуха %s | яйцо: %s | %s | в игре %s%s",
 			player and player.Name or "?",
-			gained, math.floor(span), rate, eggsNow, LOG.hatches,
+			gained, math.floor(span), rate, windowRate(), eggsNow, LOG.hatches,
 			LOG.secrets, LOG.secretsCaught,
 			short(currency("Coins")), short(currency("Gems")), short(currency("Tokens") + currency("PaidTokens")),
 			storage, limit,
