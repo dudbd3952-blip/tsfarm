@@ -9762,6 +9762,10 @@ local CONFIRM_ROUNDS = 12       -- максимум раундов, если с�
 local CONFIRM_ROUND_WAIT = 1.5  -- пауза между раундами
 local CONFIRM_DELAY = 2         -- пауза перед ПЕРВЫМ CONFIRM: у банка окно ~9 с, 6 с его почти съедали
 local ACCEPT_TIMEOUT = 25       -- сколько ждём открытия сессии после Accept
+-- Замер 09.11 (A/B на TurboLynx и Veifuzie): вызов игрового обработчика через 1 мс после
+-- события Request НЕ принимает и вдобавок снимает обработчик с кнопки на ~20 с.
+-- С паузой 0.15 с приём проходит с первой попытки за ~0.2 с. Меньше 0.12 ставить нельзя.
+local ACCEPT_READY_DELAY = 0.15
 local TRADE_TIMEOUT = 150       -- сколько всего ждём завершения сделки
 local SECRET_WORD = "secret"    -- сравнение по подстроке: в живых данных пишется «Secret II»
 local REVEAL_PATH = { "HatchScreen", "Main", "Info", "HatchEgg" }   -- карточка «Hold to Reveal»
@@ -10087,8 +10091,144 @@ local function byPath(parts, partsButton)
     return nil
 end
 
+-- Вызов ТОЛЬКО игровых обработчиков кнопки: тех, чей исходник — игровой контроллер
+-- (ReplicatedStorage.Controllers.Trading.TradingController). Звук/анимацию из
+-- ButtonEffects и чужие логгеры не дёргаем. Замер 09.11: именно этот вызов
+-- переводит Request → Started, и делает это в том же кадре.
+-- Возвращает: сколько вызвано, список источников.
+local function fireTradeHandlers(button, label)
+    if not button then
+        return 0, {}
+    end
+    Env.elevate()
+    local genv = Env.genv or {}
+    local getconnections = genv.getconnections
+    if type(getconnections) ~= "function" then
+        return 0, {}
+    end
+    local debugLib = type(genv.debug) == "table" and genv.debug or debug
+    local fired, sources = 0, {}
+    for _, signalName in ipairs({ "Activated", "MouseButton1Click", "MouseButton1Down", "TouchTap" }) do
+        local okSignal, signal = pcall(function()
+            return button[signalName]
+        end)
+        if okSignal and signal then
+            local okList, list = pcall(getconnections, signal)
+            if okList and type(list) == "table" then
+                for _, connection in ipairs(list) do
+                    if connection.Enabled ~= false then
+                        local source = "?"
+                        pcall(function()
+                            local func = connection.Function
+                            if type(func) == "function" and type(debugLib) == "table"
+                                and type(debugLib.info) == "function" then
+                                source = tostring(debugLib.info(func, "s"))
+                            end
+                        end)
+                        if string.find(string.lower(source), "trading", 1, true) then
+                            local okFire = pcall(function()
+                                connection:Fire()
+                            end)
+                            if okFire then
+                                fired += 1
+                                table.insert(sources, source .. " на " .. signalName)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return fired, sources
+end
+
 local function findAcceptButton()
     return byPath(ACCEPT_PATH)
+end
+
+-- Настоящий клик по центру кнопки: координаты берём из AbsolutePosition, удержание
+-- подобрано так, чтобы попасть в кадр даже при лимите 5 FPS (кадр 200 мс).
+-- Нужен как запасной способ, если прямой вызов обработчика не принимает.
+local function clickButtonCentre(button, hold)
+    if not button then
+        return false
+    end
+    local centre = button.AbsolutePosition + button.AbsoluteSize / 2
+    local x, y = math.floor(centre.X), math.floor(centre.Y)
+    local camera = workspace.CurrentCamera
+    local viewport = camera and camera.ViewportSize or Vector2.new(0, 0)
+    if x < 0 or y < 0 or x > viewport.X or y > viewport.Y then
+        log("клик вне экрана (%d,%d) при %dx%d — пропускаю", x, y, viewport.X, viewport.Y)
+        return false
+    end
+    hold = hold or 0.25
+    local ok = pcall(function()
+        local vim = game:GetService("VirtualInputManager")
+        vim:SendMouseButtonEvent(x, y, 0, true, game, 0)
+        task.wait(hold)
+        vim:SendMouseButtonEvent(x, y, 0, false, game, 0)
+    end)
+    log("клик по Accept (%d,%d), удержание %.2f — %s", x, y, hold, ok and "ok" or "ошибка")
+    return ok
+end
+
+-- Клик по первой видимой строке списка заявок, затем игровой обработчик Accept.
+-- Некоторые клиенты требуют, чтобы заявка была выделена в списке.
+local function clickRequestRowThenHandler()
+    local tabs = resolvePath({ "Tabs" })
+    local quest = tabs and tabs:FindFirstChild("TradeQuest")
+    local menu = quest and quest:FindFirstChild("Menu")
+    if not menu then
+        return 0
+    end
+    for _, node in ipairs(menu:GetDescendants()) do
+        if node:IsA("GuiButton") then
+            local path = string.lower(node:GetFullName())
+            local skip = string.find(path, "accept", 1, true) or string.find(path, "decline", 1, true)
+                or string.find(path, "cancel", 1, true) or string.find(path, "close", 1, true)
+            if not skip and isShown(node) and node.AbsoluteSize.Magnitude > 0 then
+                log("клик по строке заявки: %s", node:GetFullName())
+                clickButtonCentre(node, 0.25)
+                task.wait(0.3)
+                break
+            end
+        end
+    end
+    local button = findAcceptButton()
+    local fired = 0
+    if button then
+        fired = fireTradeHandlers(button, "ACCEPT-ROW")
+    end
+    return fired
+end
+
+-- Открыть панель трейда: контроллер подвязывает Accept к кнопке при инициализации панели,
+-- а на фарм-аккаунте она может быть ни разу не открыта (замер 09.11, Veifuzie:
+-- игрового обработчика на кнопке не было вообще). Ищем кнопку таба TradeQuest и жмём её
+-- штатными обработчиками; ничего не ломаем, если такой кнопки нет.
+local function openTradePanel()
+    local tabs = resolvePath({ "Tabs" })
+    if not tabs then
+        log("openTradePanel: нет узла Tabs")
+        return false
+    end
+    for _, node in ipairs(tabs:GetDescendants()) do
+        if node:IsA("GuiButton") then
+            local low = string.lower(node:GetFullName())
+            local isTrade = string.find(low, "trade", 1, true) ~= nil
+            local isOther = string.find(low, "accept", 1, true) or string.find(low, "decline", 1, true)
+                or string.find(low, "cancel", 1, true) or string.find(low, "close", 1, true)
+            if isTrade and not isOther then
+                local fired = fireTradeHandlers(node, "OPEN-TAB")
+                if fired > 0 then
+                    log("openTradePanel: открыл через %s (обработчиков %d)", node:GetFullName(), fired)
+                    return true
+                end
+            end
+        end
+    end
+    log("openTradePanel: кнопки таба не нашёл — панель не открыть")
+    return false
 end
 
 local function findReadyButton()
@@ -10424,57 +10564,6 @@ local function handover()
     return ok
 end
 
--- Вызов ТОЛЬКО игровых обработчиков кнопки: тех, чей исходник — игровой контроллер
--- (ReplicatedStorage.Controllers.Trading.TradingController). Звук/анимацию из
--- ButtonEffects и чужие логгеры не дёргаем. Замер 09.11: именно этот вызов
--- переводит Request → Started, и делает это в том же кадре.
--- Возвращает: сколько вызвано, список источников.
-local function fireTradeHandlers(button, label)
-    if not button then
-        return 0, {}
-    end
-    Env.elevate()
-    local genv = Env.genv or {}
-    local getconnections = genv.getconnections
-    if type(getconnections) ~= "function" then
-        return 0, {}
-    end
-    local debugLib = type(genv.debug) == "table" and genv.debug or debug
-    local fired, sources = 0, {}
-    for _, signalName in ipairs({ "Activated", "MouseButton1Click", "MouseButton1Down", "TouchTap" }) do
-        local okSignal, signal = pcall(function()
-            return button[signalName]
-        end)
-        if okSignal and signal then
-            local okList, list = pcall(getconnections, signal)
-            if okList and type(list) == "table" then
-                for _, connection in ipairs(list) do
-                    if connection.Enabled ~= false then
-                        local source = "?"
-                        pcall(function()
-                            local func = connection.Function
-                            if type(func) == "function" and type(debugLib) == "table"
-                                and type(debugLib.info) == "function" then
-                                source = tostring(debugLib.info(func, "s"))
-                            end
-                        end)
-                        if string.find(string.lower(source), "trading", 1, true) then
-                            local okFire = pcall(function()
-                                connection:Fire()
-                            end)
-                            if okFire then
-                                fired += 1
-                                table.insert(sources, source .. " на " .. signalName)
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end
-    return fired, sources
-end
-
 -- Трейд пришёл (событие Request): пауза фарма, снять Secret, нажать Accept.
 -- Повторные нажатия Accept — пока сервер не пришлёт Started.
 local function acceptTrade(name, fromId)
@@ -10527,22 +10616,56 @@ local function acceptTrade(name, fromId)
         if startedEvent then
             winner = "сессия уже открыта"
         end
+        -- Замер 09.11 (Veifuzie): вызов через 1 мс после Request не сработал, а затем
+        -- игровой обработчик на кнопке исчез — на фарм-аккаунте контроллер к ней не
+        -- подключён (панель трейда ни разу не открывалась). Поэтому:
+        --   1) даём контроллеру привязку — короткая пауза перед первым вызовом;
+        --   2) если обработчика нет — НЕ молотим косметику каждые 0.5 с, а пытаемся
+        --      открыть панель трейда и ждём появления обработчика;
+        --   3) press() как фолбэк — максимум 2 раза, с интервалом 1 с.
+        task.wait(ACCEPT_READY_DELAY)
+        local fallbackPresses = 0
+        local triedOpenPanel = false
+        -- Порядок способов: сначала быстрый игровой обработчик (на рабочих аккаунтах
+        -- принимает за ~0.2 с), затем, если он не принял, запасные из A/B-прогона.
+        local plan = { "handler", "vimclick", "allconns", "row", "handler" }
         while os.clock() - acceptStart < ACCEPT_TIMEOUT and not startedEvent do
             attempt += 1
+            local method = plan[math.min(attempt, #plan)]
             local buttonNow = findAcceptButton()
             if buttonNow then
                 local fired, sources = fireTradeHandlers(buttonNow, "ACCEPT")
+                if method == "vimclick" then
+                    log("способ vimclick (игровой обработчик не принял) — клик по центру")
+                    clickButtonCentre(buttonNow, 0.25)
+                elseif method == "allconns" then
+                    local pressed = press(buttonNow, "ACCEPT (все обработчики)")
+                    log("способ allconns — вызвано обработчиков: %d", pressed)
+                elseif method == "row" then
+                    log("способ row — выделяю заявку в списке и жму обработчик")
+                    clickRequestRowThenHandler()
+                end
                 if fired > 0 then
-                    log("ACCEPT (игровой обработчик: %s) — вызвано %d, попытка %d",
-                        table.concat(sources, ", "), fired, attempt)
+                    log("ACCEPT (игровой обработчик: %s) — вызвано %d, попытка %d (%s)",
+                        table.concat(sources, ", "), fired, attempt, method)
                 else
-                    local pressed = press(buttonNow, "ACCEPT (фолбэк: все обработчики)")
-                    log("игровой обработчик не найден — фолбэк на все обработчики: %d", pressed)
-                    if pressed == 0 then
-                        -- единственный запрос, без веера: FromUserId берём из события Request
-                        fireRemote("TradingService", "TradeRequested",
-                            { Action = "Accept", FromUserId = fromId })
-                        log("ACCEPT (remote {Action=Accept, FromUserId=%s})", tostring(fromId))
+                    -- обработчика нет: сначала пробуем открыть панель, чтобы контроллер подвязался
+                    if not triedOpenPanel then
+                        triedOpenPanel = true
+                        log("игрового обработчика нет — открываю панель трейда, чтобы контроллер подвязался")
+                        openTradePanel()
+                        task.wait(0.5)
+                    elseif fallbackPresses < 2 then
+                        fallbackPresses += 1
+                        local pressed = press(buttonNow, "ACCEPT (фолбэк: все обработчики)")
+                        log("игровой обработчик не найден — фолбэк %d/2: вызвано %d", fallbackPresses, pressed)
+                        if pressed == 0 then
+                            -- единственный запрос, без веера: FromUserId берём из события Request
+                            fireRemote("TradingService", "TradeRequested",
+                                { Action = "Accept", FromUserId = fromId })
+                            log("ACCEPT (remote {Action=Accept, FromUserId=%s})", tostring(fromId))
+                        end
+                        task.wait(1)
                     end
                 end
             else
