@@ -9756,11 +9756,11 @@ local CONFIRM_PATH = { "Trading", "Trading", "Review", "Confirm" }
 local READY_PATH_BUTTON = { "Trading", "Trading", "Build", "Actions", "Ready", "Button" }
 local CONFIRM_PATH_BUTTON = { "Trading", "Trading", "Review", "Confirm", "Button" }
 
-local READY_DELAY = 1.5         -- пауза после оффера перед READY
+local READY_DELAY = 3         -- пауза после оффера перед READY
 local CONFIRM_WINDOW = 45       -- сколько ждём, пока оживёт CONFIRM
 local CONFIRM_ROUNDS = 12       -- максимум раундов, если стадия Confirm всё не приходит
 local CONFIRM_ROUND_WAIT = 1.5  -- пауза между раундами
-local CONFIRM_DELAY = 2         -- пауза перед ПЕРВЫМ CONFIRM: у банка окно ~9 с, 6 с его почти съедали
+local CONFIRM_DELAY = 4         -- пауза перед ПЕРВЫМ CONFIRM: у банка окно ~9 с, 6 с его почти съедали
 local ACCEPT_TIMEOUT = 25       -- сколько ждём открытия сессии после Accept
 -- Замер 09.11 (A/B на TurboLynx и Veifuzie): вызов игрового обработчика через 1 мс после
 -- события Request НЕ принимает и вдобавок снимает обработчик с кнопки на ~20 с.
