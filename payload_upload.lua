@@ -1,3 +1,16 @@
+-- ТЕСТ 30M v5: запускай после свежего входа только на 1-2 тестовых аккаунтах.
+-- Сначала тапы, гемовые улучшения и максимальный доступный ребёрт без яиц, не чаще одного запроса за 5 с.
+-- Предварительные приросты кошелька могут быть искажены; перед lock доход проверяется без ребёртов.
+-- После порога — только 30M x3, фарм монет, удача и исходная чистка.
+-- Тест сам ограничивает запросы яиц: не чаще одного раза в 2 секунды.
+-- Для старта яиц нужен замер дохода >=540 млн/с в 3 окнах и резерв 2.7 млрд.
+-- Это ограничение теста, а не предполагаемая скорость игры. Ребёрт может сбросить весь баланс.
+-- Выключи игровой авто-ребёрт и другие фермы: их запросами этот скрипт управлять не может.
+-- До перехода включены только игровые улучшения и дерево навыков за гемы.
+-- Рыбалка, приманки, зелья, зачарования, крафт и трейд выключены.
+-- После порога работает исходная чистка: не-секреты вне команды, включая Godly; их лок снимается.
+-- Перед чисткой кратко останавливаем новые яйца и запросы экипировки; серверные фильтры не меняем.
+-- Ранее настроенное автоудаление самой игры может оставаться активным.
 -- TapSim OPEN build 2026-11-05
 -- Содержит Slopix Hub (Tap Simulator) — MIT License, Copyright (c) 2026 TrustyCoding
 -- https://github.com/TrustyCoding/slopix-hub
@@ -147,6 +160,31 @@ function Env.invoke(service, name, ...)
     if not done then
         return false, "timeout"
     end
+    return table.unpack(result, 1, result.n)
+end
+
+-- Проверяем разрешение непосредственно в задаче перед InvokeServer: lookup может уступить поток,
+-- пока начался трейд или нажата остановка. Уже отправленную покупку отозвать нельзя.
+function Env.invokeGuarded(service, name, guard, ...)
+    local resolved, remote = pcall(Env.remote, service, name)
+    if not resolved or not remote then return false, "ts30_unavailable_before_send" end
+    local args = table.pack(...)
+    local done, result = false, nil
+    task.spawn(function()
+        local checked, allowed = pcall(guard)
+        if not checked or not allowed then
+            result = table.pack(false, "ts30_cancelled_before_send")
+        else
+            result = table.pack(Env.call(function()
+                return remote:InvokeServer(table.unpack(args, 1, args.n))
+            end))
+        end
+        done = true
+    end)
+    local deadline = os.clock() + INVOKE_TIMEOUT
+    while not done and os.clock() < deadline do task.wait(0.03) end
+    Env.elevate()
+    if not done then return false, "timeout" end
     return table.unpack(result, 1, result.n)
 end
 
@@ -763,7 +801,8 @@ local function machineOn(key)
 end
 
 local function keepGoing(manual)
-    return Life.alive and (manual or Ui.on("AutoCraft"))
+    return Life.alive and (manual or (Ui.on("AutoCraft")
+        and not (Ui.__progressTest and Ui.__progressTest.disableAutoCraft)))
 end
 
 -- Every Golden or Diamond batch there is, at that machine: Craft All requests (60 batches each)
@@ -956,7 +995,8 @@ Life.spawn("craft:auto", function()
     local last = -math.huge
     while Life.alive do
         local every = math.clamp(tonumber(Options.CraftEvery.Value) or 10, 3, 120)
-        if Ui.on("AutoCraft") and os.clock() - last >= every then
+        if Ui.on("AutoCraft") and not (Ui.__progressTest and Ui.__progressTest.disableAutoCraft)
+            and os.clock() - last >= every then
             last = os.clock()
             runPass(false)
         end
@@ -2897,6 +2937,7 @@ local function pushFilters()
     return Env.invoke("EnchantService", "SetFilters", keepList())
 end
 Life.loop("enchant:filters", 0.5, function()
+    if Ui.__progressTest then return end -- тест не включает и не настраивает зачарования
     if filtersDirty and os.clock() - filtersChangedAt >= 1 then
         pushFilters()
     end
@@ -4495,6 +4536,8 @@ do
                 EGGS[name] = {
                     price = tonumber(def.Price) or 0,
                     island = def.Island,
+                    display = type(def.DisplayName) == "string" and def.DisplayName
+                        or type(def.Name) == "string" and def.Name or "",
                     pets = type(def.Pets) == "table" and def.Pets or {},
                     secrets = type(def.Secrets) == "table" and def.Secrets or {},
                 }
@@ -4541,6 +4584,21 @@ local function totalPrice(data, egg, count)
     return price * count
 end
 
+-- Для теста не подменяем игровые цены локальным предположением при ошибке модуля.
+local function progressStrictPrice(data, egg)
+    local def = EGGS[egg]
+    if type(data) ~= "table" or not def or not EggPricing
+        or type(EggPricing.GetUnitPrice) ~= "function" or type(EggPricing.GetTotal) ~= "function" then
+        return nil
+    end
+    local ok1, one = Env.call(EggPricing.GetUnitPrice, data, egg, def.price)
+    local ok3, three = Env.call(EggPricing.GetTotal, data, egg, def.price, 3)
+    if ok1 and ok3 and tonumber(one) == 300000000 and tonumber(three) == 900000000 then
+        return 900000000
+    end
+    return nil
+end
+
 local function canOcto(data)
     local function has(module, method, key)
         if not module then
@@ -4555,6 +4613,12 @@ end
 -- The game's own pickAutoHatchCount: the biggest batch you have the pass and the coins for.
 local function hatchCount(data, egg)
     local coins = tonumber(type(data.Currencies) == "table" and data.Currencies.Coins) or 0
+    if Ui.__progressTest then
+        -- Ни единичное, ни x8 не разрешено даже при соответствующем пропуске.
+        if egg == Ui.__progressTest.eggGoal and progressStrictPrice(data, egg) == 900000000
+            and coins >= 900000000 then return 3 end
+        return nil
+    end
     if canOcto(data) and totalPrice(data, egg, 8) <= coins then
         return 8
     end
@@ -4655,8 +4719,26 @@ local function eggPosition(egg)
     return EGG_POSITIONS[egg]
 end
 
+-- Для текущего ивента сохранённая координата не заменяет реальную модель.
+local function progressLivePosition(egg)
+    local model = eggModel(egg)
+    if not model then return nil end
+    local ok, pivot = pcall(model.GetPivot, model)
+    if ok and pivot and pivot.Position then
+        learn(egg, pivot.Position)
+        return pivot.Position
+    end
+    return nil
+end
+
 -- Unlocked, on an unlocked island, and standing somewhere in the world.
 local function hatchable(data, egg)
+    if Ui.__progressTest then
+        -- Unlocked мог означать факт предыдущего открытия: семантика не подтверждена.
+        -- Разрешаем только выбранный контроллером ключ и живую стойку; решение остаётся за сервером.
+        local P = Ui.__progressTest
+        return P.eggGoal == egg and EGGS[egg] ~= nil and progressLivePosition(egg) ~= nil
+    end
     local eggs = type(data.Eggs) == "table" and data.Eggs.Unlocked
     if type(eggs) ~= "table" or eggs[egg] ~= true or not eggPosition(egg) then
         return false
@@ -4688,6 +4770,7 @@ local function whySkipped(data)
 end
 
 Life.loop("hatch:why", 300, function()
+    if Ui.__progressTest then return end -- старый отчёт ошибочно считает отсутствие Unlocked запретом 30M
     local ok, data = pcall(Env.data)
     if not ok or type(data) ~= "table" then
         return
@@ -4852,6 +4935,14 @@ local function chooseByValue(data)
 end
 
 local function chooseEgg(data)
+    if Ui.__progressTest then
+        local P = Ui.__progressTest
+        local goal = P.eggGoal
+        if P.phase ~= "hatch" or P.holdHatch or P.stopRequested or not P.rebirthLocked
+            or not goal or not EGGS[goal] or not hatchable(data, goal)
+            or os.clock() < (refused[goal] or 0) then return nil end
+        return hatchCount(data, goal) == 3 and goal or nil
+    end
     if LOCK_EGG ~= "" then
         local egg = LOCK_EGG
         if EGGS[egg] and hatchable(data, egg) and hatchCount(data, egg) then
@@ -4870,6 +4961,42 @@ local function chooseEgg(data)
         if lockNote ~= reason then
             lockNote = reason
             logEgg("замок не сработал: " .. egg .. " — " .. reason)
+        end
+    end
+    -- В тесте удерживаем выбранное доступное яйцо, даже когда на счёте меньше его цены.
+    -- Иначе ферма сразу тратит заработок на дешёвое и до цели никогда не докапливает.
+    local progress = Ui.__progressTest
+    local goal = progress and progress.eggGoal
+    if goal then
+        if not EGGS[goal] or not hatchable(data, goal) then
+            progress.eggGoal = nil
+            logEgg("тест: выбранное яйцо недоступно, возвращаю обычный выбор")
+        else
+            -- Можно перейти на улучшение, если появился устойчивый запас на 2 тройных открытия.
+            -- По секретам сохраняем прежний запас SWITCH_MARGIN; без оценки — сравниваем цену.
+            local candidate = chooseByValue(data)
+            local oldValue = tonumber(EGG_VALUE[goal]) or 0
+            if not candidate and oldValue <= 0 then
+                for _, egg in ipairs(eggsByPrice(data)) do
+                    if hatchCount(data, egg) then candidate = egg; break end
+                end
+            end
+            if candidate and candidate ~= goal and EGGS[candidate] then
+                local newValue = tonumber(EGG_VALUE[candidate]) or 0
+                local better = (newValue > 0 and oldValue <= 0)
+                    or (newValue > 0 and oldValue > 0 and newValue > oldValue * SWITCH_MARGIN)
+                    or (newValue <= 0 and oldValue <= 0
+                        and EGGS[candidate].price > EGGS[goal].price * SWITCH_MARGIN)
+                local triple = tonumber(totalPrice(data, candidate, 3))
+                local coins = tonumber(type(data.Currencies) == "table" and data.Currencies.Coins) or 0
+                if better and triple and triple == triple and triple > 0 and triple < math.huge
+                    and coins >= triple * 2 then
+                    progress.eggGoal, goal = candidate, candidate
+                    logEgg("тест: достаточно монет для улучшения цели -> " .. goal)
+                end
+            end
+            if os.clock() < (refused[goal] or 0) then return nil end
+            return hatchCount(data, goal) and goal or nil
         end
     end
     local byValue = chooseByValue(data)
@@ -4967,19 +5094,26 @@ end
 -- (Ui.travelling) cuts this one short: two features teleporting at once fight over the character.
 local function goToEgg(egg)
     local target, hrp = eggPosition(egg), root()
-    if not target or not hrp or Ui.travelling then
+    if not target or not hrp or Ui.travelling or not Ui.on("AutoHatch")
+        or (Ui.__progressTest and (Ui.__progressTest.holdHatch or Ui.__progressTest.stopRequested))
+        or (Env.genv and Env.genv.__handoverPaused) then
         return false
     end
     Ui.hatchMoving = true
     local arrived = false
     pcall(function()
         Env.streamAround(target, 10)
+        if not Life.alive or not Ui.on("AutoHatch") or Ui.travelling
+            or (Ui.__progressTest and (Ui.__progressTest.holdHatch or Ui.__progressTest.stopRequested))
+            or (Env.genv and Env.genv.__handoverPaused) then return end
         hrp.AssemblyLinearVelocity = Vector3.zero
         hrp.CFrame = CFrame.new(target + Vector3.new(0, 6, 0))
         -- The model (and its Egg part) stream in once we are here.
         local model
         local deadline = os.clock() + 8
-        while Life.alive and not Ui.travelling and os.clock() < deadline do
+        while Life.alive and not Ui.travelling and Ui.on("AutoHatch")
+            and not (Ui.__progressTest and (Ui.__progressTest.holdHatch or Ui.__progressTest.stopRequested))
+            and not (Env.genv and Env.genv.__handoverPaused) and os.clock() < deadline do
             model = eggModel(egg)
             if model and model:FindFirstChild("Egg") then
                 break
@@ -4988,7 +5122,9 @@ local function goToEgg(egg)
         end
         local center = model and eggCenter(model)
         hrp = root()
-        if center and hrp and not Ui.travelling then
+        if center and hrp and not Ui.travelling and Ui.on("AutoHatch")
+            and not (Ui.__progressTest and (Ui.__progressTest.holdHatch or Ui.__progressTest.stopRequested))
+            and not (Env.genv and Env.genv.__handoverPaused) then
             hrp.AssemblyLinearVelocity = Vector3.zero
             hrp.CFrame = standSpot(model, center)
             Life.wait(0.3)
@@ -5007,7 +5143,8 @@ local waiting
 Life.spawn("hatch:results", function()
     local remote = Env.remote("EggService", "EggHatchResult")
     Life.connect(remote.OnClientEvent, function(payload)
-        if waiting and type(payload) == "table" and (payload.Seq == waiting.seq or (payload.Seq == nil and payload.Egg == waiting.egg)) then
+        -- Не относим к нашему запросу чужой ответ без Seq (например от старого автохатча).
+        if waiting and type(payload) == "table" and payload.Seq == waiting.seq then
             waiting.result = payload
         end
     end, "hatch:result")
@@ -5016,25 +5153,130 @@ end)
 -- Ui.hatchInFlight: the server holds a request until the egg may open again and only then checks
 -- distance, so a craft trip must wait for it to land or the held request comes back TooFar.
 local function hatch(egg, count)
+    local P = Ui.__progressTest
+    local function allowed()
+        return Life.alive and P and P.phase == "hatch" and P.rebirthLocked and not P.holdHatch
+            and not P.hatchUncertain and not P.stopRequested and not P.cleaning
+            and Ui.on("AutoHatch") and not Ui.travelling
+            and not (Env.genv and Env.genv.__handoverPaused) and egg == P.eggGoal and count == 3
+    end
+    local function failClosed(why)
+        if P then
+            P.hatchUncertain = true
+            P.holdHatch = true
+            P.phase = "hatch_uncertain"
+            P.note = why
+            if type(P.log) == "function" then pcall(P.log, why .. "; яйца и ребёрты остановлены") end
+        end
+    end
+    if not allowed() then return { Error = "Cancelled" } end
+    local okRemote, remote = pcall(Env.remote, "EggService", "EggHatchRequested")
+    if not okRemote or not remote then failClosed("EggHatchRequested недоступен"); return nil end
+    if not allowed() then return { Error = "Cancelled" } end
+    -- Ограничение НАШИХ запросов. Даже если сервер быстрее, тест не шлёт чаще 1 раза за 2 с.
+    local gap = math.max(2, tonumber(P.minHatchInterval) or 2)
+    while allowed() and P.lastHatchSendAt and os.clock() - P.lastHatchSendAt < gap do
+        Life.wait(math.min(0.1, gap - (os.clock() - P.lastHatchSendAt)))
+    end
+    if not allowed() then return { Error = "Cancelled" } end
+    local fresh = Env.data()
+    if not fresh or not eggModel(egg) or not hatchable(fresh, egg) or hatchCount(fresh, egg) ~= 3 then
+        return { Error = "Cancelled" }
+    end
+    -- Игровые функции могли уступить поток: проверяем всё ещё раз перед FireServer.
+    local check = Env.data()
+    local coins = check and type(check.Currencies) == "table" and tonumber(check.Currencies.Coins) or nil
+    local rb = check and type(check.Statistics) == "table" and tonumber(check.Statistics.Rebirths) or nil
+    if not allowed() or not coins or coins < 900000000 or not rb or P.lockedRebirths == nil then
+        return { Error = "Cancelled" }
+    end
+    if rb ~= P.lockedRebirths then
+        P.holdHatch, P.phase = true, "blocked"
+        P.note = "после фиксации изменилось число ребёртов: возможен внешний авто-ребёрт"
+        if type(P.log) == "function" then pcall(P.log, P.note .. "; новые яйца остановлены") end
+        return { Error = "Cancelled" }
+    end
     seq += 1
     local slot = { seq = seq, egg = egg }
     waiting = slot
     Ui.hatchInFlight = true
-    Env.fire("EggService", "EggHatchRequested", { Egg = egg, Count = count, Auto = true, Seq = slot.seq })
-    local deadline = os.clock() + 12 -- the client's own give-up time
-    while Life.alive and not slot.result and os.clock() < deadline do
-        Life.wait(0.03)
+    P.lastHatchSendAt = os.clock()
+    local sent, err = pcall(function()
+        Env.elevate()
+        remote:FireServer({ Egg = egg, Count = 3, Auto = true, Seq = slot.seq })
+    end)
+    if not sent then
+        Ui.hatchInFlight = false
+        if waiting == slot then waiting = nil end
+        failClosed("ошибка отправки яйца: " .. tostring(err))
+        return nil
     end
+    local deadline = os.clock() + 12
+    while Life.alive and not slot.result and os.clock() < deadline do Life.wait(0.03) end
     Ui.hatchInFlight = false
-    if waiting == slot then
-        waiting = nil
+    if waiting == slot then waiting = nil end
+    local result = slot.result
+    local refusal = type(result) == "table" and (result.Error or (result.Success ~= true and result.Reason)) or nil
+    if type(result) == "table" and refusal and not result.Error then result.Error = refusal end
+    if not result and Life.alive then
+        failClosed("нет ответа на яйцо: запрос мог остаться на сервере")
+    elseif type(result) == "table" and result.Success == true and result.Error ~= nil then
+        failClosed("сервер прислал противоречивый ответ на яйцо")
+    elseif type(result) == "table" and result.Success == true then
+        local rolls = tonumber(result.Rolls)
+        local pets = type(result.Pets) == "table" and #result.Pets or 0
+        local explicit = rolls or tonumber(result.Count) or tonumber(result.HatchCount) or tonumber(result.Amount)
+            or (pets > 0 and pets or nil)
+        local spent = result.Spent ~= nil and tonumber(result.Spent) or nil
+        if (result.Egg ~= nil and result.Egg ~= egg) or explicit ~= 3
+            or (result.Spent ~= nil and spent ~= 900000000) then
+            failClosed("сервер не подтвердил 30M x3 за 900M (Egg=" .. tostring(result.Egg)
+                .. ", Rolls/Count=" .. tostring(explicit) .. ", Spent=" .. tostring(result.Spent) .. ")")
+        else
+            local at = os.clock()
+            if P.lastHatchAt then
+                local list = P.actualBatchIntervals
+                list[#list + 1] = at - P.lastHatchAt
+                while #list > 20 do table.remove(list, 1) end
+            end
+            P.lastHatchAt = at
+            P.confirmedBatches = (P.confirmedBatches or 0) + 1
+        end
+    elseif type(result) == "table" and result.Error == "NotEnoughCoins" then
+        -- Доход мог измениться. Больше не делаем ребёрты: копим и перепроверяем его.
+        P.holdHatch = true
+        P.phase = "locked_wait"
+        P.phaseAt = P.activeClock
+        P.note = "сервер сообщил нехватку монет; проверяю доход"
+        if type(P.log) == "function" then pcall(P.log, P.note .. "; ребёрты остаются выключены") end
+    elseif type(result) == "table" and result.Error == "StorageFull" then
+        P.holdHatch = true
+        P.phase = "storage_wait"
+        P.phaseAt = P.activeClock
+        P.storageNeeded = math.max(3, tonumber(result.Needed) or 3)
+        P.note = "рюкзак заполнен; жду свободные места"
+        if type(P.log) == "function" then pcall(P.log, "рюкзак заполнен: жду штатную чистку и свободные места") end
+    elseif type(result) == "table" and (result.Error == "RateLimited" or result.Error == "TooFar") then
+        -- Явный отказ сервера, без открытия: штатный цикл скорректирует позицию/паузу.
+    elseif type(result) == "table" and (refusal ~= nil or result.Success == false) then
+        -- Например IslandLocked/EggLocked: это отказ, а не подтверждённая тройка и не повод открыть другое яйцо.
+        P.holdHatch = true
+        P.phase, P.phaseAt = "target_wait", P.activeClock
+        P.serverDeniedUntil = os.clock() + 60
+        P.serverDeniedReason = tostring(refusal or "Success=false")
+        P.note = "сервер отклонил 30M: " .. P.serverDeniedReason
+        if type(P.log) == "function" then pcall(P.log, P.note .. "; другое яйцо не выбираю, повтор не раньше чем через 60 с") end
+    else
+        failClosed("непонятный ответ на яйцо: " .. tostring(type(result) == "table" and (result.Error or result.Reason) or result))
     end
-    return slot.result
+    return result
 end
 
 -- Auto delete: the game's own per-egg list, filled with every pet at or above a drop chance.
 local appliedDelete = {}
 local function applyAutoDelete(egg)
+    -- Тест не меняет серверный автоудалёнт яйца. Ранее сохранённые настройки игры остаются.
+    if Ui.__progressTest then return end
     local threshold = tonumber(Options.HatchDeleteAbove.Value) or 0
     if threshold <= 0 or appliedDelete[egg] == threshold then
         return
@@ -5079,7 +5321,7 @@ local box = tab:AddGroupbox({ Side = "Left", Name = "Auto hatch", IconName = "eg
 box:AddToggle("AutoHatch", {
     Text = "Auto hatch",
     Default = false,
-    Tooltip = "Walks you to the egg and hatches as fast as the server allows: the next hatch goes the instant the last one lands.",
+    Tooltip = "30M test: x3 only; at least 2 seconds between requests, while income can support it.",
 })
 Ui.automation("AutoHatch")
 box:AddDropdown("HatchMode", {
@@ -5148,9 +5390,13 @@ Life.spawn("hatch:auto", function()
     local tooFar = 0
     while Life.alive do
         -- A craft trip stands you somewhere else; hatching resumes (and walks back) after it.
-        if not Ui.on("AutoHatch") or Ui.travelling then
+        if not Ui.on("AutoHatch") or Ui.travelling
+            or (Ui.__progressTest and (Ui.__progressTest.holdHatch or Ui.__progressTest.cleaning))
+            or (Env.genv and Env.genv.__handoverPaused) then
             stop()
-            if not Ui.on("AutoHatch") then
+            if Ui.__progressTest and Ui.__progressTest.holdHatch then
+                note = "Paused for the progression test."
+            elseif not Ui.on("AutoHatch") then
                 note = "Auto hatch is off."
                 if Ui.status and (Ui.status:find("^Auto hatching") or Ui.status:find("^Walking to the")) then
                     Ui.status = "Idle"
@@ -5189,8 +5435,19 @@ Life.spawn("hatch:auto", function()
                 continue
             end
         end
+        -- Во время пути к яйцу тумблер или трейд могли измениться: повторная проверка перед запросом.
+        if not Ui.on("AutoHatch") or Ui.travelling
+            or (Ui.__progressTest and (Ui.__progressTest.holdHatch or Ui.__progressTest.stopRequested))
+            or (Env.genv and Env.genv.__handoverPaused) then
+            continue
+        end
         applyAutoDelete(egg)
-        -- в статусе видно, сколько яиц уходит в одном запросе: 3 (или 8 с пассом), 1 — если монет мало
+        if not Ui.on("AutoHatch") or Ui.travelling
+            or (Ui.__progressTest and (Ui.__progressTest.holdHatch or Ui.__progressTest.stopRequested))
+            or (Env.genv and Env.genv.__handoverPaused) then
+            continue
+        end
+        -- В этой тестовой копии разрешён строго Count=3; единичные и x8 запрещены.
         Ui.status = string.format("Auto hatching %s x%d", egg, count)
         local result = hatch(egg, count)
         active = true
@@ -5264,7 +5521,66 @@ end)
 
 Life.onCleanup(stop)
 
-return {}
+-- Разрешаем только однозначно найденный в живом конфиге 30M за 300 млн / 900 млн за x3.
+local function is30M(value)
+    local n = string.lower(tostring(value or "")):gsub("[^%w]", "")
+    local function token(part)
+        local cursor = 1
+        while true do
+            local at = n:find(part, cursor, true)
+            if not at then return false end
+            local before = at > 1 and n:sub(at - 1, at - 1) or ""
+            local after = n:sub(at + #part, at + #part)
+            if not before:match("%d") and not after:match("%d") then return true end
+            cursor = at + 1
+        end
+    end
+    return token("30m") or token("30000000")
+end
+local function progressTarget(data)
+    if type(data) ~= "table" then return nil, "нет реплики" end
+    local found, matches = nil, 0
+    for name, def in pairs(EGGS) do
+        if type(name) == "string" and def.price == 300000000 and (is30M(name) or is30M(def.display)) then
+            found, matches = name, matches + 1
+        end
+    end
+    if matches ~= 1 then return nil, "30M не найден однозначно в игровом конфиге (совпадений: " .. matches .. ")" end
+    if progressStrictPrice(data, found) ~= 900000000 then return nil, "цена 30M x3 не подтверждена как 900 млн" end
+    -- Отметка Eggs.Unlocked сама по себе не является подтверждённым запретом доступа.
+    -- Явный отказ игры обработаем отдельно; другое яйцо вместо 30M выбирать нельзя.
+    -- Старая сохранённая координата НЕ доказывает, что ивентовая стойка ещё существует.
+    local visible = progressLivePosition(found) ~= nil
+    return found, visible and "ready" or "no_position", 900000000
+end
+
+-- Если стойка ещё не стримится, прибываем к последней точке или к Spawn и смотрим модель.
+-- Одна сохранённая координата без живой модели не считается доступным ивентом.
+local function progressLocate(egg)
+    local P = Ui.__progressTest
+    if not P or not Life.alive or P.stopRequested or P.pending or P.previousHatchPending
+        or P.previousRebirthPending or Ui.travelling or not Ui.on("HatchTeleport")
+        or (Env.genv and Env.genv.__handoverPaused) then return false end
+    if progressLivePosition(egg) then return true end
+    local destination, hrp = eggPosition(egg) or EGG_POSITIONS.Basic, root()
+    if not destination or not hrp then return false end
+    Ui.hatchMoving = true
+    local ok = pcall(function()
+        Env.streamAround(destination, 5)
+        if not Life.alive or P.stopRequested or P.pending or Ui.travelling
+            or (Env.genv and Env.genv.__handoverPaused) then return end
+        hrp = root()
+        if not hrp then return end
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.CFrame = CFrame.new(destination + Vector3.new(0, 6, 0))
+        Life.wait(3)
+    end)
+    Env.elevate()
+    Ui.hatchMoving = false
+    return ok and progressLivePosition(egg) ~= nil
+end
+
+return { progressTarget = progressTarget, progressLocate = progressLocate }
 end
 __modules["features/home"] = function(use) -- src/games/tapsim/features/home.luau
 -- Home tab: the shared welcome box plus your live currencies and progress.
@@ -7204,7 +7520,19 @@ local function equipModeNow()
 end
 
 local function equipBest(mode)
-    Env.fire("PetService", "PetActionRequested", { Action = "EquipBest", Mode = mode or equipModeNow() })
+    if (Ui.__progressTest and (Ui.__progressTest.stopRequested or Ui.__progressTest.cleaning))
+        or (Env.genv and Env.genv.__handoverPaused) then return end
+    local ok, remote = pcall(Env.remote, "PetService", "PetActionRequested")
+    -- Env.remote может ждать сервис; после ожидания снова проверяем паузу трейда.
+    if not ok or not Life.alive or (Ui.__progressTest and (Ui.__progressTest.stopRequested or Ui.__progressTest.cleaning))
+        or (Env.genv and Env.genv.__handoverPaused) then return end
+    Env.elevate()
+    local requestedMode = mode or equipModeNow()
+    remote:FireServer({ Action = "EquipBest", Mode = requestedMode })
+    if Ui.__progressTest then
+        Ui.__progressTest.lastEquipMode = requestedMode
+        Ui.__progressTest.lastEquipAt = os.clock()
+    end
 end
 
 box:AddToggle("AutoEquipBest", {
@@ -8498,25 +8826,55 @@ local box = tab:AddGroupbox({ Side = "Left", Name = "Skill tree", IconName = "gi
 
 -- Every node name in the game's skill tree config (all branches).
 local NODES = {}
+local function skillHasOtherCurrency(def)
+    local seen, denied = {}, false
+    local function fields(value)
+        for _, key in ipairs({ "Currency", "CostCurrency", "PriceCurrency", "CurrencyName" }) do
+            local currency = value[key]
+            if type(currency) == "string" and currency ~= "" and currency:lower():gsub("%s+", "") ~= "gems" then denied = true end
+        end
+        for _, key in ipairs({ "Coins", "Tokens", "PaidTokens", "Robux" }) do
+            if tonumber(value[key]) and tonumber(value[key]) > 0 then denied = true end
+        end
+    end
+    local function costs(value, depth)
+        if type(value) ~= "table" or seen[value] or depth > 3 then return end
+        seen[value] = true
+        fields(value)
+        for _, child in pairs(value) do if type(child) == "table" then costs(child, depth + 1) end end
+    end
+    fields(def)
+    for _, key in ipairs({ "Cost", "Price", "Costs", "Prices" }) do costs(def[key], 0) end
+    return denied
+end
 do
     local ok, cfg = Env.call(function()
         return require(Env.ReplicatedStorage.Shared.Progression.SkillTreeConfig)
     end)
     if ok and type(cfg) == "table" then
-        local seen = {}
+        local seen, nonGem, visited = {}, {}, {}
         local function walk(node)
+            if visited[node] then return end
+            visited[node] = true
             for _, value in pairs(node) do
                 if type(value) == "table" then
                     local name = value.Name
-                    if type(name) == "string" and not seen[name] then
-                        seen[name] = true
-                        NODES[#NODES + 1] = name
+                    if type(name) == "string" then
+                        if skillHasOtherCurrency(value) then
+                            nonGem[name] = true
+                        elseif not seen[name] then
+                            seen[name] = true
+                            NODES[#NODES + 1] = name
+                        end
                     end
                     walk(value)
                 end
             end
         end
         walk(cfg)
+        local allowed = {}
+        for _, name in ipairs(NODES) do if not nonGem[name] then allowed[#allowed + 1] = name end end
+        NODES = allowed
     end
 end
 
@@ -8536,7 +8894,15 @@ box:AddButton({
 local label = box:AddLabel(string.format("%d skill nodes in the tree.", #NODES), true)
 
 local PACE = 0.3
-local unlockedCount = 0
+local unlockedCount, skillCursor = 0, 1
+local function reportSkills(message)
+    local P = Ui.__progressTest
+    if P then
+        P.gemWork = P.gemWork or {}
+        P.gemWork.skills = string.format("узлов=%d, куплено=%d, %s", #NODES, unlockedCount, tostring(message))
+    end
+end
+reportSkills(#NODES == 0 and "игровой конфиг не загружен" or "ожидаю")
 
 local function isUnlocked(data, node)
     local tree = data and type(data.SkillTree) == "table" and data.SkillTree.Unlocked
@@ -8550,30 +8916,64 @@ Life.spawn("skills:auto", function()
             continue
         end
         local data = Env.data()
+        if not data then Life.wait(0.5); continue end
         local progressed, blocked, remaining = false, {}, 0
-        for _, node in ipairs(NODES) do
+        local startIndex, scanComplete = skillCursor, true
+        for step = 0, #NODES - 1 do
+            local index = (startIndex - 1 + step) % #NODES + 1
+            local node = NODES[index]
             if not (Life.alive and Ui.on("AutoSkillTree")) then
+                skillCursor, scanComplete = index, false
                 break
             end
+            skillCursor = index % #NODES + 1 -- короткие окна не должны навсегда пропускать дальние узлы
             if not isUnlocked(data, node) then
                 remaining += 1
-                local ok, res = Env.invoke("SkillTreeService", "Unlock", { Name = node })
-                if ok and type(res) == "table" then
+                local P = Ui.__progressTest
+                local called, ok, res
+                if P then
+                    P.skillInFlight = true
+                    called, ok, res = pcall(Env.invokeGuarded, "SkillTreeService", "Unlock", function()
+                        return Life.alive and Ui.__progressTest == P and P.phase == "rebirth" and P.gemReady
+                            and not P.holdSkillTree and not P.rebirthLocked and not P.stopRequested
+                            and not P.skillUncertain and Ui.on("AutoSkillTree")
+                            and not (Env.genv and Env.genv.__handoverPaused)
+                    end, { Name = node })
+                    P.skillInFlight = false
+                else
+                    called, ok, res = pcall(Env.invoke, "SkillTreeService", "Unlock", { Name = node })
+                end
+                if called and not ok and res == "ts30_cancelled_before_send" then
+                    -- Гонка со Stop/трейдом/замером: вызов точно не был отправлен.
+                elseif P and called and not ok and res == "ts30_unavailable_before_send" then
+                    P.skillRetryAt = os.clock() + 60
+                    reportSkills("сервис недоступен до отправки; повтор позже")
+                    if type(P.log) == "function" then pcall(P.log, "сервис навыков недоступен; продолжу фарм и повторю позже") end
+                elseif called and ok and type(res) == "table"
+                    and (type(res.Success) == "boolean" or type(res.Reason) == "string") then
                     if res.Success then
                         progressed = true
                         unlockedCount += 1
+                        reportSkills("куплен " .. tostring(node))
                         Ui.status = "Unlocking skills"
                         label:SetText(string.format("Unlocked %s (%d this session).", node, unlockedCount))
                         data = Env.data() -- refresh so a freed subtree is seen this pass
                     else
                         local reason = res.Reason or "unavailable"
                         blocked[reason] = (blocked[reason] or 0) + 1
+                        reportSkills("отказ " .. tostring(node) .. ": " .. tostring(reason))
                     end
+                elseif P then
+                    P.skillUncertain = true
+                    reportSkills("нет подтверждения " .. tostring(node) .. "; повторы остановлены")
+                    if type(P.log) == "function" then pcall(P.log, "покупка навыка не подтверждена; новые покупки навыков на паузе") end
                 end
                 Life.wait(PACE)
             end
         end
-        if remaining == 0 then
+        if not scanComplete then
+            Life.wait(0.2)
+        elseif remaining == 0 then
             label:SetText(string.format("Whole skill tree unlocked (%d this session).", unlockedCount))
             Life.wait(5)
         elseif not progressed then
@@ -8860,11 +9260,13 @@ local SEQUENCE_KEY = "__SlopixTapSequence"
 local STALL_TAPS, STALL_SECONDS = 25, 2
 local sequence = tonumber(Env.genv[SEQUENCE_KEY]) or 0
 local lastAnswer, unanswered, resyncs = os.clock(), 0, 0
+local tapAnswerCount = 0
 
 Life.spawn("tap:results", function()
     local results = Env.remote("TapService", "TapResult")
     Life.connect(results.OnClientEvent, function(result)
         if type(result) == "table" and result.ClientSequence ~= nil then
+            tapAnswerCount += 1
             lastAnswer, unanswered = os.clock(), 0
         end
     end)
@@ -8876,7 +9278,8 @@ Life.spawn("tap:auto", function()
     while Life.alive do
         -- Ui.tapDemand: another feature (breaking a creature or a meteor, which taps hit from
         -- 14 studs) needs taps even while auto tap is off.
-        if Ui.on("AutoTap") or Ui.tapDemand then
+        if (Ui.on("AutoTap") or Ui.tapDemand)
+            and not (Ui.__progressTest and Ui.__progressTest.holdTap) then
             if unanswered >= STALL_TAPS and os.clock() - lastAnswer > STALL_SECONDS then
                 sequence = math.max(sequence * 2, sequence + 1000000)
                 lastAnswer, unanswered = os.clock(), 0
@@ -8920,9 +9323,23 @@ clickBox:AddToggle("AutoClicker", {
 })
 clickBox:AddLabel("Uses the game's own auto clicker. If you do not own it, the server ignores this.", true)
 
+-- Поиск remote может уступить поток. После него отправляем только АКТУАЛЬНОЕ состояние:
+-- запоздавшее включение не должно победить Stop/трейд/ожидание ребёрта.
+function Ui.syncNativeClicker()
+    local remote = Env.remote("AutoClickService", "AutoClickRequested")
+    local P = Ui.__progressTest
+    local enabled = Life.alive and Ui.on("AutoClicker")
+        and not (P and (P.holdTap or P.stopRequested))
+        and not (Env.genv and Env.genv.__handoverPaused)
+    Env.elevate()
+    remote:FireServer({ Enabled = enabled == true })
+end
 Ui.Toggles.AutoClicker:OnChanged(function(on)
-    Env.fire("AutoClickService", "AutoClickRequested", { Enabled = on == true })
+    if Ui.__progressTest then Ui.syncNativeClicker()
+    else Env.fire("AutoClickService", "AutoClickRequested", { Enabled = on == true }) end
 end)
+-- В тесте Stop all и пауза трейда останавливают и штатный автокликер игры.
+Ui.automation("AutoClicker", true)
 
 -- Auto rebirth ---------------------------------------------------------------------------------
 --
@@ -9080,6 +9497,7 @@ end
 
 local lastRebirth, rebirthed = -math.huge, 0
 local function rebirthNow(data)
+    if Ui.__progressTest then return false, "rebirth controlled by 30M test" end
     local index, why = choosePack(data)
     if not index then
         return false, why
@@ -9105,6 +9523,12 @@ rebirthBox:AddButton({
 })
 
 Life.loop("tap:rebirth", 0.25, function()
+    -- Авто-ребёрт в тесте ведёт один ограниченный контроллер с проверкой реальных данных.
+    -- Даже старая сохранённая настройка AutoRebirth не запустит второй цикл.
+    if Ui.__progressTest then
+        rebirthLabel:SetText("Controlled by the progression test.")
+        return
+    end
     local data = Env.data()
     if not data then
         return
@@ -9122,7 +9546,41 @@ Life.loop("tap:rebirth", 0.25, function()
     rebirthLabel:SetText(string.format("%s this session. Next: %s.", short(rebirthed), tostring(upcoming)))
 end)
 
-return {}
+local function progressPack(data, remaining)
+    if not RebirthConfig or type(RebirthConfig.GetPrice) ~= "function" then
+        return nil, nil, nil, "нет игрового RebirthConfig"
+    end
+    local stats = type(data) == "table" and data.Statistics
+    local rb = type(stats) == "table" and tonumber(stats.Rebirths) or nil
+    local coins = type(data) == "table" and coinsOf(data) or nil
+    if not rb or rb ~= rb or rb < 0 or not coins or coins ~= coins then
+        return nil, nil, nil, "нет достоверных ребёртов или монет"
+    end
+    local available = buttonCount(data)
+    if type(available) ~= "number" or available ~= available or available < 1 then
+        return nil, nil, nil, "число кнопок ребёрта неизвестно"
+    end
+    available = math.clamp(math.floor(available), 1, 64)
+    local validPrice = false
+    for index = available, 1, -1 do
+        local amount = packAmount(index)
+        if type(amount) == "number" and amount == amount and amount >= 1
+            and amount < math.huge and math.floor(amount) == amount and amount <= remaining then
+            local price = packPrice(data, index)
+            if type(price) == "number" and price == price and price > 0 and price < math.huge then
+                validPrice = true
+                if price <= coins then return index, amount, price, nil end
+            end
+        end
+    end
+    return nil, nil, nil, validPrice and "unaffordable" or "игровая цена ребёрта недоступна"
+end
+
+return {
+    progressPack = progressPack,
+    hasAutoRebirth = hasAutoRebirth,
+    tapAnswers = function() return tapAnswerCount end,
+}
 end
 __modules["features/tradepost"] = function(use) -- src/games/tapsim/features/tradepost.luau
 -- Pets tab (right): a trade post for Discord, built from your rarest pets and copied to the
@@ -9651,6 +10109,60 @@ if ok and type(cfg) == "table" and type(cfg.Order) == "table" and #cfg.Order > 0
     ORDER = cfg.Order
 end
 
+local function currencyIn(def)
+    if type(def) ~= "table" then return nil end
+    local result, mixed, seen = nil, false, {}
+    local function add(value)
+        if type(value) ~= "string" or value == "" then return end
+        local normalized = value:lower():gsub("%s+", "")
+        if result and result ~= normalized then mixed = true else result = normalized end
+    end
+    local function fields(value)
+        for _, key in ipairs({ "Currency", "CostCurrency", "PriceCurrency", "CurrencyName" }) do add(value[key]) end
+        for _, key in ipairs({ "Gems", "Coins", "Tokens", "PaidTokens", "Robux" }) do
+            if tonumber(value[key]) and tonumber(value[key]) > 0 then add(key) end
+        end
+    end
+    local function costs(value, depth)
+        if type(value) ~= "table" or seen[value] or depth > 3 then return end
+        seen[value] = true
+        fields(value)
+        for _, child in pairs(value) do
+            if type(child) == "table" then costs(child, depth + 1) end
+        end
+    end
+    fields(def)
+    for _, key in ipairs({ "Cost", "Price", "Costs", "Prices" }) do costs(def[key], 0) end
+    return mixed and "mixed currencies" or result
+end
+local function upgradeCurrency(name)
+    if not ok or type(cfg) ~= "table" then return nil end
+    local containers = { cfg.Upgrades, cfg.Definitions, cfg.Items, cfg.ByName, cfg }
+    local result, mixed = nil, false
+    local function record(found)
+        if found == "mixed currencies" then mixed = true
+        elseif found then
+            if result and result ~= found then mixed = true else result = found end
+        end
+    end
+    for i = 1, 5 do
+        local group = containers[i]
+        if type(group) == "table" then
+            record(currencyIn(group[name]))
+            for _, entry in ipairs(group) do
+                if type(entry) == "table" and (entry.Name == name or entry.Id == name) then
+                    record(currencyIn(entry))
+                end
+            end
+        end
+    end
+    return mixed and "mixed currencies" or result -- валюта неизвестна или неоднозначна: пропускаем
+end
+local function gemUpgrade(name)
+    local currency = upgradeCurrency(name)
+    return type(currency) == "string" and currency:lower():gsub("%s+", "") == "gems"
+end
+
 box:AddToggle("AutoUpgrade", {
     Text = "Auto buy upgrades",
     Default = false,
@@ -9667,25 +10179,90 @@ box:AddDropdown("UpgradePicks", {
 local label = box:AddLabel("Auto buy is off.", true)
 
 local PACE = 0.4 -- seconds between purchase attempts (the server rate-limits)
-local bought, blocked = 0, {}
+local bought, blocked, upgradeCursor = 0, {}, 1
+local knownGem, knownOther, unknown, unknownNames = 0, 0, 0, {}
+for _, name in ipairs(ORDER) do
+    local currency = upgradeCurrency(name)
+    if gemUpgrade(name) then knownGem += 1 elseif currency then knownOther += 1 else
+        unknown += 1
+        if #unknownNames < 8 then unknownNames[#unknownNames + 1] = tostring(name) end
+    end
+end
+local configShape = {}
+if unknown > 0 and ok and type(cfg) == "table" then
+    for key, value in pairs(cfg) do
+        if type(key) == "string" then configShape[#configShape + 1] = key .. ":" .. type(value) end
+    end
+    table.sort(configShape)
+    while #configShape > 12 do table.remove(configShape) end
+end
+local function reportUpgrades(message)
+    local P = Ui.__progressTest
+    if P then
+        P.gemWork = P.gemWork or {}
+        P.gemWork.upgrades = string.format("Gems=%d, другая=%d, валюта неизвестна=%d%s, куплено=%d, %s",
+            knownGem, knownOther, unknown, #unknownNames > 0 and (" [" .. table.concat(unknownNames, ",") .. "]") or "",
+            bought, tostring(message))
+        if #configShape > 0 then P.gemWork.upgrades ..= " | ключи конфига=" .. table.concat(configShape, ",") end
+    end
+end
+reportUpgrades("неподтверждённые валюты пропускаю")
 
 Life.spawn("tap:upgrades", function()
     while Life.alive do
-        if not Ui.on("AutoUpgrade") then
+        if not Ui.on("AutoUpgrade") or (Ui.__progressTest and (Ui.__progressTest.holdUpgrades
+            or Ui.__progressTest.stopRequested or Ui.__progressTest.upgradeUncertain)) then
             Life.wait(0.3)
             continue
         end
         local picks = Options.UpgradePicks.Value or {}
         local progressed = false
-        for _, name in ipairs(ORDER) do
-            if not (Life.alive and Ui.on("AutoUpgrade")) then
+        local startIndex = upgradeCursor
+        for step = 0, #ORDER - 1 do
+            local index = (startIndex - 1 + step) % #ORDER + 1
+            local name = ORDER[index]
+            if not (Life.alive and Ui.on("AutoUpgrade"))
+                or (Ui.__progressTest and (Ui.__progressTest.holdUpgrades or Ui.__progressTest.stopRequested
+                    or Ui.__progressTest.upgradeUncertain or Ui.__progressTest.rebirthLocked))
+                or (Env.genv and Env.genv.__handoverPaused) then
+                upgradeCursor = index
                 break
             end
-            if picks[name] then
-                local ok2, res = Env.invoke("UpgradeService", "Purchase", { Name = name })
+            upgradeCursor = index % #ORDER + 1
+            if picks[name] and (not Ui.__progressTest or gemUpgrade(name)) then
+                local progress = Ui.__progressTest
+                local invoked, ok2, res
+                if progress then
+                    progress.upgradeInFlight = true
+                    invoked, ok2, res = pcall(Env.invokeGuarded, "UpgradeService", "Purchase", function()
+                        return Life.alive and Ui.__progressTest == progress and progress.phase == "rebirth" and progress.gemReady
+                            and not progress.holdUpgrades and not progress.rebirthLocked and not progress.stopRequested
+                            and not progress.upgradeUncertain and Ui.on("AutoUpgrade") and gemUpgrade(name)
+                            and not (Env.genv and Env.genv.__handoverPaused)
+                    end, { Name = name })
+                else
+                    invoked, ok2, res = pcall(Env.invoke, "UpgradeService", "Purchase", { Name = name })
+                end
+                if progress then
+                    progress.upgradeInFlight = false
+                    local unavailable = invoked and not ok2 and res == "ts30_unavailable_before_send"
+                    local cancelled = invoked and not ok2 and res == "ts30_cancelled_before_send"
+                    if unavailable then
+                        progress.upgradeRetryAt = os.clock() + 60
+                        reportUpgrades("сервис недоступен до отправки; повтор позже")
+                        if type(progress.log) == "function" then pcall(progress.log, "сервис улучшений недоступен; продолжу фарм и повторю позже") end
+                    end
+                    if not cancelled and not unavailable and (not invoked or not ok2 or type(res) ~= "table"
+                        or (type(res.Success) ~= "boolean" and type(res.Reason) ~= "string")) then
+                        progress.upgradeUncertain = true
+                        reportUpgrades("ответ на " .. tostring(name) .. " не подтверждён")
+                    end
+                end
+                if not invoked then ok2 = false end
                 if ok2 and type(res) == "table" then
                     if res.Success then
                         bought += 1
+                        reportUpgrades("успех " .. tostring(name))
                         progressed = true
                         blocked[name] = nil
                         Ui.status = "Bought " .. name
@@ -9695,6 +10272,9 @@ Life.spawn("tap:upgrades", function()
                         Life.wait(0.3)
                     else
                         blocked[name] = res.Reason or "unavailable"
+                        if not (Ui.__progressTest and Ui.__progressTest.upgradeUncertain) then
+                            reportUpgrades("отказ " .. tostring(name) .. ": " .. tostring(blocked[name]))
+                        end
                     end
                 end
                 Life.wait(PACE)
@@ -10369,15 +10949,16 @@ local function pauseFarm()
         return
     end
     paused = true
+    -- Флаг ставим ДО отключения тумблеров, иначе другой поток успеет экипировать петов.
+    if Env.genv then
+        Env.genv.__handoverPaused = true
+    end
     savedToggles = {}
     local toggles = Ui.Library and Ui.Library.Toggles or {}
     for name, toggle in pairs(toggles) do
         savedToggles[name] = toggle.Value == true
     end
-    Ui.stopAll(false)
-    if Env.genv then
-        Env.genv.__handoverPaused = true
-    end
+    Ui.stopAll(false, true)
     setStatus("фарм на паузе, идёт сделка")
     log("фарм на паузе")
 end
@@ -10387,19 +10968,41 @@ local function resumeFarm()
         return
     end
     paused = false
+    if Ui.__progressTest and Ui.__progressTest.stopRequested then
+        savedToggles = nil
+        if Env.genv then Env.genv.__handoverPaused = false end
+        setStatus("трейд завершён; ручной Stop all сохранён")
+        log("трейд завершён; фарм не возобновляю после ручной остановки")
+        return
+    end
     for name, value in pairs(savedToggles or {}) do
+        local P = Ui.__progressTest
+        if P and P.rebirthLocked and (name == "AutoUpgrade" or name == "AutoSkillTree") then value = false end
         pcall(Ui.set, name, value)
     end
     savedToggles = nil
     if Env.genv then
         Env.genv.__handoverPaused = false
     end
-    -- отданных петов больше нет — берём лучших из того, что осталось, родной функцией payload'а
+    -- Restore произошёл при флаге трейда, поэтому обновляем игровой кликер после снятия паузы.
+    if Ui.__progressTest and type(Ui.syncNativeClicker) == "function" then
+        Life.spawn("handover:syncNativeClicker", function() pcall(Ui.syncNativeClicker) end)
+    end
+    -- Во время теста может быть выбран Clicks: не перезаписываем его на Luck после трейда.
     pcall(function()
-        Env.fire("PetService", "PetActionRequested", { Action = "EquipBest", Mode = "Luck" })
+        local remote = Env.remote("PetService", "PetActionRequested")
+        -- Lookup может уступить поток: читаем актуальный режим уже после него.
+        local option = Ui.Options and Ui.Options.EquipMode
+        local mode = option and option.Value or "Luck"
+        if Life.alive and not paused and Ui.on("AutoEquipBest")
+            and not (Env.genv and Env.genv.__handoverPaused)
+            and not (Ui.__progressTest and Ui.__progressTest.stopRequested) then
+            Env.elevate()
+            remote:FireServer({ Action = "EquipBest", Mode = mode })
+        end
     end)
     setStatus("фарм снова работает, EquipBest отправлен")
-    log("фарм снова работает, EquipBest отправлен")
+    log("фарм снова работает, EquipBest отправлен в текущем режиме")
 end
 
 -- ---------------------------------------------------------------------------------------------
@@ -11000,6 +11603,9 @@ end
 -- Тумблер читается на каждом проходе (без локального флага): Ui.stopAll от handover его не гасит,
 -- потому что модуль не зарегистрирован как automation, а значение всегда живое.
 local function enabled()
+    local P = Ui.__progressTest
+    -- Раскрытие уже появившейся карточки не открывает новое яйцо и не должно ждать конца прокачки.
+    if P and (P.stopRequested or P.phase == "stopped") then return false end
     local ok, value = pcall(function()
         return Ui.on("AutoReveal")
     end)
@@ -11187,25 +11793,55 @@ local function restore(saved)
     end
 end
 
+-- Life.shutdown отменяет рабочую корутину, поэтому отпускание должно работать и из cleanup.
+local activeHold = nil
+local function releaseHold(hold)
+    if not hold or activeHold ~= hold then return end
+    activeHold = nil
+    if hold.vim and hold.mouseDown and hold.x and hold.y then
+        pcall(function() hold.vim:SendMouseButtonEvent(hold.x, hold.y, 0, false, game, 1) end)
+    end
+    fireSignal(hold.button, "MouseButton1Up")
+    restore(hold.saved)
+    Env.elevate()
+end
+Life.onCleanup(function() releaseHold(activeHold) end)
+
 -- Одно зажатие: держим, пока полоска не заполнится (или карточка не уйдёт), максимум HOLD_MAX.
 -- Возвращает "filled" | "gone" | "limit" | "gone-early" — по нему и решается, что писать в лог.
 local function holdOnce(button)
+    if not Life.alive or not enabled() then return "stopped", 0 end
     Env.elevate()
     local started = os.clock()
+    local hold = { button = button }
+    activeHold = hold
     local hands = fireSignal(button, "MouseButton1Down")
+    if not Life.alive or not enabled() then
+        releaseHold(hold)
+        return "stopped", os.clock() - started
+    end
     local x, y, labelX, labelY = points(button)
     if not x then
-        fireSignal(button, "MouseButton1Up")
+        releaseHold(hold)
         return "limit", 0
     end
+    hold.x, hold.y = x, y
     local vim
     pcall(function()
         vim = game:GetService("VirtualInputManager")
     end)
+    hold.vim = vim
     local saved = unblock(x, y, button)
+    hold.saved = saved
+    if not Life.alive or not enabled() then
+        releaseHold(hold)
+        restore(saved) -- на случай shutdown внутри получения перекрывающих фреймов
+        return "stopped", os.clock() - started
+    end
     debugLog("кнопка %s | обработчиков Down: %d | мышь %s | точка %d,%d",
         button:GetFullName(), hands, vim and "да" or "нет", x, y)
     if vim then
+        hold.mouseDown = true -- даже при ошибке вызываем безопасное отпускание
         pcall(function()
             vim:SendMouseButtonEvent(x, y, 0, true, game, 1)
         end)
@@ -11217,6 +11853,10 @@ local function holdOnce(button)
     local zeroSince = nil
     while os.clock() - started < HOLD_MAX do
         task.wait(0.15)
+        if not Life.alive or not enabled() then
+            result = "stopped"
+            break
+        end
         if not button.Parent then
             result = "gone"
             break
@@ -11234,15 +11874,27 @@ local function holdOnce(button)
                 zeroSince = nil
                 debugLog("полоска на нуле — повторное нажатие в %d,%d", labelX, labelY)
                 if vim then
-                    pcall(function()
+                    local released = pcall(function()
                         vim:SendMouseButtonEvent(x, y, 0, false, game, 1)
                     end)
+                    if released then hold.mouseDown = false end
                     task.wait(0.1)
+                    if not Life.alive or not enabled() then
+                        result = "stopped"
+                        break
+                    end
+                    x, y = labelX, labelY
+                    hold.x, hold.y, hold.mouseDown = x, y, true
                     pcall(function()
-                        vim:SendMouseButtonEvent(labelX, labelY, 0, true, game, 1)
+                        vim:SendMouseButtonEvent(x, y, 0, true, game, 1)
                     end)
                 end
+                if not Life.alive or not enabled() then
+                    result = "stopped"
+                    break
+                end
                 x, y = labelX, labelY
+                hold.x, hold.y = x, y
                 fireSignal(button, "MouseButton1Down")
             end
         else
@@ -11254,14 +11906,7 @@ local function holdOnce(button)
         end
     end
 
-    if vim then
-        pcall(function()
-            vim:SendMouseButtonEvent(x, y, 0, false, game, 1)
-        end)
-    end
-    fireSignal(button, "MouseButton1Up")
-    restore(saved)
-    Env.elevate()
+    releaseHold(hold)
     return result, os.clock() - started, ratio
 end
 
@@ -11283,6 +11928,11 @@ end
 
 Life.loop("holdreveal:watch", POLL, function()
     if not enabled() then
+        local P = Ui.__progressTest
+        if P and (P.stopRequested or P.phase == "stopped") then
+            setStatus("остановлено пользователем")
+            return
+        end
         -- Карточка на экране, а модуль выключен — молчать нельзя, иначе «не работает» без причин.
         -- Одна строка не чаще раза в 30 с, и только когда карточка правда на экране.
         local nowClock = os.clock()
@@ -11345,6 +11995,8 @@ Life.loop("holdreveal:watch", POLL, function()
         state.cards += 1
         setStatus("карточка закрылась — ждём следующую")
         log("карточка #%d: закрылась во время удержания (%.2f с)", state.cards, seconds)
+    elseif result == "stopped" then
+        setStatus("остановлено пользователем")
     else
         -- заполнить не удалось: пишем это всегда, тут молчать нельзя
         setStatus("не заполнилась")
@@ -11410,6 +12062,15 @@ end
 
 -- A copy already running is closed first (two hubs fighting over the UI).
 local previous = Env.genv.__SlopixHub
+-- Старая копия может иметь отправленный запрос, который невозможно отозвать.
+local prevUi = type(previous) == "table" and type(previous.Ui) == "table" and previous.Ui or nil
+local prevState = prevUi and prevUi.__progressTest
+local previousHatchPending = prevUi and (prevUi.hatchInFlight == true
+    or (type(prevState) == "table" and (prevState.previousHatchPending == true or prevState.hatchUncertain == true))) or false
+local prevRequest = type(prevState) == "table" and (prevState.pending or prevState.previousRebirthPending) or nil
+local previousRebirthPending = type(prevRequest) == "table" and { before = prevRequest.before } or nil
+local previousSkillUncertain = type(prevState) == "table" and (prevState.skillInFlight == true or prevState.skillUncertain == true) or false
+local previousUpgradeUncertain = type(prevState) == "table" and (prevState.upgradeInFlight == true or prevState.upgradeUncertain == true) or false
 if type(previous) == "table" and type(previous.Ui) == "table" and previous.Ui.Library then
     pcall(previous.Ui.Library.Unload, previous.Ui.Library)
     Env.genv.__SlopixHub = nil
@@ -11419,44 +12080,23 @@ end
 local Life = use("shared/life")
 local Ui = use("core/ui")
 
+-- Защита с самого начала, ДО запуска модулей и автозагрузки старых настроек.
+-- Тест запускать на свежем входе в игру, не во время открытого трейда.
+Ui.__progressTest = {
+    phase = "bootstrap", holdHatch = true, holdUpgrades = true,
+    disableAutoCraft = true, stopRequested = false,
+    previousHatchPending = previousHatchPending, previousRebirthPending = previousRebirthPending,
+    skillUncertain = previousSkillUncertain, upgradeUncertain = previousUpgradeUncertain,
+    holdTap = true, minHatchInterval = 2, -- до проверки диска не накапливаем возможный сбрасываемый баланс
+}
+if Env.genv then Env.genv.__handoverPaused = false end
+
 -- Loaded in tab order, and within a tab in the order the boxes stack in each column.
 local FEATURES = {
-    -- Home
-    "features/home",
-    "features/performance",
-    -- Tapping
-    "features/tap",
-    "features/upgrades",
-    "features/skilltree",
-    -- Pets
-    "features/hatch",
-    "features/holdreveal",
-    "features/pets",
-    "features/handover",
-    "features/treats",
-    "features/enchant",
-    "features/shrine",
-    "features/tradepost",
-    -- Craft
-    "features/craft",
-    "features/honeypot",
-    "features/potions",
-    -- Rewards
-    "features/rewards",
-    "features/stars",
-    "features/items",
-    -- World
-    "features/pickups",
-    "features/dig",
-    "features/creatures",
-    -- Minigames
-    "features/defense",
-    "features/minigames",
-    "features/mining",
-    "features/fishing",
-    -- Halloween
-    "features/halloween",
-    "features/dungeon",
+    -- Only the requested farm, plus local anti-AFK, performance, and egg reveal UI.
+    "features/home", "features/performance",
+    "features/tap", "features/upgrades", "features/skilltree",
+    "features/hatch", "features/holdreveal", "features/pets",
 }
 
 local function load(name)
@@ -11482,7 +12122,8 @@ end
 
 -- After the autoload, so a saved "Claim offline earnings on load: off" is respected.
 local Rewards = loaded["features/rewards"]
-if Rewards and type(Rewards.afterLoad) == "function" then
+-- Во время теста не запрашиваем разовую оффлайн-награду: она испортит замер дохода.
+if Rewards and not Ui.__progressTest and type(Rewards.afterLoad) == "function" then
     pcall(Rewards.afterLoad)
 end
 
@@ -12477,8 +13118,25 @@ function Ui.panel(groupbox, rows)
     return panel
 end
 
+-- На время теста непрофильные функции выключены ещё ДО автозагрузки старых настроек.
+-- Это закрывает окно, когда сохранённые тумблеры могли запустить покупки или награды.
+local TEST_ALLOWED_TOGGLES = {
+    AutoTap=true, AutoClicker=true, AutoHatch=true, HatchTeleport=true, AutoEquipBest=true,
+    AutoUpgrade=true, AutoSkillTree=true, -- только улучшения, без рыбалки/зелий/зачарований
+    AntiAfk=true, PerfMode=true, PerfGameSettings=true, PerfHideHatching=true, PerfNoRender=true,
+    WebhookDisconnect=true, AutoReveal=true, -- раскрытие карточки уже открытого яйца
+}
+local TEST_GEM_AUTOMATION = { AutoUpgrade=true, AutoSkillTree=true }
 -- Toggle value that is safe to read during unload (the library clears Toggles).
 function Ui.on(name)
+    local P = Ui.__progressTest
+    if P and not TEST_ALLOWED_TOGGLES[name] then return false end
+    if P and TEST_GEM_AUTOMATION[name] and (not P.gemReady or P.stopRequested or P.rebirthLocked
+        or (name == "AutoSkillTree" and (P.holdSkillTree or (P.skillRetryAt and os.clock() < P.skillRetryAt)))
+        or (name == "AutoUpgrade" and P.upgradeRetryAt and os.clock() < P.upgradeRetryAt)
+        or P.previousHatchPending or P.previousRebirthPending or P.hatchUncertain or P.upgradeUncertain or P.skillUncertain
+        or P.phase == "blocked" or P.phase == "uncertain" or P.phase == "stopped" or P.phase == "hatch_uncertain"
+        or (Env.genv and Env.genv.__handoverPaused)) then return false end
     local toggle = Ui.Library.Toggles[name]
     return toggle ~= nil and toggle.Value == true
 end
@@ -12499,7 +13157,11 @@ function Ui.automation(name, stays)
 end
 
 -- Switches automation off: everything, or with moversOnly just what would move the character.
-function Ui.stopAll(moversOnly)
+function Ui.stopAll(moversOnly, temporaryTradePause)
+    -- Обычная Stop all отменяет тест. Пауза трейда не должна отменять его.
+    if not moversOnly and not temporaryTradePause and Ui.__progressTest then
+        Ui.__progressTest.stopRequested = true
+    end
     for _, entry in ipairs(automation) do
         if not (moversOnly and entry.stays) then
             Ui.set(entry.name, false)
@@ -25702,6 +26364,984 @@ end
 getgenv().Library = Library
 return Library
 end
+-- ТЕСТ 30M: одна копия на 1-2 аккаунтах. Не изменяет GitHub или другие клиенты.
+-- Нет покупок яиц во время ребёртов. Задаётся ОГРАНИЧЕНИЕ собственного темпа,
+-- а не выдаётся догадка о скорости сервера. Цена 3 яиц проверяется в игре.
+__modules["features/progress_test"] = function(use)
+    local Env = use("core/env")
+    local Life = use("shared/life")
+    local Ui = use("core/ui")
+
+    local BATCH_PRICE = 900000000
+    local MIN_HATCH_INTERVAL = 2 -- ограничение этого теста, а не скорость игры
+    local INCOME_MARGIN = 1.20
+    local REQUIRED_INCOME = BATCH_PRICE / MIN_HATCH_INTERVAL * INCOME_MARGIN
+    local RESERVE_BATCHES = 3
+    local WINDOW = 10
+    local REQUIRED_WINDOWS = 3
+    local START_SETTLE = 7
+    local REPLY_TIMEOUT = 15
+    local REBIRTH_GAP = 5 -- между отправками, а не ожидание после подтверждения
+    local RECHECK_SECONDS = 10
+    local LUCK_RECHECK_SECONDS = 45 -- Luck проверяется даже при низком доходе команды Clicks
+    local CLICKER_REFRESH_SECONDS = 15
+    local REPORT_SECONDS = 30
+    local HATCH_OBSERVE_WINDOW = 30
+    local LOCK_MAGIC = "TS30_LOCK_V1"
+    local NO_PENDING_MAGIC = "TS30_NO_PENDING_V1"
+    local PENDING_MAGIC = "TS30_RB_PENDING_V1:"
+    local IO_MAGIC = "TS30_IO_OK_V1"
+    local MAX_SAFE_INTEGER = 9007199254740991
+
+    local function number(value)
+        local n = tonumber(value)
+        if not n or n ~= n or n == math.huge or n == -math.huge or n < 0 then return nil end
+        return n
+    end
+
+    local function readValues()
+        local data = Env.data()
+        if type(data) ~= "table" then return nil, nil, nil end
+        local stats = type(data.Statistics) == "table" and data.Statistics or nil
+        local currencies = type(data.Currencies) == "table" and data.Currencies or nil
+        local rebirths = number(stats and stats.Rebirths)
+        if rebirths and math.floor(rebirths) ~= rebirths then rebirths = nil end
+        return data, rebirths, number(currencies and currencies.Coins)
+    end
+
+    local function setMode(value)
+        local option = Ui.Options and Ui.Options.EquipMode
+        if not option then return false end
+        local P = Ui.__progressTest
+        local changed = option.Value ~= value
+        if P and (changed or P.expectedEquipMode ~= value) then
+            P.expectedEquipMode, P.equipMinimumAt = value, os.clock()
+            P.modeReadySince = nil
+        end
+        if changed then option:SetValue(value) end
+        return option.Value == value
+    end
+
+    local function start(emit)
+        local P = Ui.__progressTest
+        if type(P) ~= "table" then error("нет состояния теста") end
+        local hub = Env.genv and Env.genv.__SlopixHub
+        local features = hub and hub.Features or {}
+        local tap, hatch = features["features/tap"], features["features/hatch"]
+        if type(tap) ~= "table" or type(tap.progressPack) ~= "function"
+            or type(tap.hasAutoRebirth) ~= "function" then
+            error("не загружен безопасный модуль ребёртов")
+        end
+        local hatchApiReady = type(hatch) == "table" and type(hatch.progressTarget) == "function"
+            and type(hatch.progressLocate) == "function"
+
+        local userId = number(Env.LocalPlayer and Env.LocalPlayer.UserId)
+        if not userId or userId < 1 or math.floor(userId) ~= userId then
+            error("не удалось определить UserId для отдельного состояния аккаунта")
+        end
+        local userKey = string.format("%.0f", userId)
+        local lockPath = "SlopixHub/TapSimulator/ts30_hatch_" .. userKey .. ".lock"
+        local pendingPath = "SlopixHub/TapSimulator/ts30_rebirth_" .. userKey .. ".state"
+        local ioPath = "SlopixHub/TapSimulator/ts30_io_" .. userKey .. ".probe"
+        local genv = Env.genv or {}
+        if type(genv.__TS30Locks) ~= "table" then genv.__TS30Locks = {} end
+        local locks = genv.__TS30Locks
+        local files = Env.files or {}
+        local canReadLock = type(files.isfile) == "function" and type(files.readfile) == "function"
+        local canWriteLock = canReadLock and type(files.writefile) == "function"
+            and type(files.isfolder) == "function" and type(files.makefolder) == "function"
+
+        local function writeChecked(path, value)
+            if not canWriteLock then return false, "нет функций чтения и записи файлов" end
+            local ok, err = pcall(function()
+                for _, folder in ipairs({ "SlopixHub", "SlopixHub/TapSimulator" }) do
+                    if not files.isfolder(folder) then files.makefolder(folder) end
+                end
+                files.writefile(path, value)
+                assert(files.isfile(path) and files.readfile(path) == value, "проверка записи не прошла")
+            end)
+            Env.elevate()
+            return ok, ok and nil or tostring(err)
+        end
+        local function readLock()
+            if not canWriteLock then return nil, "экзекутор не поддерживает сохранение состояния" end
+            local ok, exists = pcall(files.isfile, lockPath)
+            Env.elevate()
+            if not ok then return nil, "не читается маркер фазы яиц" end
+            if not exists then
+                if locks[userKey] then return nil, "маркер фазы яиц пропал из файлов" end
+                return false, nil
+            end
+            local readOk, value = pcall(files.readfile, lockPath)
+            Env.elevate()
+            if not readOk or value ~= LOCK_MAGIC then return nil, "повреждён маркер фазы яиц" end
+            locks[userKey] = true
+            return true, nil
+        end
+        local function saveLock()
+            -- Даже при ошибке в этой сессии обратный переход запрещён.
+            locks[userKey] = true
+            return writeChecked(lockPath, LOCK_MAGIC)
+        end
+        local function readPending()
+            local ok, exists = pcall(files.isfile, pendingPath)
+            Env.elevate()
+            if not ok then return nil, nil, "не читается маркер запроса ребёрта" end
+            if not exists then return true, nil, nil end
+            local readOk, raw = pcall(files.readfile, pendingPath)
+            Env.elevate()
+            if not readOk or type(raw) ~= "string" then return nil, nil, "не читается запрос ребёрта" end
+            if raw == NO_PENDING_MAGIC then return true, nil, nil, true end
+            local digits = raw:match("^TS30_RB_PENDING_V1:(%d+)$")
+            local before = number(digits)
+            if not before or before > MAX_SAFE_INTEGER or math.floor(before) ~= before then
+                return nil, nil, "повреждён маркер запроса ребёрта"
+            end
+            return true, { before = before }, nil
+        end
+        local function writePending(before)
+            if not before or before > MAX_SAFE_INTEGER or before < 0 or math.floor(before) ~= before then
+                return false, "неверный или слишком большой счётчик ребёртов"
+            end
+            return writeChecked(pendingPath, PENDING_MAGIC .. string.format("%.0f", before))
+        end
+        local function clearPending()
+            return writeChecked(pendingPath, NO_PENDING_MAGIC)
+        end
+
+        P.phase = "check"
+        P.holdHatch = true
+        P.holdUpgrades = true
+        P.minHatchInterval = MIN_HATCH_INTERVAL
+        P.requiredIncome = REQUIRED_INCOME
+        P.batchPrice = BATCH_PRICE
+        P.activeClock = 0
+        P.phaseAt = 0
+        P.lastTick = os.clock()
+        P.nextReport = REPORT_SECONDS
+        P.pending = nil
+        P.confirmed = 0
+        if type(genv.__TS30LastRebirthSend) ~= "table" then genv.__TS30LastRebirthSend = {} end
+        local lastSends = genv.__TS30LastRebirthSend
+        local lastSent = number(lastSends[userKey])
+        P.nextSendAt = lastSent and (lastSent + REBIRTH_GAP) or 0 -- сохраняется при перезагрузке скрипта в том же клиенте
+        P.nextLocateAt = 0
+        P.farmMode = nil
+        P.farmThresholdReached = false
+        P.farmPrevRebirths, P.farmPrevCoins = nil, nil
+        P.farmWindowStart, P.farmWindowCoins, P.farmWindowMode = nil, 0, nil
+        P.farmResetGraceUntil = 0
+        P.farmNextLuckAt = 0
+        P.nextClickerRefresh = 0
+        P.rebirthLocked = false
+        P.eggGoal = nil
+        P.income = nil
+        P.gemReady = false -- покупки навыков не стартуют до проверки состояния и профиля
+        P.holdSkillTree = true
+        P.gemWork = P.gemWork or {}
+        P.actualBatchIntervals = {}
+        P.confirmedBatches = 0
+        P.note = "проверяю аккаунт и 30M"
+        P.remoteError = nil
+
+        local function log(text)
+            emit("progress", "[30M TEST] " .. tostring(text))
+        end
+        P.log = log
+        local function phase(name, note)
+            P.phase = name
+            P.phaseAt = P.activeClock
+            P.note = note or name
+        end
+        local function stopNativeClicker()
+            if Ui.on("AutoClicker") then pcall(Ui.set, "AutoClicker", false) end
+            P.clickerStoppedForSafety = not Ui.on("AutoClicker")
+            -- Значение тумблера не подтверждает сервер. Отправляем явную команду выключения.
+            Life.spawn("progress:stopNativeClicker", function()
+                local ok, err = pcall(function()
+                    if type(Ui.syncNativeClicker) == "function" then Ui.syncNativeClicker()
+                    else Env.fire("AutoClickService", "AutoClickRequested", { Enabled = false }) end
+                end)
+                if not ok then
+                    log("не удалось отправить отключение штатного автокликера: " .. tostring(err)
+                        .. "; он может продолжать работу, останови клиент вручную")
+                end
+            end)
+            if not P.clickerStoppedForSafety then log("тумблер автокликера не выключился; останови клиент вручную") end
+        end
+        local function blocked(reason)
+            P.holdHatch = true
+            P.holdUpgrades, P.holdSkillTree = true, true
+            phase("blocked", reason)
+            log(reason .. "; яйца и новые ребёрты на паузе")
+        end
+        local function uncertain(reason)
+            P.holdHatch = true
+            P.holdUpgrades, P.holdSkillTree = true, true
+            if P.pending or P.previousRebirthPending then
+                P.holdTap = true
+                stopNativeClicker()
+            end
+            phase("uncertain", reason)
+            log(reason .. "; новые запросы и яйца остановлены"
+                .. ((P.pending or P.previousRebirthPending) and ", тапы на паузе до подтверждения" or ""))
+        end
+        local function beginSettle(reason)
+            P.holdHatch = true
+            P.holdUpgrades, P.holdSkillTree = true, true
+            P.goodWindows = 0
+            P.sampleCoins = nil
+            P.sampleAt = nil
+            P.equipMinimumAt = os.clock() -- после трейда/ребёрта нужен новый запрос команды
+            P.modeReadySince = nil
+            phase("settle", "подготавливаю замер чистого дохода")
+            if reason then log(reason) end
+        end
+        local function beginUpgradeWindow(reason)
+            if P.rebirthLocked then
+                P.holdSkillTree = true
+                beginSettle("фаза яиц уже закреплена: покупки и ребёрты не возобновляются")
+                return
+            end
+            -- Прокачка, покупки и наблюдение дохода идут параллельно: ребёрт больше не ждёт
+            -- отдельного 6-секундного окна улучшений и 30-секундного замера.
+            P.holdHatch = true
+            P.holdUpgrades, P.holdSkillTree = false, false
+            P.farmMode, P.farmThresholdReached = "Clicks", false
+            P.farmPrevRebirths, P.farmPrevCoins = nil, nil
+            P.farmWindowStart, P.farmWindowCoins, P.farmWindowMode = nil, 0, nil
+            P.farmNextLuckAt = P.activeClock + LUCK_RECHECK_SECONDS
+            P.goodWindows, P.income = 0, nil
+            local ok, selected = pcall(setMode, "Clicks")
+            if not ok or not selected then blocked("не удалось выбрать команду Clicks"); return end
+            phase("rebirth", "максимальный доступный ребёрт не чаще раза в 5 секунд")
+            if reason then log(reason) end
+        end
+        local function pausedForTrade()
+            return Env.genv and Env.genv.__handoverPaused == true
+        end
+        -- Автокликер могли купить уже ПОСЛЕ стартового включения, которое сервер игнорировал.
+        -- Перед замером повторно отправляем Enable; это не покупка и не расходует гемы.
+        local function refreshNativeClicker()
+            if P.clickerRefreshPending or P.holdTap or P.stopRequested or pausedForTrade() or not Ui.on("AutoClicker") then return end
+            P.clickerRefreshPending = true
+            Life.spawn("progress:refreshNativeClicker", function()
+                local ok, err = pcall(function()
+                    local remote = Env.remote("AutoClickService", "AutoClickRequested")
+                    if Life.alive and not P.holdTap and not P.stopRequested and not pausedForTrade() and Ui.on("AutoClicker") then
+                        Env.elevate()
+                        remote:FireServer({ Enabled = true })
+                    end
+                end)
+                P.clickerRefreshPending = false
+                if not ok then log("не удалось повторно включить игровой автокликер: " .. tostring(err)) end
+            end)
+        end
+        local function hatchControlEnabled()
+            -- Если модуль яйца вообще не загрузился, он не должен останавливать ПРОКАЧКУ.
+            return not hatchApiReady or Ui.on("AutoHatch")
+        end
+        local function userStopped()
+            return P.stopRequested or not Ui.on("AutoTap") or not hatchControlEnabled()
+        end
+        local function modeRequestSeen(mode)
+            return Ui.on("AutoEquipBest") and P.lastEquipMode == mode
+                and type(P.lastEquipAt) == "number" and P.lastEquipAt >= (P.equipMinimumAt or 0)
+        end
+        local function canRebirth(prepared)
+            return Life.alive and not P.stopRequested and not pausedForTrade()
+                and Ui.on("AutoTap") and hatchControlEnabled()
+                and P.phase == "rebirth" and not P.rebirthLocked and not P.farmThresholdReached
+                and P.holdHatch and P.holdUpgrades and P.holdSkillTree
+                and P.pending == prepared and not P.previousHatchPending and not P.previousRebirthPending
+                and not P.hatchUncertain and not P.upgradeUncertain and not P.upgradeInFlight
+                and not P.skillUncertain and not P.skillInFlight
+                and not P.locating and not Ui.hatchInFlight and not Ui.hatchMoving and not Ui.travelling
+        end
+        local function status(rebirths, coins)
+            local intervals = P.actualBatchIntervals or {}
+            local actual = "пока нет"
+            if #intervals > 0 then
+                local sum = 0
+                for _, v in ipairs(intervals) do sum += v end
+                actual = string.format("%.2f с (среднее %d промежутков)", sum / #intervals, #intervals)
+            end
+            log(string.format("фаза=%s | ребёрты=%s | монеты=%s | доход=%s/с | нужно>=%.0f/с | яйцо=%s | тройных=%s | фактический интервал=%s | %s",
+                tostring(P.phase), tostring(rebirths or "нет данных"), tostring(coins or "нет данных"),
+                P.income and string.format("%.0f", P.income) or "измеряю", REQUIRED_INCOME,
+                tostring(P.eggGoal or "ищу"), tostring(P.confirmedBatches or 0), actual, tostring(P.note)))
+            local data = Env.data()
+            local gems = data and type(data.Currencies) == "table" and data.Currencies.Gems
+            local function switch(name)
+                local toggle = Ui.Toggles and Ui.Toggles[name]
+                return toggle and tostring(toggle.Value == true) or "нет"
+            end
+            local work = P.gemWork or {}
+            log("гемы=" .. tostring(gems or "нет данных") .. " | тумблеры навыков/улучшений="
+                .. switch("AutoSkillTree") .. "/" .. switch("AutoUpgrade")
+                .. (P.rebirthLocked and " | новые покупки остановлены" or ""))
+            log("улучшения: навыки=" .. tostring(work.skills or "нет данных модуля")
+                .. " | прочие=" .. tostring(work.upgrades or "нет данных модуля"))
+        end
+
+        -- Сначала создаём свою директорию и проверяем фактическое чтение/запись.
+        -- Без них после полного перезапуска нельзя отличить фарм от уже начатой фазы яиц.
+        local ioOk, ioErr = writeChecked(ioPath, IO_MAGIC)
+        if not ioOk then
+            blocked("нельзя сохранить состояние теста: " .. tostring(ioErr))
+        else
+            local lock, lockErr = readLock()
+            if lock == nil then
+                blocked(lockErr)
+            else
+                P.rebirthLocked = lock == true
+                local pendingOk, fromDisk, pendingErr, hadClearedRequest = readPending()
+                -- После полного перезапуска genv и точное время последней отправки потеряны.
+                -- Если на диске есть состояние прошлого запроса, безопасно выдерживаем новые 5 с.
+                if pendingOk and hadClearedRequest and lastSent == nil then
+                    P.nextSendAt = math.max(P.nextSendAt or 0, os.clock() + REBIRTH_GAP)
+                end
+                if not pendingOk then
+                    blocked(pendingErr)
+                elseif fromDisk and P.previousRebirthPending
+                    and number(P.previousRebirthPending.before) ~= fromDisk.before then
+                    blocked("счётчики двух ожидающих ребёртов не совпадают")
+                elseif fromDisk then
+                    P.previousRebirthPending = fromDisk
+                    log("найден неподтверждённый ребёрт предыдущего запуска")
+                elseif P.previousRebirthPending then
+                    local before = number(P.previousRebirthPending.before)
+                    local persisted, err = writePending(before)
+                    if not persisted then blocked("не удалось сохранить старый запрос ребёрта: " .. tostring(err)) end
+                end
+                if lock then log("маркер фазы яиц найден: новых ребёртов не будет") end
+            end
+        end
+        if P.previousRebirthPending then
+            P.holdTap = true
+            stopNativeClicker()
+        elseif P.phase == "blocked" then
+            stopNativeClicker()
+        else
+            -- До этой точки при загрузке тапы и штатный кликер были на паузе.
+            P.holdTap = false
+            if Ui.on("AutoClicker") and not pausedForTrade() and not P.stopRequested then
+                pcall(Ui.set, "AutoClicker", false)
+                if Life.alive and not pausedForTrade() and not P.stopRequested then pcall(Ui.set, "AutoClicker", true) end
+            end
+        end
+
+        local modeOk, modeSelected = pcall(setMode, "Luck")
+        if not modeOk or not modeSelected then
+            blocked("не удалось установить режим команды Luck")
+        end
+        -- Покупки включаются только в окнах прокачки. При замере, ребёрте и после порога они на паузе.
+        if not P.stopRequested and not pausedForTrade() then
+            pcall(Ui.set, "AutoUpgrade", not P.rebirthLocked)
+            pcall(Ui.set, "AutoSkillTree", not P.rebirthLocked)
+        end
+        P.holdUpgrades = true
+        P.gemReady = P.phase ~= "blocked" and not P.stopRequested
+
+        Life.spawn("progress:resolve", function()
+            local ok, remote = pcall(Env.remote, "RebirthService", "RebirthRequested")
+            if ok and remote then P.remote = remote else P.remoteError = tostring(remote) end
+        end)
+
+        local function findTarget(data)
+            if not hatchApiReady then return false, "модуль яйца 30M не загрузился" end
+            local egg, why, price = hatch.progressTarget(data)
+            if not egg then return false, why end
+            if P.eggGoal and P.eggGoal ~= egg then
+                return false, "ключ 30M изменился во время теста"
+            end
+            if price ~= BATCH_PRICE then return false, "цена x3 не равна 900000000" end
+            P.eggGoal = egg
+            if why == "no_position" and not P.locating and not P.pending
+                and not P.previousHatchPending and not P.previousRebirthPending
+                and P.activeClock >= P.nextLocateAt and not pausedForTrade() then
+                P.nextLocateAt = P.activeClock + 45
+                P.locating = true
+                Life.spawn("progress:locate30m", function()
+                    local ok, arrived = pcall(hatch.progressLocate, egg)
+                    P.locating = false
+                    if ok and arrived then
+                        log("модель 30M обнаружена; позиция получена из игры")
+                    else
+                        log("позиция 30M пока не видна; попробую снова у Spawn")
+                    end
+                end)
+            end
+            return true, why
+        end
+        local function confirmed(rebirths, coins)
+            local request = P.pending
+            if not request or not rebirths or rebirths <= request.before then return false end
+            local cleared, err = clearPending()
+            if not cleared then
+                P.holdTap = true
+                blocked("ребёрт подтверждён, но не удалось сохранить состояние: " .. tostring(err))
+                return true
+            end
+            P.pending = nil
+            P.confirmed += 1
+            -- Реплика монет может обновиться позже счётчика. Падение в этот период не считаем
+            -- доходом и не принимаем за посторонний расход, но и не прибавляем как доход.
+            P.farmResetGraceUntil = os.clock() + 5
+            local wasUncertain = P.phase == "uncertain"
+            if P.confirmed <= 3 or P.confirmed % 10 == 0 or wasUncertain then
+                log(string.format("ребёрт подтверждён: %s -> %s; баланс до=%s, сейчас=%s",
+                    tostring(request.before), tostring(rebirths), tostring(request.coins), tostring(coins)))
+            end
+            if wasUncertain then
+                P.holdTap = false
+                P.farmPrevRebirths, P.farmPrevCoins = rebirths, coins
+                P.farmWindowStart, P.farmWindowCoins, P.farmWindowMode = nil, 0, nil
+                P.goodWindows = 0
+                if P.clickerStoppedForSafety and not P.stopRequested and not pausedForTrade() then
+                    pcall(Ui.set, "AutoClicker", true)
+                    P.clickerStoppedForSafety = false
+                end
+            end
+            if P.farmThresholdReached then
+                P.holdUpgrades, P.holdSkillTree = true, true
+            else
+                P.holdUpgrades, P.holdSkillTree = false, false
+            end
+            phase("rebirth", "ребёрт подтверждён; следующий не раньше 5 секунд после отправки")
+            return true
+        end
+        local function lockRebirth(rebirths)
+            if P.pending or P.previousRebirthPending then
+                uncertain("нельзя блокировать ребёрт: запрос всё ещё ожидает ответа")
+                return false
+            end
+            P.rebirthLocked = true -- до любого потенциального ожидания и до открытия яиц
+            P.lockedRebirths = rebirths
+            P.holdHatch = true
+            P.holdUpgrades, P.holdSkillTree = true, true
+            -- Видимые тумблеры тоже выключаем; даже если они восстановятся, Ui.on запрещает покупки при lock.
+            pcall(Ui.set, "AutoUpgrade", false)
+            pcall(Ui.set, "AutoSkillTree", false)
+            local saved, err = saveLock()
+            if not saved then
+                blocked("не удалось надёжно сохранить запрет ребёртов: " .. tostring(err))
+                return false -- никогда не открываем яйца без проверенного постоянного маркера
+            end
+            log("доход подтвердился в трёх окнах; ребёрты остановлены, коплю резерв на 30M x3")
+            phase("save", "коплю и перепроверяю доход без ребёртов")
+            P.saveSampleCoins = nil
+            P.saveSampleAt = nil
+            return true
+        end
+
+        local function resetFarmWindow()
+            P.farmWindowStart, P.farmWindowCoins, P.farmWindowMode = nil, 0, nil
+        end
+        local function farmMode(wanted, why)
+            local ok, selected = pcall(setMode, wanted)
+            if not ok or not selected then blocked("не удалось выбрать команду " .. tostring(wanted)); return false end
+            P.farmMode = wanted
+            P.goodWindows, P.income = 0, nil
+            resetFarmWindow()
+            if wanted == "Clicks" then P.farmNextLuckAt = P.activeClock + LUCK_RECHECK_SECONDS end
+            if why then log(why) end
+            return true
+        end
+
+        -- Ребёрты могут обнулить баланс, поэтому нельзя сравнивать кошелёк только раз в 10 с.
+        -- Суммируем положительные последовательные изменения кошелька и НЕ прибавляем падения.
+        -- Это предварительная оценка, не доказанная нижняя граница: репликация и посторонние
+        -- поступления могут её исказить. До постоянного lock ещё раз измеряем доход без ребёртов.
+        -- Никакая догадка о числе ребёртов, цене яйца или размере кошелька доходом не считается.
+        local function observeFarmIncome(rebirths, coins)
+            local lastRb, lastCoins = P.farmPrevRebirths, P.farmPrevCoins
+            if lastRb and rebirths ~= lastRb then
+                if rebirths < lastRb or (not P.pending and not P.previousRebirthPending) then
+                    blocked("счётчик ребёртов изменился вне ожидаемого запроса; выключи внешний авто-ребёрт")
+                    return false
+                end
+            end
+            local delta = lastCoins and (coins - lastCoins) or nil
+            local precision = math.max(coins, lastCoins or 0) * 1e-15
+            if delta and delta < -precision and not P.pending and not P.previousRebirthPending
+                and os.clock() > (P.farmResetGraceUntil or 0) then
+                blocked("монеты уменьшились вне ожидаемого ребёрта: проверь другой скрипт")
+                return false
+            end
+            P.farmPrevRebirths, P.farmPrevCoins = rebirths, coins
+            if P.farmThresholdReached then return true end
+
+            local mode = P.farmMode or "Clicks"
+            local opt = Ui.Options and Ui.Options.EquipMode
+            if not opt or opt.Value ~= mode then
+                if not farmMode(mode, "режим команды изменился — заново замеряю доход") then return false end
+                return true
+            end
+            if not modeRequestSeen(mode) then
+                P.modeReadySince = nil
+                resetFarmWindow()
+                return true
+            end
+            P.modeReadySince = P.modeReadySince or P.activeClock
+            if P.activeClock - P.modeReadySince < START_SETTLE then
+                resetFarmWindow()
+                return true
+            end
+            if P.farmWindowStart == nil or P.farmWindowMode ~= mode then
+                P.farmWindowStart, P.farmWindowCoins, P.farmWindowMode = P.activeClock, 0, mode
+                return true
+            end
+            if delta and delta > precision then
+                P.farmWindowCoins += delta - precision
+            end
+            local seconds = P.activeClock - P.farmWindowStart
+            if seconds < WINDOW then return true end
+            local rate = math.max(0, P.farmWindowCoins / seconds)
+            P.income = rate
+            P.farmWindowStart, P.farmWindowCoins = P.activeClock, 0
+            if mode == "Clicks" then
+                P.note = string.format("ребёрты до 1/5 с; предварительная оценка Clicks %.0f/с", rate)
+                if rate >= REQUIRED_INCOME or P.activeClock >= (P.farmNextLuckAt or 0) then
+                    return farmMode("Luck", "проверяю доход с командой Luck; ребёрты не приостанавливаю")
+                end
+            elseif mode == "Luck" then
+                if rate >= REQUIRED_INCOME then
+                    P.goodWindows += 1
+                    P.note = string.format("доход Luck подтверждается: %d/%d окон", P.goodWindows, REQUIRED_WINDOWS)
+                    if P.goodWindows >= REQUIRED_WINDOWS then
+                        -- До любого ожидания запрещаем новые покупки/ребёрты. Ожидаем уже отправленные.
+                        P.farmThresholdReached = true
+                        P.holdUpgrades, P.holdSkillTree = true, true
+                        P.note = "предварительный порог; жду завершения отправленных действий перед проверкой"
+                        log("предварительный доход Luck достиг порога; останавливаю новые ребёрты и покупки для контрольного замера")
+                    end
+                else
+                    return farmMode("Clicks", "доход Luck ниже порога; продолжаю быстрые ребёрты")
+                end
+            end
+            return true
+        end
+
+        local function step()
+            if P.phase == "stopped" then return end
+            local now = os.clock()
+            local delta = math.max(0, now - (P.lastTick or now))
+            P.lastTick = now
+            if pausedForTrade() then
+                P.wasTradePaused = true
+                return
+            end
+            if userStopped() then
+                P.holdHatch = true
+                phase("stopped", "остановлено пользователем")
+                log("тест остановлен; уже отправленный серверу запрос отозвать нельзя")
+                return
+            end
+            P.activeClock += delta
+            local data, rebirths, coins = readValues()
+            if P.activeClock >= P.nextReport then
+                P.nextReport = P.activeClock + REPORT_SECONDS
+                status(rebirths, coins)
+            end
+
+            if P.wasTradePaused then
+                P.wasTradePaused = false
+                if not P.pending and P.phase ~= "blocked" and P.phase ~= "uncertain" and P.phase ~= "hatch_uncertain" then
+                    if P.rebirthLocked then beginSettle("пауза завершена: заново измеряю доход")
+                    else beginUpgradeWindow("пауза завершена: продолжаю быстрые ребёрты") end
+                end
+            end
+            -- Повреждённый/недоступный маркер не должен случайно разблокироваться подтверждением.
+            if P.phase == "blocked" then return end
+            if P.phase == "rebirth" and not P.rebirthLocked and not P.previousHatchPending
+                and not P.previousRebirthPending and data and rebirths ~= nil and coins ~= nil then
+                if not observeFarmIncome(rebirths, coins) then return end
+            end
+
+            if P.previousRebirthPending then
+                local before = number(P.previousRebirthPending.before)
+                if before and rebirths and rebirths > before then
+                    local cleared, err = clearPending()
+                    if not cleared then
+                        blocked("ребёрт подтвердился, но состояние не сохранилось: " .. tostring(err))
+                        return
+                    end
+                    P.previousRebirthPending = nil
+                    P.holdTap = false
+                    -- Не знаем точное время отправки предыдущей копии: выдерживаем полные 5 с.
+                    P.nextSendAt = math.max(P.nextSendAt or 0, os.clock() + REBIRTH_GAP)
+                    P.farmResetGraceUntil = os.clock() + 5
+                    if P.clickerStoppedForSafety and not P.stopRequested and not pausedForTrade() then
+                        pcall(Ui.set, "AutoClicker", true)
+                        P.clickerStoppedForSafety = false
+                    end
+                    beginUpgradeWindow("ребёрт предыдущей копии подтвердился; продолжаю прокачку")
+                else
+                    if P.phase ~= "uncertain" then uncertain("у предыдущей копии был неподтверждённый ребёрт") end
+                    return
+                end
+            end
+            if P.previousHatchPending then
+                if P.phase ~= "blocked" then blocked("у предыдущей копии оставался запрос яйца; нужен свежий вход") end
+                return
+            end
+            if P.pending then
+                if confirmed(rebirths, coins) then return end
+                if P.phase ~= "uncertain" and P.activeClock - P.pending.sentAt >= REPLY_TIMEOUT then
+                    uncertain("ребёрт не подтвердился по Statistics.Rebirths")
+                end
+                return
+            end
+            if P.phase == "blocked" or P.phase == "uncertain" or P.phase == "hatch_uncertain" then return end
+            if not data or rebirths == nil or coins == nil then
+                P.goodWindows = 0
+                P.sampleCoins, P.sampleAt = nil, nil
+                P.note = "ожидаю корректные Currencies.Coins и Statistics.Rebirths"
+                return
+            end
+            if P.rebirthLocked then
+                if P.lockedRebirths == nil then P.lockedRebirths = rebirths end
+                if rebirths ~= P.lockedRebirths then
+                    blocked("счётчик ребёртов изменился после остановки; возможен внешний авто-ребёрт")
+                    return
+                end
+            end
+            if P.upgradeUncertain then
+                blocked("ответ на покупку улучшения не подтверждён; новые яйца и ребёрты на паузе")
+                return
+            end
+            if P.skillUncertain then
+                blocked("ответ на покупку навыка не подтверждён; новые яйца и ребёрты на паузе")
+                return
+            end
+            -- Во время ПРОКАЧКИ доступность яйца не нужна: это не должно останавливать ребёрты.
+            -- Яйцо проверяется только после достаточного дохода и постоянной блокировки ребёртов.
+            local targetState = nil
+            if P.rebirthLocked and (P.phase == "save" or P.phase == "hatch" or P.phase == "target_wait") then
+                local okTarget
+                if P.serverDeniedUntil and os.clock() < P.serverDeniedUntil then
+                    okTarget = false
+                    targetState = "отказ сервера " .. tostring(P.serverDeniedReason or "неизвестен") .. "; жду повтор"
+                else
+                    P.serverDeniedUntil, P.serverDeniedReason = nil, nil
+                    okTarget, targetState = findTarget(data)
+                end
+                if not okTarget or targetState ~= "ready" then
+                    P.goodWindows = 0
+                    P.sampleCoins, P.sampleAt = nil, nil
+                    P.holdHatch = true
+                    P.holdUpgrades, P.holdSkillTree = true, true -- после перехода покупки не возобновляются
+                    local reason = targetState == "no_position" and "ожидаю модель и координаты 30M" or tostring(targetState)
+                    local note = "30M не подтверждено: " .. reason
+                    if P.phase ~= "target_wait" then
+                        phase("target_wait", note)
+                        log(P.note .. "; другое яйцо не выбираю, ребёрты уже остановлены")
+                    elseif P.note ~= note then
+                        P.note = note
+                        log(P.note .. "; ребёрты остаются остановлены")
+                    end
+                    return
+                elseif P.phase == "target_wait" then
+                    beginSettle("30M найдено; ещё раз проверяю доход")
+                    return
+                end
+            end
+
+            if P.phase == "check" then
+                beginUpgradeWindow("яйца остановлены; включены улучшения и дерево навыков за гемы")
+                return
+            end
+            if P.phase == "settle" then
+                if P.hatchUncertain or P.upgradeUncertain then
+                    blocked("есть неподтверждённый запрос яйца или апгрейда")
+                    return
+                end
+                if Ui.hatchInFlight or Ui.hatchMoving or Ui.travelling or P.upgradeInFlight or P.skillInFlight
+                    or P.clickerRefreshPending or P.locating then return end
+                local opt = Ui.Options and Ui.Options.EquipMode
+                if not opt or opt.Value ~= "Luck" then
+                    local ok, set = pcall(setMode, "Luck")
+                    if not ok or not set then blocked("режим команды Luck недоступен"); return end
+                    P.phaseAt = P.activeClock
+                    return
+                end
+                if not modeRequestSeen("Luck") then
+                    P.modeReadySince = nil
+                    P.note = "жду отправку команды Luck перед замером"
+                    return
+                end
+                P.modeReadySince = P.modeReadySince or P.activeClock
+                if P.activeClock - P.modeReadySince < START_SETTLE then return end
+                P.sampleCoins, P.sampleAt, P.goodWindows = coins, P.activeClock, 0
+                phase("measure", "измеряю доход без расходов и яиц")
+                return
+            end
+            if P.phase == "measure" then
+                local opt = Ui.Options and Ui.Options.EquipMode
+                if not opt or opt.Value ~= "Luck" or not modeRequestSeen("Luck")
+                    or Ui.hatchInFlight or Ui.travelling or P.upgradeInFlight or P.skillInFlight or P.clickerRefreshPending then
+                    beginSettle("условия замера изменились — начинаю заново")
+                    return
+                end
+                if not P.sampleAt or P.sampleCoins == nil then
+                    P.sampleCoins, P.sampleAt, P.goodWindows = coins, P.activeClock, 0
+                    return
+                end
+                local seconds = P.activeClock - P.sampleAt
+                if seconds < WINDOW then return end
+                local change = coins - P.sampleCoins
+                local precision = math.max(coins, P.sampleCoins) * 1e-15 / seconds
+                local rate = change / seconds
+                P.sampleCoins, P.sampleAt = coins, P.activeClock
+                if change < -precision * seconds then
+                    blocked("во время замера баланс уменьшился: возможно, другой скрипт расходует монеты")
+                    return
+                end
+                P.income = math.max(0, rate - precision)
+                if P.income >= REQUIRED_INCOME then
+                    P.goodWindows += 1
+                    P.note = string.format("доход подтверждается: %d/%d окон", P.goodWindows, REQUIRED_WINDOWS)
+                    if P.goodWindows >= REQUIRED_WINDOWS then
+                        if P.rebirthLocked then
+                            phase("save", "ребёрты уже запрещены; коплю резерв")
+                        elseif not lockRebirth(rebirths) then
+                            return
+                        end
+                        P.saveSampleCoins, P.saveSampleAt = coins, P.activeClock
+                    end
+                elseif precision >= REQUIRED_INCOME * 0.05 then
+                    blocked("баланс слишком велик для точного замера прироста числом клиента")
+                elseif P.rebirthLocked then
+                    phase("locked_wait", "доход упал; коплю без новых ребёртов")
+                else
+                    beginUpgradeWindow("доход ниже порога; возвращаю быстрые ребёрты")
+                end
+                return
+            end
+            if P.phase == "rebirth" then
+                if P.farmThresholdReached then
+                    P.holdUpgrades, P.holdSkillTree = true, true
+                    if P.upgradeInFlight or P.skillInFlight or P.clickerRefreshPending
+                        or Ui.hatchInFlight or Ui.hatchMoving or Ui.travelling or P.locating then return end
+                    -- Положительные дельты между быстрыми сбросами могут быть искажены.
+                    -- Постоянный запрет ставим только после трёх прямых окон без ребёртов
+                    -- в фазах settle/measure; при недостаточном доходе прокачка возобновится.
+                    beginSettle("проверяю доход Luck без ребёртов и расходов перед постоянным запретом")
+                    return
+                end
+                if P.remoteError then blocked("RebirthRequested не найден: " .. tostring(P.remoteError)); return end
+                if not P.remote then return end
+                -- Между отправками и при нехватке монет гемовые улучшения могут покупаться.
+                if os.clock() < (P.nextSendAt or 0) then
+                    P.holdUpgrades, P.holdSkillTree = false, false
+                    if P.activeClock >= (P.nextClickerRefresh or 0) then
+                        P.nextClickerRefresh = P.activeClock + CLICKER_REFRESH_SECONDS
+                        refreshNativeClicker()
+                    end
+                    return
+                end
+                local index, amount, price, why = tap.progressPack(data, math.huge)
+                if not index then
+                    P.holdUpgrades, P.holdSkillTree = false, false
+                    if why ~= "unaffordable" then blocked("цена ребёрта недоступна: " .. tostring(why)); return end
+                    if P.activeClock >= (P.nextClickerRefresh or 0) then
+                        P.nextClickerRefresh = P.activeClock + CLICKER_REFRESH_SECONDS
+                        refreshNativeClicker()
+                    end
+                    return
+                end
+                -- Как только ребёрт доступен, перестаём запускать покупки и дожидаемся только
+                -- уже отправленных запросов; 6/30-секундных окон перед ребёртом больше нет.
+                P.holdUpgrades, P.holdSkillTree = true, true
+                -- Включение штатного автокликера не покупка и не меняет цену пакета;
+                -- долгий поиск его remote не должен задерживать доступный ребёрт.
+                if P.upgradeInFlight or P.skillInFlight or not canRebirth() then return end
+                local autoFlag = tap.hasAutoRebirth(data)
+                local _, currentRebirths, currentCoins = readValues()
+                if not canRebirth() or currentRebirths ~= rebirths or not currentCoins or currentCoins < price then return end
+                if rebirths > MAX_SAFE_INTEGER then blocked("счётчик ребёртов слишком велик для точного подтверждения"); return end
+                local prepared = { before = rebirths, coins = currentCoins, sentAt = P.activeClock,
+                    index = index, amount = amount, price = price }
+                P.pending = prepared
+                -- До FireServer сохраняем ожидание на диск: после перезапуска не повторяем неизвестный запрос.
+                local persisted, persistErr = writePending(rebirths)
+                if not persisted then
+                    P.pending = nil -- запрос ещё не отправлялся
+                    blocked("не удалось сохранить запрос ребёрта: " .. tostring(persistErr))
+                    return
+                end
+                -- Запись могла уступить поток: Stop, цена и максимальный доступный пакет проверяются снова.
+                local fresh, freshRb, freshCoins = readValues()
+                local i2, a2, p2 = tap.progressPack(fresh, math.huge)
+                local _, lastRb, lastCoins = readValues()
+                if not canRebirth(prepared) or freshRb ~= rebirths or lastRb ~= rebirths
+                    or i2 ~= index or a2 ~= amount or p2 ~= price
+                    or not freshCoins or not lastCoins or lastCoins < price then
+                    local cleared, clearErr = clearPending() -- точно знаем, что запрос НЕ отправлен
+                    if cleared then P.pending = nil else uncertain("не удалось отменить подготовленный запрос: " .. tostring(clearErr)) end
+                    return
+                end
+                prepared.coins = lastCoins
+                prepared.sentAt = P.activeClock
+                local payload = autoFlag and { Auto = true, Index = index } or { Index = index }
+                local ok, err = pcall(function()
+                    Env.elevate()
+                    -- Считаем интервал ОТ ОТПРАВКИ. Не сокращаем его даже после ошибки FireServer.
+                    local attempted = os.clock()
+                    P.nextSendAt = attempted + REBIRTH_GAP
+                    lastSends[userKey] = attempted
+                    P.remote:FireServer(payload)
+                end)
+                if not ok then uncertain("ошибка отправки ребёрта: " .. tostring(err)) end
+                return
+            end
+            if P.phase == "storage_wait" then
+                P.holdUpgrades, P.holdSkillTree = true, true -- ждем места без новых покупок
+                local pets = type(data.Pets) == "table" and data.Pets or nil
+                local owned = pets and type(pets.Owned) == "table" and pets.Owned or nil
+                local limit = pets and number(pets.StorageLimit) or nil
+                if owned and limit then
+                    local count = 0
+                    for _ in pairs(owned) do count += 1 end
+                    if limit - count >= (P.storageNeeded or 3) then
+                        P.storageNeeded = nil
+                        beginSettle("в рюкзаке появились места; снова проверяю доход")
+                    end
+                end
+                return
+            end
+            if P.phase == "locked_wait" then
+                P.holdUpgrades, P.holdSkillTree = true, true
+                if P.activeClock - P.phaseAt >= RECHECK_SECONDS then
+                    beginSettle("повторно измеряю доход; ребёрты остаются выключены")
+                end
+                return
+            end
+            if P.phase == "save" then
+                if not P.rebirthLocked then blocked("нет защиты от ребёртов в фазе накопления"); return end
+                local opt = Ui.Options and Ui.Options.EquipMode
+                if not opt or opt.Value ~= "Luck" or not modeRequestSeen("Luck") then
+                    beginSettle("режим команды изменился; перепроверяю доход")
+                    return
+                end
+                if targetState == "no_position" or P.locating or Ui.travelling then
+                    P.note = "ищу позицию 30M у Spawn; ребёрты выключены"
+                    return
+                end
+                if P.saveSampleCoins == nil or P.saveSampleAt == nil then
+                    P.saveSampleCoins, P.saveSampleAt = coins, P.activeClock
+                    return
+                end
+                local dt = P.activeClock - P.saveSampleAt
+                if dt < WINDOW then return end
+                local change = coins - P.saveSampleCoins
+                local precision = math.max(coins, P.saveSampleCoins) * 1e-15 / dt
+                local rate = change / dt
+                P.saveSampleCoins, P.saveSampleAt = coins, P.activeClock
+                if change < -precision * dt then
+                    blocked("монеты уменьшились во время накопления без яиц")
+                    return
+                end
+                P.income = math.max(0, rate - precision)
+                if P.income < REQUIRED_INCOME then
+                    phase("locked_wait", "доход упал после замера; ребёрты не возвращаю")
+                    return
+                end
+                if coins >= BATCH_PRICE * RESERVE_BATCHES then
+                    P.holdHatch = false
+                    P.holdUpgrades, P.holdSkillTree = true, true
+                    phase("hatch", "30M x3, ребёрты и покупки улучшений отключены")
+                    P.hatchSampleCoins, P.hatchSampleAt = coins, P.activeClock
+                    P.hatchSampleBatches, P.badHatchWindows = P.confirmedBatches or 0, 0
+                    log("старт 30M x3: доход подтверждён, запас >= 3 партий; запросы не чаще одного за 2 с")
+                else
+                    P.note = "коплю резерв: " .. tostring(math.floor(coins)) .. " / " .. tostring(BATCH_PRICE * RESERVE_BATCHES)
+                end
+                return
+            end
+            if P.phase == "hatch" then
+                if not P.rebirthLocked then blocked("ошибка защиты фазы яиц"); return end
+                local opt = Ui.Options and Ui.Options.EquipMode
+                if not opt or opt.Value ~= "Luck" or not modeRequestSeen("Luck") then
+                    beginSettle("режим команды изменился во время яиц; перепроверяю доход")
+                    return
+                end
+                if coins < BATCH_PRICE and not Ui.hatchInFlight then
+                    P.holdHatch = true
+                    phase("locked_wait", "запас закончился; снова измеряю доход")
+                    log("монет меньше одной тройной партии; ребёрты остаются выключены")
+                    return
+                end
+                local dt = P.activeClock - (P.hatchSampleAt or P.activeClock)
+                if dt >= HATCH_OBSERVE_WINDOW and not Ui.hatchInFlight then
+                    local count = (P.confirmedBatches or 0) - (P.hatchSampleBatches or 0)
+                    if count > 0 and P.hatchSampleCoins ~= nil then
+                        -- Цена и число роллов проверены на каждом запросе. Это оценка дохода
+                        -- по изменению кошелька и успешным партиям, а не отдельная метрика сервера.
+                        local spend = count * BATCH_PRICE
+                        local net = coins - P.hatchSampleCoins
+                        P.income = math.max(0, (net + spend) / dt)
+                        if net < spend * 0.05 then P.badHatchWindows = (P.badHatchWindows or 0) + 1
+                        else P.badHatchWindows = 0 end
+                        if P.badHatchWindows >= 2 then
+                            P.holdHatch = true
+                            phase("locked_wait", "баланс не покрывает текущий темп; перепроверяю доход")
+                            log("доход во время яиц просел; временно коплю без ребёртов")
+                            return
+                        end
+                    end
+                    P.hatchSampleCoins, P.hatchSampleAt = coins, P.activeClock
+                    P.hatchSampleBatches = P.confirmedBatches or 0
+                end
+                return
+            end
+        end
+
+        local function guardedStep()
+            local ok, err = pcall(step)
+            if ok then return end
+            if P.pending then
+                uncertain("ошибка при ожидающем ребёрте: " .. tostring(err))
+            else
+                P.holdHatch, P.holdUpgrades, P.holdSkillTree = true, true, true
+                phase("blocked", "ошибка контроллера: " .. tostring(err))
+                log(P.note .. "; яйца и ребёрты не запускаю")
+            end
+        end
+
+        genv.ts30TestState = function()
+            local _, rb, coins = readValues()
+            status(rb, coins)
+            return P.phase
+        end
+        genv.ts30TestStop = function()
+            P.stopRequested = true
+            P.holdTap, P.holdHatch = true, true
+            Ui.stopAll()
+            stopNativeClicker()
+            print("[TAPSIM] 30M TEST | остановлено; уже отправленный запрос отменить нельзя")
+        end
+        Life.onCleanup(function()
+            genv.ts30TestState = nil
+            genv.ts30TestStop = nil
+        end)
+        log("тест v5: фарм и улучшения за гемы; максимальный доступный ребёрт сразу, не чаще одного запроса за 5 секунд")
+        log("доход между ребёртами оценивается предварительно по приростам кошелька и может быть искажён")
+        log("перед фазой яиц три окна проверяют прирост без ребёртов; при недостаточном доходе прокачка возобновится")
+        log("целевой проверяемый доход с запасом 20%: " .. tostring(REQUIRED_INCOME)
+            .. " монет/с; лимит 1 запрос/2 с установлен тестом, НЕ измерен на сервере")
+        log("после порога покупки и ребёрты этого скрипта отключены; рыбалка, приманки, зелья и чары не запускаются")
+        log("выключи игровой авто-ребёрт и не запускай другие фермы: внешние ребёрты этим скриптом не контролируются")
+        log("после порога включится исходная чистка: не-секреты вне команды, включая Godly; с них снимается лок")
+        log("ребёрт может сбросить баланс; крафт петов выключен, прежнее автоудаление игры может сохраняться")
+        if not hatchApiReady then log("модуль яйца 30M не загрузился: прокачка продолжится, перед яйцами будет ожидание") end
+        Life.loop("progress:test", 0.1, guardedStep)
+        return P
+    end
+    return { start = start }
+end
+
 -- ===== патч: панель + логи в консоль и на сервер + разгрузка + вебхук =====
 -- ============================================================================
 -- TAPSIM OPEN · панель в старом дизайне (только статистика) + вебхук на петов
@@ -25720,7 +27360,7 @@ do
 	local NOTIFY_POWER_PETS = true
 	local FULLSCREEN = false -- false = маленькая плашка в углу; полноэкранная чёрная панель
 -- перекрывала весь экран и, главное, съедала нажатия мыши (у Frame был Active = true)
-	local HATCH_DELETE_ABOVE = 50 -- % : удаляем при вылупе только самое частое (>=50%), остальное идёт в крафт
+	local HATCH_DELETE_ABOVE = 0 -- тест не меняет автоудалёнт игры; прежние серверные настройки могут действовать
 	local CRAFT_MIN_CHANCE = 50 -- % : в машины попадают только петы с шансом выпадения не ниже этого
 
 	-- ==== логи на свой сервер ================================================
@@ -25767,10 +27407,8 @@ do
 
 	-- ========================================================================
 
-	-- 1) ФЕРМА ЯИЦ: включаем только то, что нужно яйцам, всё остальное глушим.
-	-- Приоритет времени — яйцам, поэтому из крафта остаются только золото и алмазы,
-	-- а всё, что уводит персонажа с яйца (рыбалка, подземелья, боссы, ивенты, шахта,
-	-- шары, пчёлы, зелья, квесты, колесо, ребёрс, тотемы и т.д.), выключено.
+	-- 1) Фарм, контролируемые ребёрты и покупки улучшений за гемы; затем яйца 30M.
+	-- Без рыбалки, зелий, зачарования, крафта и трейда; после порога исходная чистка петов.
 	local FARM_ON = {
 		-- яйца
 		AutoHatch = true,
@@ -25778,18 +27416,21 @@ do
 		-- команда: лучшие петы по удаче
 		AutoEquipBest = true,
 		-- крафт: золотые и алмазные (радугу не делаем — она отнимает время у яиц)
-		AutoCraft = true,
+		AutoCraft = false, -- ТЕСТ: автокрафт выключен, чтобы не расходовать петов
 		CraftKeepEquipped = true,
 		CraftKeepMutated = true,
-		CraftReturn = true,
+		CraftReturn = false, -- крафт и связанные поездки запрещены
 		-- клики (гемы и монеты, персонажа никуда не уводят)
 		AutoTap = true,
 		AutoClicker = true,
 		-- мелочь, которая не мешает: награда за вход, анти-афк, апгрейды
 		-- (их всего шесть, и среди них HatchSpeed, FreeAutoClicker и Teleport)
-		AutoClaimOffline = true,
+		AutoClaimOffline = false, -- разовые монеты не должны исказить измерение
 		AntiAfk = true,
-		AutoUpgrade = true,
+		AutoUpgrade = true, -- только улучшения, для которых конфиг подтверждает Gems
+		AutoSkillTree = true, -- дерево навыков за гемы
+		AutoBrew = false, AutoDrink = false, AutoCraftPotions = false,
+		AutoEnchant = false, AutoFish = false, FishBuyBait = false, FishStockUp = false,
 		-- производительность: чем меньше рисуем, тем больше яиц успеваем открыть
 		PerfMode = true,
 		PerfGameSettings = true,
@@ -25797,11 +27438,9 @@ do
 		PerfNoRender = true,
 		-- свой вебхук об отключении оставляем
 		WebhookDisconnect = true,
-		-- ВАЖНО: профиль глушит ВСЁ, чего нет в этом списке, а ниже он пробегает по всем
-		-- тумблерам. Без этих двух строк модуль «Hold to Reveal» и модуль трейда оставались
-		-- выключенными и молчали: карточка на экране, а зажатия нет; трейд от банка игнорится.
-		AutoReveal = true,   -- «Hold to Reveal»: зажать, дождаться заполнения, отпустить
-		Handover = true,     -- приём трейда от банка и передача Secret
+		-- Раскрытие карточки относится к открытию яйца; модуль трейда не загружается.
+		AutoReveal = true,   -- только карточка уже открытого яйца
+		Handover = false,    -- сделки в этом тесте не выполняются
 	}
 	local allCount = 0
 	for name, toggle in pairs(Ui.Library.Toggles) do
@@ -25823,38 +27462,35 @@ do
 		table.sort(onNames)
 		logEvent("farm", string.format("включено %d из %d: %s", #onNames, allCount, table.concat(onNames, ", ")))
 	end
-	-- Яйцо: всегда самое дорогое, которое можем себе позволить.
-	pcall(function()
-		local hatch = Ui.Options and Ui.Options.HatchMode
-		local values = hatch and hatch.Values
-		if type(values) == "table" and type(values[1]) == "string" and hatch.Value ~= values[1] then
-			hatch:SetValue(values[1])
-		end
-		logEvent("farm", "режим яйца: " .. tostring(hatch and hatch.Value))
-	end)
-	-- Апгрейды: покупаем все шесть, ничего не вычёркиваем.
+	-- Поверх сохранённого конфига явно включаем раскрытие уже появившихся карточек.
+	pcall(Ui.set, "AutoReveal", true)
+	if Ui.on("AutoReveal") then logEvent("hold", "Hold to Reveal включён")
+	else logEvent("warn", "Hold to Reveal не включился: модуль или тумблер не загрузился") end
+	logEvent("farm", "цель: только 30M x3; доступность яйца не блокирует ребёрты")
 	pcall(function()
 		local picks = Ui.Options and Ui.Options.UpgradePicks
 		local values = picks and picks.Values
-		if type(values) == "table" and #values > 0 then
-			picks:SetValue(values)
-			logEvent("farm", "апгрейды: " .. table.concat(values, ", "))
-		end
+		if type(values) == "table" and #values > 0 then picks:SetValue(values) end
+		local count = 0
+		for _, active in pairs(picks and picks.Value or {}) do if active == true then count += 1 end end
+		logEvent("farm", "выбрано игровых улучшений: " .. tostring(count))
 	end)
-	-- Крафт: только золотые и алмазные, радугу не собираем.
+	logEvent("farm", "прокачка: фарм, ребёрты, дерево навыков и разрешённые улучшения")
+	logEvent("farm", "рыбалка, приманки, зелья, зачарования, крафт и трейд выключены; после порога работает исходная чистка")
+	-- Переключение команды учитывается до замера; опрашиваем её раз в 2 секунды.
 	pcall(function()
-		local machines = Ui.Options and Ui.Options.CraftMachines
-		if machines then
-			machines:SetValue({ "Golden", "Diamond" })
-			local picked = {}
-			for name, active in pairs(machines.Value or {}) do
-				if active == true then
-					picked[#picked + 1] = tostring(name)
-				end
-			end
-			logEvent("farm", "крафт: " .. table.concat(picked, ", "))
-		end
+		local slider = Ui.Options and Ui.Options.EquipEvery
+		if slider and slider.Value ~= 2 then slider:SetValue(2) end
 	end)
+	-- Контроллер 30M: исходный GitHub не меняется.
+	local okProgress, progressError = pcall(function()
+		use("features/progress_test").start(logEvent)
+	end)
+	if not okProgress then
+		local state = Ui.__progressTest
+		if state then state.holdHatch = true; state.holdUpgrades = true; state.phase = "blocked" end
+		logEvent("warn", "[30M TEST] контроллер не загрузился; яйца и ребёрты остановлены: " .. tostring(progressError))
+	end
 
 	-- 1.5) КОМАНДА: лучшие петы по удаче.
 	-- У кнопки "Equip Best" в игре есть режим: удача / клики / гемы. Он лежит в настройках
@@ -25881,6 +27517,17 @@ do
 	end
 
 	local function applyEquipMode()
+		local option = Ui.Options and Ui.Options.EquipMode
+		local desired = option and option.Value or "Luck"
+		if desired ~= "Luck" and desired ~= "Clicks" and desired ~= "Gems" then desired = "Luck" end
+		if Ui.__progressTest then
+			-- Mode уже идёт прямо в EquipBest. Не угадываем и не перезаписываем игровые Settings.
+			EQUIP.mode = desired; EQUIP.ok = true; EQUIP.note = "режим в запросе EquipBest"
+			return true
+		end
+		if EQUIP.mode ~= desired then EQUIP.mode = desired; EQUIP.ok = false end
+		if (Env.genv and Env.genv.__handoverPaused)
+			or (Ui.__progressTest and Ui.__progressTest.stopRequested) then return false end
 		local settings = settingsOf()
 		if not settings then
 			EQUIP.note = "настройки игрока ещё не пришли"
@@ -25921,14 +27568,15 @@ do
 		end
 		EQUIP.name = found
 		local current = settings[found]
-		if tostring(current) == EQUIP.mode then
+		local modeNumber = ({ Clicks = 1, Gems = 2, Luck = 3 })[EQUIP.mode]
+		if tostring(current) == EQUIP.mode or (type(current) == "number" and current == modeNumber) then
 			EQUIP.ok = true
 			EQUIP.note = string.format("%s = %s", found, EQUIP.mode)
 			return true
 		end
 		local value = EQUIP.mode
 		if type(current) == "number" then
-			value = 3 -- PetAffinity.Values: 1 клики, 2 гемы, 3 удача
+			value = modeNumber -- PetAffinity.Values: 1 клики, 2 гемы, 3 удача
 		end
 		local ok, result = Env.invoke("SettingsService", "UpdateSetting", { Name = found, Value = value })
 		EQUIP.note = string.format("%s -> %s (%s)", found, tostring(value),
@@ -25988,30 +27636,46 @@ do
 		return limit
 	end
 
-	-- EquipBest с полем Mode и проверкой результата: без Mode сервер запрос молча глотает,
-	-- поэтому пробуем режимы по очереди и смотрим, выросла ли команда.
-	local function equipBestVerified(tag)
-		applyEquipMode()
-		pcall(function()
-			Ui.set("AutoEquipBest", true)
+	local function testCanEquip()
+		return Life.alive and Ui.on("AutoEquipBest")
+			and not (Env.genv and Env.genv.__handoverPaused)
+			and not (Ui.__progressTest and (Ui.__progressTest.stopRequested or Ui.__progressTest.cleaning))
+	end
+	local function testSendEquip(mode)
+		if not testCanEquip() then return false end
+		local ok, remote = pcall(Env.remote, "PetService", "PetActionRequested")
+		if not ok or not testCanEquip() then return false end
+		-- Не отправляем старый режим, если контроллер переключил команду во время lookup.
+		if Ui.__progressTest and preferredEquipMode() ~= mode then return false end
+		return pcall(function()
+			Env.elevate()
+			remote:FireServer({ Action = "EquipBest", Mode = mode })
 		end)
+	end
+	-- После любого ожидания заново проверяем Stop all и трейд; не включаем тумблер сами.
+	local function equipBestVerified(tag)
+		if not testCanEquip() then return false end
+		applyEquipMode()
+		if not testCanEquip() then return false end
 		local limit = equipLimit()
 		local before = teamCount()
 		if limit and before >= limit then
 			-- команда полная: одного запроса в рабочем режиме достаточно, чтобы обновить состав
-			pcall(Env.fire, "PetService", "PetActionRequested", { Action = "EquipBest", Mode = preferredEquipMode() })
+			testSendEquip(preferredEquipMode())
 			return true
 		end
 		local wanted = preferredEquipMode()
 		local order = { wanted }
-		for _, mode in ipairs(EQUIP_MODES) do
-			if mode ~= wanted then
-				order[#order + 1] = mode
+		if not Ui.__progressTest then
+			for _, mode in ipairs(EQUIP_MODES) do
+				if mode ~= wanted then order[#order + 1] = mode end
 			end
 		end
 		for _, mode in ipairs(order) do
-			pcall(Env.fire, "PetService", "PetActionRequested", { Action = "EquipBest", Mode = mode })
+			if not testCanEquip() then return false end
+			testSendEquip(mode)
 			task.wait(2)
+			if not testCanEquip() then return false end
 			local now = teamCount()
 			if now > before then
 				logEvent("equip", string.format("%sEquipBest Mode=%s: команда %d -> %d%s",
@@ -26036,10 +27700,10 @@ do
 	pcall(equipBestNow)
 	Life.loop("equip:mode", 120, function()
 		-- идёт сделка: не переэкипировываем, иначе петы вернутся в команду и уйдут из оффера
-		if Env.genv and Env.genv.__handoverPaused then
+		if not testCanEquip() then
 			return
 		end
-		-- режим удачи: если настройка нашлась — ставим и проверяем
+		-- Ставим режим, выбранный текущей фазой, если настройка нашлась.
 		pcall(function()
 			if not EQUIP.ok then
 				applyEquipMode()
@@ -26121,6 +27785,7 @@ do
 	end
 
 	local function applyCraftFilter()
+		if Ui.__progressTest then return end -- крафт в тесте отключён; старые настройки не меняем
 		local allowed = buildCraftWhitelist()
 		if next(allowed) == nil then
 			return
@@ -26656,7 +28321,7 @@ do
 	-- Godly тоже удаляем; если годли (или любой не-секрет) залочен — сначала снимаем лок,
 	-- иначе сервер удаление не принимает.
 	local CLEAN = {
-		enabled = true,
+		enabled = true, -- исходная чистка, в этой копии только после перехода к яйцам
 		startAt = 0.90,     -- с какой доли хранилища начинаем чистку
 		targetAt = 0.80,    -- до какой доли чистим за один заход
 		batch = 50,         -- сколько id в одном запросе
@@ -26816,36 +28481,97 @@ do
 	-- Правило: остаются ТОЛЬКО секреты (Secret I/II/III) и петы из команды.
 	-- Godly удаляем; лок ничего не защищает — с не-секретов он снимается перед удалением.
 	local function keepReason(pet, aliases, team)
-		if type(pet) ~= "table" then
-			return "нет записи"
+		if type(pet) ~= "table" or type(pet.Rarity) ~= "string" or pet.Rarity == "" then
+			return "нет записи" -- неизвестная редкость не доказывает, что это не секрет
 		end
 		if isSecret(pet) then
 			return "секрет"
-		end
-		if isGodly(pet) then
-			return "годли" -- удаляем, но считаем отдельно в логе
 		end
 		if pet.Equip == true or pet.Equipped == true or pet.IsEquipped == true then
 			return "в команде"
 		end
 		for _, id in ipairs(aliases) do
-			if team[id] then
-				return "в команде"
-			end
+			if team[id] then return "в команде" end
 		end
+		if isGodly(pet) then return "годли" end -- Godly ВНЕ команды удаляются, как в исходнике
 		return nil
 	end
 
+	-- Не достаточно распознать хотя бы одного пета: все идентификаторы Equipped должны
+	-- однозначно совпасть с Owned, включая секретов. При неполной реплике чистка ждёт.
+	local function cleanTeamVerified(data, owned)
+		local pets = type(data) == "table" and data.Pets or nil
+		local equipped = type(pets) == "table" and pets.Equipped or nil
+		if type(equipped) ~= "table" or type(owned) ~= "table" then return false end
+		local aliases, primary, entry = {}, {}, 0
+		local function scalar(value)
+			return (type(value) == "string" or type(value) == "number") and tostring(value) ~= ""
+		end
+		local function mark(value, token)
+			if not scalar(value) then return end
+			local id = tostring(value)
+			if aliases[id] ~= nil and aliases[id] ~= token then aliases[id] = false
+			elseif aliases[id] == nil then aliases[id] = token end
+		end
+		for key, pet in pairs(owned) do
+			if type(pet) == "table" then
+				entry += 1
+				local id = pet.Id or key
+				if not scalar(id) or primary[tostring(id)] then return false end
+				primary[tostring(id)] = true
+				mark(key, entry); mark(pet.Id, entry); mark(pet.PetId, entry); mark(pet.PetID, entry)
+			end
+		end
+		local active, selected = 0, {}
+		for key, value in pairs(equipped) do
+			if value ~= false and value ~= nil then
+				local id
+				if type(value) == "table" then
+					id = value.Id or value.PetId or value.PetID
+					if id == nil and type(key) == "string" then id = key end
+				elseif value == true then
+					id = key
+				elseif scalar(value) then
+					id = value
+				end
+				if not scalar(id) then return false end
+				local token = aliases[tostring(id)]
+				if not token or selected[token] then return false end
+				selected[token] = true
+				active += 1
+			end
+		end
+		return active > 0
+	end
+
 	-- Лок снимаем ОДИН раз на пет: ToggleLock — переключатель, второй вызов залочит обратно.
-	local CLEAN_UNLOCKED = {}
+	local cleanCacheKey = "__ts30CleanUnlocksV4_" .. tostring(Env.LocalPlayer and Env.LocalPlayer.UserId or "unknown")
+	local CLEAN_UNLOCKED = type(Env.genv) == "table" and Env.genv[cleanCacheKey] or nil
+	if type(CLEAN_UNLOCKED) ~= "table" then
+		CLEAN_UNLOCKED = {}
+		if type(Env.genv) == "table" then Env.genv[cleanCacheKey] = CLEAN_UNLOCKED end
+	end
+	local function cleanAllowed()
+		local P = Ui.__progressTest
+		local phase = P and P.phase
+		local lockedPhase = phase == "save" or phase == "hatch" or phase == "storage_wait"
+			or phase == "target_wait" or phase == "locked_wait"
+		return Life.alive and P and P.rebirthLocked and P.cleaning and lockedPhase and not P.stopRequested
+			and not P.hatchUncertain and not (Env.genv and Env.genv.__handoverPaused)
+	end
 	local function unlockJunk(owned)
 		local ids = {}
 		local godly = 0
+		local data = Env.data()
+		local team = teamSet(data)
 		for key, pet in pairs(owned) do
-			if type(pet) == "table" and pet.Locked == true and not isSecret(pet) then
+			local aliases = { tostring(key), type(pet) == "table" and tostring(pet.Id or key) or tostring(key),
+				type(pet) == "table" and tostring(pet.PetId or key) or tostring(key),
+				type(pet) == "table" and tostring(pet.PetID or key) or tostring(key) }
+			local reason = keepReason(pet, aliases, team)
+			if type(pet) == "table" and pet.Locked == true and (reason == nil or reason == "годли") then
 				local id = tostring(pet.Id or key)
 				if not CLEAN_UNLOCKED[id] then
-					CLEAN_UNLOCKED[id] = true
 					ids[#ids + 1] = id
 					if isGodly(pet) then
 						godly += 1
@@ -26857,17 +28583,48 @@ do
 			return 0
 		end
 		local failed = 0
+		local uncertain, sentCount = 0, 0
 		for _, id in ipairs(ids) do
+			if not cleanAllowed() then break end
+			local attempted = false
 			local ok = pcall(function()
-				Env.fire("PetService", "PetActionRequested", { Action = "ToggleLock", PetId = id })
+				local remote = Env.remote("PetService", "PetActionRequested")
+				if not cleanAllowed() then error("cleaning stopped") end
+				local fresh = Env.data()
+				local pets = type(fresh) == "table" and fresh.Pets or nil
+				if type(pets) ~= "table" or not cleanTeamVerified(fresh, pets.Owned) then error("team unknown") end
+				local liveTeam = teamSet(fresh)
+				local allowed = false
+				for key, pet in pairs(pets.Owned) do
+					if type(pet) == "table" and tostring(pet.Id or key) == id and pet.Locked == true then
+						local reason = keepReason(pet, { tostring(key), tostring(pet.Id or key), tostring(pet.PetId or key), tostring(pet.PetID or key) }, liveTeam)
+						allowed = reason == nil or reason == "годли"
+						break
+					end
+				end
+				if not allowed or not cleanAllowed() then error("pet protected or cleaning stopped") end
+				local send = remote and remote.FireServer
+				if type(send) ~= "function" then error("remote unavailable before send") end
+				Env.elevate()
+				if not cleanAllowed() then error("cleaning stopped") end
+				-- Только сейчас отмечаем попытку: ошибку FireServer после вызова нельзя отличить
+				-- от отправленного переключателя, поэтому повторять её в этой сессии нельзя.
+				CLEAN_UNLOCKED[id] = true
+				attempted = true
+				send(remote, { Action = "ToggleLock", PetId = id })
 			end)
 			if not ok then
 				failed += 1
+				if attempted then uncertain += 1 end
+			else
+				sentCount += 1
 			end
+			if attempted and cleanAllowed() then Life.wait(0.1) end -- не шлём пачку локов в один кадр
 		end
-		logEvent("clean", string.format("снял лок с %d петов (из них годли %d)%s",
-			#ids - failed, godly, failed > 0 and (" — не ушло " .. failed) or ""))
-		return #ids - failed
+		if uncertain > 0 then logEvent("warn", "чистка: ответ на снятие лока неясен; повторять переключение не буду") end
+		logEvent("clean", string.format("запросы на снятие лока: %d; кандидатов Godly %d%s",
+			sentCount, godly, failed > 0 and (" — ошибок или пауз " .. failed) or ""))
+		return sentCount
 	end
 
 	-- порядок на удаление: слабейшие первыми
@@ -26878,9 +28635,9 @@ do
 			if type(pet) == "table" then
 				-- один пет может лежать и под ключом, и со своим Id — проверяем оба
 				local aliases = { tostring(key) }
-				if pet.Id ~= nil then
-					aliases[#aliases + 1] = tostring(pet.Id)
-				end
+				if pet.Id ~= nil then aliases[#aliases + 1] = tostring(pet.Id) end
+				if pet.PetId ~= nil then aliases[#aliases + 1] = tostring(pet.PetId) end
+				if pet.PetID ~= nil then aliases[#aliases + 1] = tostring(pet.PetID) end
 				entries[#entries + 1] = { id = tostring(pet.Id or key), aliases = aliases, pet = pet }
 			end
 		end
@@ -26894,6 +28651,9 @@ do
 		local plan = {}
 		local stats = { total = #entries, team = 0, secret = 0, godly = 0, bad = 0 }
 		for _, entry in ipairs(entries) do
+			local onTeam = entry.pet.Equip == true or entry.pet.Equipped == true or entry.pet.IsEquipped == true
+			for _, id in ipairs(entry.aliases) do if team[id] then onTeam = true end end
+			if onTeam then stats.team += 1 end -- в том числе секрет или пет без редкости
 			local reason = keepReason(entry.pet, entry.aliases, team)
 			if reason == "годли" then
 				stats.godly += 1
@@ -26901,7 +28661,7 @@ do
 			elseif reason == nil then
 				plan[#plan + 1] = entry.id
 			elseif reason == "в команде" then
-				stats.team += 1
+				-- Уже учтён в stats.team выше.
 			elseif reason == "секрет" then
 				stats.secret += 1
 			else
@@ -26919,14 +28679,24 @@ do
 			return false
 		end
 		local ok, err = pcall(function()
-			Env.fire("PetService", "PetActionRequested", {
-				PetIds = ids,
-				Action = "Delete",
-				Batch = 1,
-			})
+			local remote = Env.remote("PetService", "PetActionRequested")
+			if not cleanAllowed() then error("cleaning stopped") end
+			local data, owned = cleanPetData()
+			if not cleanTeamVerified(data, owned) then error("equipped pets not fully identified") end
+			local plan = buildCleanPlan(data, owned)
+			local allowed, unlocked = {}, {}
+			for _, id in ipairs(plan) do allowed[id] = true end
+			for key, pet in pairs(owned) do
+				if type(pet) == "table" and pet.Locked ~= true then unlocked[tostring(pet.Id or key)] = true end
+			end
+			local safe = {}
+			for _, id in ipairs(ids) do if allowed[id] and unlocked[id] then safe[#safe + 1] = id end end
+			if #safe == 0 or not cleanAllowed() then error("no verified unequipped pets to delete") end
+			Env.elevate()
+			remote:FireServer({ PetIds = safe, Action = "Delete", Batch = 1 })
 		end)
 		if not ok then
-			logEvent("warn", "чистка: запрос не ушёл — " .. tostring(err))
+			logEvent("warn", "чистка: ошибка или неподтверждённый запрос — " .. tostring(err))
 			return false
 		end
 		return true
@@ -26940,6 +28710,13 @@ do
 		end
 		return { data = data, owned = owned, count = count, limit = limit,
 			fill = limit > 0 and (count / limit) or 0 }
+	end
+
+	local function cleanTriggered(state)
+		if state.fill >= CLEAN.startAt then return true end
+		local P = Ui.__progressTest
+		local needed = math.max(3, tonumber(P and P.storageNeeded) or 3)
+		return P and P.phase == "storage_wait" and state.limit - state.count < needed
 	end
 
 	-- один заход: чистим до targetAt, но не больше rounds запросов
@@ -26959,11 +28736,15 @@ do
 			CLEAN.note = string.format("%d петов, лимит неизвестен", state.count)
 			return 0
 		end
-		if state.fill < CLEAN.startAt then
+		if not cleanTriggered(state) then
 			CLEAN.note = string.format("%d/%d — запас есть", state.count, state.limit)
 			return 0
 		end
 
+		-- Не удаляем ничего, пока каждый id команды однозначно не сопоставлен с Owned.
+		if not cleanTeamVerified(state.data, state.owned) then
+			CLEAN.note = "команда распознана не полностью — чистка на паузе"; logEvent("clean", CLEAN.note); return 0
+		end
 		CLEAN.running = true
 		-- Годли и прочий не-секрет под локом: снимаем лок, ждём, пока данные обновятся,
 		-- и только потом считаем план удаления.
@@ -26975,9 +28756,12 @@ do
 			end
 		end
 		local target = math.floor(state.limit * CLEAN.targetAt)
+		local P = Ui.__progressTest
+		local needed = math.max(3, tonumber(P and P.storageNeeded) or 3)
+		target = math.min(target, math.max(0, state.limit - needed))
 		local removedTotal = 0
 		local round = 0
-		while state.count > target and round < CLEAN.rounds and Life.alive do
+		while state.count > target and round < CLEAN.rounds and cleanAllowed() do
 			round += 1
 			local plan, stats = buildCleanPlan(state.data, state.owned)
 			if #plan == 0 then
@@ -27001,13 +28785,21 @@ do
 			end
 			-- берём ровно столько, сколько нужно до цели: лишнего не удаляем
 			local need = state.count - target
-			local take = math.min(#plan, CLEAN.batch, math.max(need, 1))
-			local batch = {}
-			for index = 1, take do
-				batch[#batch + 1] = plan[index]
+			local unlocked, batch = {}, {}
+			for key, pet in pairs(state.owned) do
+				if type(pet) == "table" and pet.Locked ~= true then unlocked[tostring(pet.Id or key)] = true end
+			end
+			for _, id in ipairs(plan) do
+				if unlocked[id] then batch[#batch + 1] = id end
+				if #batch >= math.min(CLEAN.batch, math.max(need, 1)) then break end
+			end
+			if #batch == 0 then
+				CLEAN.note = "нет подтверждённо разблокированных кандидатов — жду"
+				logEvent("clean", CLEAN.note)
+				break
 			end
 			if not deleteByIds(batch) then
-				CLEAN.note = "запрос на удаление не ушёл"
+				CLEAN.note = "ошибка или неподтверждённое удаление"
 				break
 			end
 			Life.wait(CLEAN.pause)
@@ -27019,8 +28811,8 @@ do
 			state = again
 			if gone <= 0 then
 				CLEAN.failures += 1
-				CLEAN.note = string.format("сервер не принял удаление (%d/%d)", state.count, state.limit)
-				logEvent("warn", "чистка: запрос ушёл, а петы не удалились — выключаюсь на этот заход")
+				CLEAN.note = string.format("удаление пока не видно (%d/%d)", state.count, state.limit)
+				logEvent("warn", "чистка: после запроса изменений пока не видно — жду следующего захода")
 				break
 			end
 			CLEAN.failures = 0
@@ -27036,16 +28828,65 @@ do
 		return removedTotal
 	end
 
-	-- проверка заполненности и чистка: раз в 20 секунд
-	Life.loop("pet:clean", 20, function()
-		if not CLEAN.enabled then
-			return
+	-- Запрос EquipBest не подтверждает применение сервером. Сравниваем две реплики команды;
+	-- при меняющемся или неполном составе не начинаем удаление в этом заходе.
+	local function cleanTeamSnapshot()
+		local data = Env.data()
+		local pets = type(data) == "table" and data.Pets or nil
+		if type(pets) ~= "table" or not cleanTeamVerified(data, pets.Owned) then return nil end
+		local team = teamSet(data)
+		local parts = {}
+		for id in pairs(team) do parts[#parts + 1] = "id:" .. id end
+		for key, pet in pairs(pets.Owned) do
+			if type(pet) == "table" and (pet.Equip == true or pet.Equipped == true or pet.IsEquipped == true) then
+				parts[#parts + 1] = "flag:" .. tostring(pet.Id or key)
+			end
 		end
-		-- во время сделки рюкзак не трогаем
-		if Env.genv and Env.genv.__handoverPaused then
-			return
-		end
-		cleanNow()
+		table.sort(parts)
+		return table.concat(parts, "\0")
+	end
+
+	-- Существующая чистка: после фиксации фазы яиц при >=90% или нехватке мест под тройку.
+	-- Краткая пауза нужна, чтобы не удалять пета в тот же момент, когда EquipBest ставит его в команду.
+	Life.loop("pet:clean", 10, function()
+		local P = Ui.__progressTest
+		local phase = P and P.phase
+		local lockedPhase = phase == "save" or phase == "hatch" or phase == "storage_wait"
+			or phase == "target_wait" or phase == "locked_wait"
+		if not CLEAN.enabled or not P or not P.rebirthLocked or not lockedPhase or P.stopRequested or P.cleaning
+			or P.hatchUncertain or Ui.hatchMoving or Ui.travelling
+			or (Env.genv and Env.genv.__handoverPaused) then return end
+		local state = fillState()
+		if not state or state.limit <= 0 or not cleanTriggered(state) then return end
+		P.cleaning = true
+		local ok, err = pcall(function()
+			local deadline = os.clock() + 15
+			while Ui.hatchInFlight and cleanAllowed() and os.clock() < deadline do Life.wait(0.2) end
+			if Ui.hatchInFlight or not cleanAllowed() then return end
+			local opt = Ui.Options and Ui.Options.EquipMode
+			if not opt or opt.Value ~= "Luck" or not Ui.on("AutoEquipBest") then return end
+			local remote = Env.remote("PetService", "PetActionRequested")
+			if not cleanAllowed() or opt.Value ~= "Luck" or not Ui.on("AutoEquipBest") then return end
+			Env.elevate()
+			remote:FireServer({ Action = "EquipBest", Mode = "Luck" })
+			P.lastEquipMode, P.lastEquipAt = "Luck", os.clock()
+			Life.wait(2) -- дать реплике обновить команду до старой чистки
+			if not cleanAllowed() then return end
+			local before = cleanTeamSnapshot()
+			if not before then
+				CLEAN.note = "команда распознана не полностью — чистка на паузе"
+				logEvent("clean", CLEAN.note); return
+			end
+			Life.wait(1)
+			if not cleanAllowed() then return end
+			if cleanTeamSnapshot() ~= before then
+				CLEAN.note = "команда меняется — чистка на паузе"; logEvent("clean", CLEAN.note); return
+			end
+			cleanNow()
+		end)
+		CLEAN.running = false
+		P.cleaning = false
+		if not ok then logEvent("warn", "чистка остановлена: " .. tostring(err)) end
 	end)
 
 	-- 7.6) Логи в консоль: строка раз в минуту, плюс важные события сразу
@@ -27106,7 +28947,7 @@ do
 		))
 	end)
 
-	print("[TAPSIM] сборка | чистка-13 (07.11): остаются только секреты и команда; годли удаляем, лок снимаем")
+	print("[TAPSIM] 30M TEST v5 | ребёрты не чаще 1/5 с, Hold включён; после порога 30M x3 и чистка")
 	print(string.format("[TAPSIM] старт | аккаунт %s | панель и логи включены",
 		Env.LocalPlayer and Env.LocalPlayer.Name or "?"))
 
@@ -27281,11 +29122,11 @@ do
 			for _ in pairs(craftableNames or {}) do
 				allowed += 1
 			end
-			craftRow.Text = string.format("🧪 Крафт: только шанс ≥%d%% (%d видов)", CRAFT_MIN_CHANCE, allowed)
+			craftRow.Text = "🧪 Автокрафт: выключен в тесте"
 		end
 		autoDeleteRow.Text = HATCH_DELETE_ABOVE > 0
 			and string.format("🗑 Автоудалёнт: обычные от %d%% шанса", HATCH_DELETE_ABOVE)
-			or "🗑 Автоудалёнт: выключен (как в игре)"
+			or "🗑 Автоудалёнт: настройки игры сохранены"
 		linkRow.Text = LOG.error and ("📡 Сервер: " .. LOG.error) or "📡 Сервер: ок"
 		linkRow.TextColor3 = LOG.error and Color3.fromRGB(235, 130, 100) or Color3.fromRGB(150, 200, 150)
 
