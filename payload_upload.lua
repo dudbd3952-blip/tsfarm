@@ -1,11 +1,10 @@
--- 30M v13: Clicks 300 млн/с -> только 30M/Luck; Luck 900 млн/с -> окончательно остановить ребёрты.
--- До подтверждённого дохода: доступные яйца до 20% текущего баланса на каждую партию,
--- крафт только по подтверждённой формуле 100%, гемовые покупки и максимальный доступный ребёрт (>=20 с между запросами).
--- До 30M команда Clicks и три прямых окна после её запроса; порог 300M/с, доход Luck может отличаться.
--- После 300 млн/с: 30M x3, Luck, без крафта и покупок; ребёрты продолжаются до подтверждённых 900 млн/с.
--- Hold to Reveal и исходная чистка включены; она может удалить Godly вне команды и снять лок с не-секретов.
--- Рыбалка, приманки, зелья, зачарования и трейд выключены. Старое серверное автоудаление может остаться.
--- При изменении счётчика ребёртов в прокачке: пересинхронизация и продолжение, без предположений об источнике.
+-- Прогрессия v14: Main → TimeRift → непрерывный Royal x3 по фактическим ответам.
+-- После 300 млн/с — Luck, ребёрты не чаще 120 с, чистый замер раз в 10 минут.
+-- Финал наступает только после устойчивых окон Royal x3; оба кликера остаются включены.
+-- В TimeRift используются RiftCoins, RiftGems и RiftRebirths, без фиксированной цены Royal.
+-- Неподтверждённые запросы не повторяются; GUI-адаптер мира не доказывает серверный протокол.
+-- Hold и чистка включены; чистка может удалить несекретных петов вне команды, включая Godly.
+-- Рыбалка, приманки, зелья, зачарования и трейд выключены.
 -- TapSim OPEN build 2026-11-05
 -- Содержит Slopix Hub (Tap Simulator) — MIT License, Copyright (c) 2026 TrustyCoding
 -- https://github.com/TrustyCoding/slopix-hub
@@ -38,6 +37,1585 @@ local function use(name)
     __cache[name] = result
     return result
 end
+__modules["features/world_data"] = function(use)
+-- No cached coordinate or remote call determines the world: only the live replica does.
+local Env = use("core/env")
+local W = {}
+local function finite(x)
+    local n = tonumber(x)
+    if not n or n ~= n or n == math.huge or n == -math.huge or n < 0 then return nil end
+    return n
+end
+local function norm(v) return type(v)=="string" and v:lower():gsub("[^%w]", "") or "" end
+local function sameName(a,b) return norm(a)~="" and norm(a)==norm(b) end
+local function key(world, main, rift)
+    if world=="Main" then return main end
+    if world=="TimeRift" then return rift end
+    return nil
+end
+function W.world(data)
+    local p=type(data)=="table" and data.Progression
+    local v=type(p)=="table" and p.World
+    return (v=="Main" or v=="TimeRift") and v or nil
+end
+function W.isCurrent(P,data)
+    return type(P)=="table" and W.world(data)~=nil and W.world(data)==P.worldName
+end
+function W.coinKey(data) return key(W.world(data),"Coins","RiftCoins") end
+function W.gemKey(data) return key(W.world(data),"Gems","RiftGems") end
+function W.rebirthKey(data) return key(W.world(data),"Rebirths","RiftRebirths") end
+local function read(t,k) return k and type(t)=="table" and finite(t[k]) or nil end
+function W.coinsFor(data,world) return read(type(data)=="table" and data.Currencies,key(world,"Coins","RiftCoins")) end
+function W.gemsFor(data,world) return read(type(data)=="table" and data.Currencies,key(world,"Gems","RiftGems")) end
+function W.rebirthsFor(data,world)
+    local n=read(type(data)=="table" and data.Statistics,key(world,"Rebirths","RiftRebirths"))
+    return n and n==math.floor(n) and n or nil
+end
+function W.coins(data) return W.coinsFor(data,W.world(data)) end
+function W.gems(data) return W.gemsFor(data,W.world(data)) end
+function W.rebirths(data) return W.rebirthsFor(data,W.world(data)) end
+function W.world2Open(data)
+    local p=type(data)=="table" and data.Progression
+    local worlds=type(p)=="table" and p.UnlockedWorlds
+    return type(worlds)=="table" and worlds.TimeRift==true
+end
+function W.heavenOpen(data)
+    if W.world(data)~="Main" then return false end
+    local p=data.Progression
+    if sameName(p.Island,"Heaven") then return true end
+    local t=p.UnlockedIslands
+    if type(t)~="table" then return false end
+    for k,v in pairs(t) do if sameName(k,"Heaven") and v==true then return true end end
+    return false
+end
+-- Do not use the first world's generic UnlockedIslands as proof for Rift islands.
+-- A current island or explicit Rift-namespaced flag is evidence; unknown stays unknown.
+function W.islandState(data,name,known)
+    if type(name)~="string" or name=="" or sameName(name,"Spawn") then return true end
+    local p=type(data)=="table" and data.Progression
+    if type(p)~="table" or not W.world(data) then return nil end
+    if sameName(p.Island,name) then return true end
+    local scopes
+    if W.world(data)=="TimeRift" then
+        scopes={p.UnlockedRiftIslands,p.RiftUnlockedIslands,p.TimeRiftUnlockedIslands,
+            type(p.TimeRift)=="table" and p.TimeRift.UnlockedIslands,
+            type(p.RiftWorld)=="table" and p.RiftWorld.UnlockedIslands,
+            type(p.Worlds)=="table" and type(p.Worlds.TimeRift)=="table" and p.Worlds.TimeRift.UnlockedIslands,
+            type(data.TimeRift)=="table" and data.TimeRift.UnlockedIslands,
+            type(data.Worlds)=="table" and type(data.Worlds.TimeRift)=="table" and data.Worlds.TimeRift.UnlockedIslands}
+    else scopes={p.UnlockedIslands} end
+    local yes,no=false,false
+    for i=1,8 do
+        local scope=scopes[i]
+        if type(scope)=="table" then
+            for k,v in pairs(scope) do
+                if sameName(k,name) then if v==true then yes=true elseif v==false then no=true end end
+            end
+        end
+    end
+    if yes and not no then return true end
+    if no then return false end -- an explicit closed or contradictory flag beats old memory
+    if W.world(data)=="TimeRift" and type(known)=="table" then
+        -- A verified record may supplement a generic list, but never override explicit false.
+        local generic=type(p.UnlockedIslands)=="table" and p.UnlockedIslands or nil
+        if generic then for k,v in pairs(generic) do if sameName(k,name) and v==false then return false end end end
+        for k,v in pairs(known) do if sameName(k,name) and v==true then return true end end
+    end
+    return nil
+end
+function W.zoneState(data,name)
+    if type(name)~="string" or name=="" or sameName(name,"Spawn") then return true end
+    local p=type(data)=="table" and data.Progression
+    if type(p)~="table" then return nil end
+    if sameName(p.Zone,name) then return true end
+    local zones=W.world(data)=="TimeRift" and {p.UnlockedRiftZones,p.RiftUnlockedZones,p.TimeRiftUnlockedZones}
+        or {p.UnlockedZones}
+    local yes,no=false,false
+    for i=1,3 do
+        if type(zones[i])=="table" then
+            for k,v in pairs(zones[i]) do
+                if sameName(k,name) then if v==true then yes=true elseif v==false then no=true end end
+            end
+        end
+    end
+    if yes and not no then return true end
+    if no then return false end
+    return nil
+end
+local config,lastConfigAt
+function W.worldConfig()
+    if config then return config end
+    local now=os.clock()
+    if lastConfigAt and now-lastConfigAt<10 then return nil end
+    lastConfigAt=now
+    local ok,value=pcall(function()
+        local root=Env.ReplicatedStorage and Env.ReplicatedStorage:FindFirstChild("Shared")
+        if not root then return nil end
+        local q,head,found={root},1,{}
+        while head<=#q and head<=16000 do
+            local node=q[head]; head+=1
+            if node.Name=="WorldConfig" and node:IsA("ModuleScript") then found[#found+1]=node end
+            for _,child in ipairs(node:GetChildren()) do q[#q+1]=child end
+        end
+        if head<=#q or #found~=1 then return nil end
+        return require(found[1])
+    end)
+    if ok and type(value)=="table" then config=value end
+    return config
+end
+-- For a Rift egg with no Currency, this is a *client-side inference*, not proof of server
+-- spending: def.World=TimeRift plus WorldConfig.Worlds.TimeRift.CoinsKey=RiftCoins.
+-- Any explicit conflicting currency rejects the candidate. Never fall back to Main coins.
+function W.coinPricing(def)
+    if type(def)~="table" then return false,"нет определения" end
+    local world=def.World==nil and "Main" or def.World
+    if world~="Main" and world~="TimeRift" then return false,"неизвестный мир" end
+    if def.Enabled==false or def.Active==false or def.Available==false then return false,"конфиг выключен" end
+    local wanted=world=="Main" and "coins" or "riftcoins"
+    local explicit,bad=false,false
+    local function fields(t)
+        if type(t)~="table" then return end
+        for _,field in ipairs({"Currency","PriceCurrency","CostCurrency","CurrencyName"}) do
+            local v=t[field]
+            if v~=nil then
+                local n=norm(v)
+                if n==wanted or (wanted=="coins" and n=="coin") or (wanted=="riftcoins" and n=="riftcoin") then explicit=true
+                else bad=true end
+            end
+        end
+        for _,k in ipairs({"Coins","RiftCoins","Gems","RiftGems","Tokens","PaidTokens","Robux","CandyCorn","Tickets","EventCurrency"}) do
+            local v=t[k]
+            if v~=nil and v~=false then
+                local n=finite(v)
+                if n==nil then bad=true elseif n>0 then if norm(k)==wanted then explicit=true else bad=true end end
+            end
+        end
+    end
+    fields(def)
+    local visited,visiting,budget={},{},400
+    local function costTree(t,depth)
+        if bad or type(t)~="table" then return end
+        if visiting[t] then bad=true; return end
+        if visited[t] then return end
+        budget-=1
+        if budget<0 or depth>8 then bad=true; return end
+        visited[t],visiting[t]=true,true
+        fields(t)
+        for _,child in pairs(t) do if type(child)=="table" then costTree(child,depth+1) end end
+        visiting[t]=nil
+    end
+    for _,k in ipairs({"Cost","Price","Costs","Prices"}) do
+        local v=def[k]
+        if type(v)=="table" then costTree(v,0)
+        elseif type(v)=="string" and not finite(v) then bad=true end
+    end
+    if type(def.Data)=="table" then
+        fields(def.Data)
+        for _,k in ipairs({"Cost","Price","Costs","Prices"}) do
+            local v=def.Data[k]
+            if type(v)=="table" then costTree(v,0)
+            elseif type(v)=="string" and not finite(v) then bad=true end
+        end
+    end
+    if bad then return false,"конфликт валют или непроверяемая стоимость" end
+    if world=="Main" then return true,explicit and "валюта конфига" or "обычная валюта Main" end
+    if explicit then return true,"явные RiftCoins в конфиге" end
+    local cfg=W.worldConfig()
+    local r=type(cfg)=="table" and type(cfg.Worlds)=="table" and cfg.Worlds.TimeRift
+    if type(r)=="table" and r.CoinsKey=="RiftCoins" and def.World=="TimeRift" then
+        return true,"RiftCoins по WorldConfig (вывод клиента, не подтверждение сервера)"
+    end
+    return false,"нет явной валюты и карты WorldConfig"
+end
+function W.sameNumber(a,b,epsilon)
+    a,b=finite(a),finite(b)
+    return a~=nil and b~=nil and math.abs(a-b)<=math.max(1,math.abs(a),math.abs(b))*(epsilon or 1e-9)
+end
+W.finite,W.norm,W.sameName=finite,norm,sameName
+return W
+end
+
+__modules["features/operation_journal"] = function(use)
+-- A durable write-before-send journal. A possible send is never erased merely by reload/Stop.
+local Env=use("core/env")
+local W=use("features/world_data")
+local J={}
+function J.new(kind,userId)
+    local id=W.finite(userId)
+    if type(kind)~="string" or not kind:match("^[a-z_]+$") or not id or id<1 or id>9007199254740991 or id~=math.floor(id) then
+        return nil,"некорректный аккаунт/тип журнала"
+    end
+    local key=kind..":"..string.format("%.0f",id)
+    local path="SlopixHub/TapSimulator/tsv14_"..kind.."_"..string.format("%.0f",id)..".state"
+    local f=Env.files or {}
+    if type(f.isfile)~="function" or type(f.readfile)~="function" or type(f.writefile)~="function"
+        or type(f.isfolder)~="function" or type(f.makefolder)~="function" then return nil,"нет функций надёжного журнала" end
+    local genv=Env.genv or {}
+    if type(genv.__TSV14Pending)~="table" then genv.__TSV14Pending={} end
+    local mem=genv.__TSV14Pending
+    local clear="TSV14_CLEAR_V1"
+    local function checkedWrite(value)
+        local ok,err=pcall(function()
+            for _,folder in ipairs({"SlopixHub","SlopixHub/TapSimulator"}) do if not f.isfolder(folder) then f.makefolder(folder) end end
+            f.writefile(path,value)
+            assert(f.isfile(path) and f.readfile(path)==value,"проверка записи не прошла")
+        end)
+        Env.elevate()
+        return ok,ok and nil or tostring(err)
+    end
+    local function disk()
+        local ok,exists=pcall(f.isfile,path)
+        if not ok or type(exists)~="boolean" then return nil,"не читается "..path end
+        if not exists then return clear end
+        local got,raw=pcall(f.readfile,path)
+        if not got or type(raw)~="string" then return nil,"не читается "..path end
+        return raw
+    end
+    local api={path=path}
+    function api.check()
+        local raw,err=disk()
+        if not raw then return false,err end
+        if raw~=clear or mem[key]~=nil then return false,"остался/повреждён ожидающий запрос: "..path end
+        return true
+    end
+    function api.inspect()
+        local raw,err=disk()
+        if not raw then return nil,err end
+        if raw==clear and mem[key]==nil then return false end
+        if mem[key]~=nil and mem[key]~=raw then return nil,"журналы на диске и в памяти различаются" end
+        if not raw:match("^TSV14_PENDING_V1|") then return nil,"повреждён ожидающий запрос" end
+        return raw
+    end
+    function api.begin(detail)
+        local ready,why=api.check(); if not ready then return nil,why end
+        if type(detail)~="string" or detail=="" or #detail>500 or detail:find("\n",1,true) then return nil,"неверный маркер" end
+        -- Reserve in memory before the write: another copy in this client cannot pass check().
+        local token="TSV14_PENDING_V1|"..detail
+        mem[key]=token
+        local ok,err=checkedWrite(token)
+        if not ok then return nil,"не сохранился ожидающий запрос: "..tostring(err),token end
+        return token
+    end
+    function api.finish(token)
+        if type(token)~="string" or mem[key]~=token then return false,"маркер принадлежит другой операции" end
+        local raw,err=disk()
+        if raw~=token then return false,err or "маркер не совпадает" end
+        local ok,why=checkedWrite(clear)
+        if ok then mem[key]=nil end
+        return ok,why
+    end
+    -- Call ONLY after the caller has independently confirmed the exact operation in the replica.
+    -- This permits recovery after a complete client restart without erasing unknown requests.
+    function api.confirmObserved(detailPrefix)
+        local raw,err=disk()
+        if raw==clear and mem[key]==nil then return true end
+        local prefix="TSV14_PENDING_V1|"..tostring(detailPrefix or "")
+        if type(raw)~="string" or detailPrefix==nil or detailPrefix=="" or raw:sub(1,#prefix)~=prefix then
+            return false,err or "не совпадает ожидаемая операция"
+        end
+        if mem[key]~=nil and mem[key]~=raw then return false,"операция в памяти отличается" end
+        mem[key]=raw
+        return api.finish(raw)
+    end
+    -- Only when no game call was attempted; safe even if the first write partially failed.
+    function api.cancelUnsent(token)
+        if type(token)~="string" or mem[key]~=token then return false,"маркер принадлежит другой операции" end
+        local raw,why=disk()
+        if raw==clear then mem[key]=nil; return true end
+        -- Do not erase another client's/corrupt record even if our own write failed.
+        if raw~=token then return false,why or "маркер перед отменой изменился" end
+        local ok,err=checkedWrite(clear)
+        if ok then mem[key]=nil end
+        return ok,err
+    end
+    return api
+end
+return J
+end
+
+__modules["features/hatch_result"] = function(use)
+local W=use("features/world_data")
+local C={}
+function C.classify(packet,egg,count,expected,world,seq)
+    if type(packet)~="table" then return "unknown",nil,"ответ не таблица" end
+    if seq==nil or packet.Seq~=seq then return "unknown",nil,"Seq не совпадает" end
+    if (world~="Main" and world~="TimeRift") or type(egg)~="string" or egg==""
+        or not W.finite(count) or count<1 or count~=math.floor(count)
+        or not W.finite(expected) or expected<=0 then return "unknown",nil,"неверный контекст запроса" end
+    if packet.Egg~=nil and packet.Egg~=egg then return "unknown",nil,"имя яйца не совпало" end
+    if packet.Pets~=nil and type(packet.Pets)~="table" then return "unknown",nil,"неверный тип Pets" end
+    local wanted=world=="TimeRift" and "riftcoins" or "coins"
+    for _,field in ipairs({"Currency","PriceCurrency","CostCurrency","CurrencyName"}) do
+        local v=packet[field]
+        if v~=nil then
+            local n=W.norm(v)
+            if n~=wanted and not (wanted=="coins" and n=="coin") and not (wanted=="riftcoins" and n=="riftcoin") then
+                return "unknown",nil,"ответ называет другую валюту"
+            end
+        end
+    end
+    local err=packet.Error
+    local hasError=err~=nil and err~=false and err~=""
+    local fields={"Rolls","Count","HatchCount","Amount"}
+    if packet.Success==true then
+        if hasError then return "unknown",nil,"успех вместе с ошибкой" end
+        local spent=packet.Spent~=nil and W.finite(packet.Spent) or nil
+        if packet.Spent~=nil and (not spent or not W.sameNumber(spent,expected)) then
+            return "unknown",nil,"Spent не равен проверенной цене"
+        end
+        if world=="TimeRift" and not spent then return "unknown",nil,"нет Spent для Rift" end
+        local rolls
+        for _,field in ipairs(fields) do
+            if packet[field]~=nil then
+                local n=W.finite(packet[field])
+                if not n or n<count or n~=math.floor(n) then return "unknown",nil,"неверное "..field end
+                if not rolls or n>rolls then rolls=n end
+            end
+        end
+        if not rolls and type(packet.Pets)=="table" then
+            local n=0; for _ in pairs(packet.Pets) do n+=1 end
+            if n>=count then rolls=n end
+        end
+        if not rolls then return "unknown",nil,"нет подтверждённого количества" end
+        return "success",rolls,nil
+    end
+    if packet.Success==false or (packet.Success==nil and type(err)=="string" and err~="") then
+        if packet.Spent~=nil and W.finite(packet.Spent)~=0 then return "unknown",nil,"отказ с ненулевым Spent" end
+        for _,field in ipairs(fields) do
+            if packet[field]~=nil and W.finite(packet[field])~=0 then return "unknown",nil,"отказ с ненулевым "..field end
+        end
+        if type(packet.Pets)=="table" and next(packet.Pets)~=nil then return "unknown",nil,"отказ с непустым Pets" end
+        return "refused",0,nil
+    end
+    return "unknown",nil,"непонятный статус"
+end
+return C
+end
+
+__modules["features/royal_policy"] = function()
+-- Actual receipt-to-receipt Royal x3 throughput, not a fixed 900M/s or a guessed egg price.
+-- A finite observation is not a guarantee that a future boost, network or server rate stays fixed.
+local Policy={}
+local WINDOWS,MIN_SECONDS,MIN_BATCHES,SEND_GAP,SURPLUS=3,15,3,2.0,0.05
+local function num(n) return type(n)=="number" and n==n and n>=0 and n<math.huge end
+function Policy.new() return {windows=0,batches=0,spent=0} end
+local function reset(s,why)
+    s.windows,s.batches,s.spent,s.beginAt,s.beginCoins=0,0,0,nil,nil
+    s.lastReceipt,s.team,s.rb,s.reason=nil,nil,nil,why
+end
+function Policy.reset(s,why) reset(s,why or "условия изменились") end
+function Policy.observe(s,e)
+    if type(s)~="table" or type(e)~="table" then return false,"нет данных" end
+    if e.egg~="Royal" or e.count~=3 or e.mode~="Luck" or type(e.team)~="string" or e.team==""
+        or not num(e.now) or not num(e.sendAt) or not num(e.coins) or not num(e.rb)
+        or not num(e.spent) or e.spent<=0 or e.sendAt>e.now or e.uncertain
+        or e.coins<e.spent*3 then
+        reset(s,"нет непрерывной партии Royal x3, подтверждённой цены или запаса в три партии"); return false,s.reason
+    end
+    if s.lastReceipt and (e.sendAt<s.lastReceipt or e.sendAt-s.lastReceipt>SEND_GAP
+        or e.team~=s.team or e.rb~=s.rb or e.now<s.lastReceipt) then
+        reset(s,"пауза, смена команды или ребёрты прервали измерение")
+    end
+    if not s.beginAt then
+        s.beginAt,s.beginCoins,s.team,s.rb=e.now,e.coins,e.team,e.rb
+        s.lastReceipt,s.batches,s.spent=e.now,0,0
+        return false,"начат замер непрерывного Royal x3"
+    end
+    s.lastReceipt=e.now; s.batches+=1; s.spent+=e.spent
+    if e.now-s.beginAt<MIN_SECONDS or s.batches<MIN_BATCHES then return false,"собираю окно Royal x3" end
+    local delta=e.coins-s.beginCoins
+    local precision=math.max(e.coins,s.beginCoins)*1e-14
+    if delta<=s.spent*SURPLUS+precision then
+        reset(s,"запас дохода не подтверждён при реальных открытиях"); return false,s.reason
+    end
+    s.windows+=1
+    s.lastDelta,s.lastSeconds,s.lastSpent=delta,e.now-s.beginAt,s.spent
+    s.beginAt,s.beginCoins,s.batches,s.spent=e.now,e.coins,0,0
+    s.reason="устойчивых окон Royal x3: "..tostring(s.windows).."/"..WINDOWS
+    return s.windows>=WINDOWS,s.reason
+end
+return Policy
+end
+
+__modules["features/rift_native"] = function(use)
+-- These are conservative adapters to visible, already-wired game buttons, not guessed remotes.
+-- A missing/ambiguous GUI stops that operation only; it does not establish game protocol.
+local Env=use("core/env")
+local W=use("features/world_data")
+local N={}
+local norm=W.norm
+local function isa(o,c) local ok,v=pcall(function() return o and o:IsA(c) end); return ok and v==true end
+local function children(o)
+    local ok,v=pcall(function() return o and o:GetChildren() end)
+    if not ok or type(v)~="table" then return nil end
+    return v
+end
+local function attr(o,n)
+    local ok,v=pcall(function() return o:GetAttribute(n) end)
+    if ok then return v end -- false is meaningful (e.g. Unlocked=false)
+    return nil
+end
+local function gui() local p=Env.LocalPlayer; return p and p:FindFirstChild("PlayerGui") end
+local function boundedDesc(root,cap)
+    if not root then return {},false end
+    local q,head,out={root},1,{}
+    while head<=#q and head<=cap do
+        local obj=q[head]; head+=1; out[#out+1]=obj
+        local list=children(obj); if not list then return out,false end
+        for _,child in ipairs(list) do q[#q+1]=child end
+    end
+    return out,head>#q
+end
+local function visible(o,root)
+    for _=1,40 do
+        if o==root then return true end
+        if not o then return false end
+        if isa(o,"GuiObject") then local ok,v=pcall(function() return o.Visible end); if not ok or v~=true then return false end end
+        if isa(o,"ScreenGui") then local ok,v=pcall(function() return o.Enabled end); if not ok or v~=true then return false end end
+        o=o.Parent
+    end
+    return false
+end
+local function text(o)
+    if not (isa(o,"TextLabel") or isa(o,"TextButton") or isa(o,"TextBox")) then return nil end
+    local ok,v=pcall(function() return o.Text end)
+    return ok and type(v)=="string" and v or nil
+end
+local suffix={k=1e3,m=1e6,b=1e9,t=1e12,q=1e15,qa=1e15,qi=1e18,qn=1e18,
+    sx=1e21,sp=1e24,oc=1e27,no=1e30,dc=1e33}
+function N.parsePrice(raw)
+    if type(raw)=="number" then return W.finite(raw) end
+    if type(raw)~="string" then return nil end
+    local s=raw:gsub(",", ""):gsub("%s", ""):lower()
+    s=s:gsub("^cost:",""):gsub("^price:","")
+    local a,unit=s:match("^([%d%.]+)([%a]*)$")
+    if not a then return nil end
+    local n=tonumber(a); if not n then return nil end
+    if unit~="" then
+        unit=unit:gsub("riftcoins$", ""):gsub("riftcoin$", ""):gsub("coins$", ""):gsub("coin$", "")
+        if unit~="" then if not suffix[unit] then return nil end; n*=suffix[unit] end
+    end
+    return W.finite(n)
+end
+-- A full integer text (as opposed to an abbreviated K/M/... label) can be compared
+-- at client precision. Numeric Values/attributes are already numeric game data.
+local function fullNumericPrice(v)
+    if type(v)=="number" then return true end
+    if type(v)~="string" then return false end
+    local s=v:gsub(",", ""):gsub("%s", ""):lower()
+    s=s:gsub("^cost:",""):gsub("^price:","")
+    s=s:gsub("riftcoins$",""):gsub("riftcoin$",""):gsub("coins$",""):gsub("coin$","")
+    return s:match("^%d+$")~=nil
+end
+local function forbidden(s)
+    local n=norm(s)
+    return n:find("robux",1,true) or n:find("premium",1,true) or n:find("gamepass",1,true)
+        or n:find("tokens",1,true) or n:find("riftgems",1,true) or n:find("gems",1,true)
+end
+local function locked(o)
+    if attr(o,"Locked")==true or attr(o,"IsLocked")==true
+        or attr(o,"Unlocked")==false or attr(o,"IsUnlocked")==false then return true end
+    local n=norm(text(o) or "")
+    return n=="locked" or n=="notunlocked" or n=="unavailable"
+end
+local function nodeValue(o)
+    if isa(o,"NumberValue") or isa(o,"IntValue") then
+        local ok,v=pcall(function() return o.Value end); if ok then return v end
+    end
+    return text(o)
+end
+local function buttonIndex(button)
+    for _,obj in ipairs({button,button.Parent}) do
+        if obj then
+            for _,key in ipairs({"Index","RebirthIndex","ButtonIndex","OptionIndex"}) do
+                local n=W.finite(attr(obj,key))
+                if n and n>=1 and n<=64 and n==math.floor(n) then return n end
+            end
+            local name=tostring(obj.Name):lower()
+            local n=tonumber(name:match("^rebirthbutton(%d+)$") or name:match("^button(%d+)$") or name:match("^option(%d+)$"))
+            if n and n>=1 and n<=64 then return n end
+        end
+    end
+end
+local function insideRebirth(o,root)
+    for _=1,12 do
+        if not o or o==root then return false end
+        if norm(o.Name):find("rebirth",1,true) then return true end
+        o=o.Parent
+    end
+    return false
+end
+local function readRebirth(button,root)
+    -- A card can contain the button and its labels, but no second visible button.
+    local scope=button.Parent or button
+    local nodes,complete=boundedDesc(scope,180); if not complete then return nil end
+    local buttons=0
+    for _,o in ipairs(nodes) do if isa(o,"GuiButton") and visible(o,root) then buttons+=1 end end
+    if buttons~=1 then return nil end
+    local price,amount,bad,riftEvidence,exactPrice=nil,nil,false,false,nil
+    local function setPrice(v)
+        if v==nil then return true end
+        local n=N.parsePrice(v)
+        if not n or n<=0 or (price and not W.sameNumber(price,n,0.03)) then return false end
+        if fullNumericPrice(v) then
+            if exactPrice and not W.sameNumber(exactPrice,n,1e-9) then return false end
+            exactPrice=n
+        end
+        price=exactPrice or n; return true
+    end
+    local function setAmount(v)
+        if v==nil then return true end
+        if type(v)=="string" then v=v:lower():gsub("%s",""):gsub("rebirths?$",""):gsub("^%+",""):gsub("^x","") end
+        local n=N.parsePrice(v)
+        if not n or n<1 or n~=math.floor(n) or (amount and not W.sameNumber(amount,n,0.001)) then return false end
+        amount=n; return true
+    end
+    for _,o in ipairs(nodes) do
+        if visible(o,root) then
+            if locked(o) then bad=true end
+            local name,content=norm(o.Name),text(o)
+            if forbidden(name) or (content and forbidden(content)) then bad=true end
+            -- Upgrade/unlock buttons are not rebirth-purchase controls.
+            if name:find("upgrade",1,true) or name:find("unlock",1,true)
+                or (content and (norm(content):find("upgrade",1,true) or norm(content):find("unlockbutton",1,true))) then bad=true end
+            for _,k in ipairs({"Currency","CostCurrency","PriceCurrency","CurrencyName"}) do
+                local v=attr(o,k)
+                if v~=nil then
+                    local n=norm(v)
+                    if n=="riftcoins" or n=="riftcoin" then riftEvidence=true else bad=true end
+                end
+            end
+            if content then
+                local n=norm(content)
+                if n:find("riftcoins",1,true) or n:find("riftcoin",1,true) then riftEvidence=true end
+                if n=="coins" or n=="coin" then bad=true end
+            end
+            for _,k in ipairs({"Price","Cost","RebirthPrice"}) do if not setPrice(attr(o,k)) then return nil end end
+            for _,k in ipairs({"RebirthAmount","RebirthCount","Quantity"}) do if not setAmount(attr(o,k)) then return nil end end
+            if name=="price" or name=="cost" or name=="rebirthprice" or name=="pricetext" or name=="costtext" then
+                if not setPrice(nodeValue(o)) then return nil end
+            elseif name=="amount" or name=="rebirthamount" or name=="rebirthcount" or name=="quantity" then
+                if not setAmount(nodeValue(o)) then return nil end
+            elseif content then
+                local part=content:lower():gsub(",",""):match("[%+x]%s*([%d%.]+%s*[%a]*)%s+rebirths?")
+                if part and not setAmount(part) then return nil end
+            end
+        end
+    end
+    if bad or not riftEvidence or not price or not amount then return nil end
+    -- Index is only a stable local comparison key; it is never put into a Rift remote payload.
+    return {price=price,exactPrice=exactPrice~=nil,amount=amount,index=buttonIndex(button) or amount,button=button}
+end
+function N.findRebirth(data)
+    if W.world(data)~="TimeRift" then return nil,"мир не TimeRift" end
+    local balance=W.coins(data); local root=gui()
+    if balance==nil or not root then return nil,"нет RiftCoins или PlayerGui" end
+    local nodes,complete=boundedDesc(root,40000); if not complete then return nil,"неполный обход GUI" end
+    local candidates={}
+    for _,obj in ipairs(nodes) do
+        if isa(obj,"GuiButton") and visible(obj,root) and insideRebirth(obj,root)
+            and not forbidden(obj.Name) and not forbidden(text(obj) or "") then
+            local item=readRebirth(obj,root)
+            -- Numeric game values and full integer labels are exact at client precision;
+            -- abbreviated text alone may be rounded.
+            local required=item and (item.exactPrice and item.price or item.price*1.05)
+            if required and required<=balance then candidates[#candidates+1]=item end
+        end
+    end
+    table.sort(candidates,function(a,b) if a.amount~=b.amount then return a.amount>b.amount end return a.index>b.index end)
+    if #candidates==0 then return nil,"нет видимой кнопки RiftCoins с ценой и размером ребёрта" end
+    if #candidates>1 and candidates[1].amount==candidates[2].amount then return nil,"несколько одинаковых максимальных кнопок" end
+    return candidates[1]
+end
+local function first(...)
+    for i=1,select("#",...) do local f=select(i,...); if type(f)=="function" then return f end end
+end
+function N.fireButton(button,guard)
+    local root=gui()
+    if not root or not isa(button,"GuiButton") or not visible(button,root) or locked(button) then
+        return false,false,"игровая кнопка больше не видна или закрыта"
+    end
+    local connections=first(getconnections,Env.genv and Env.genv.getconnections)
+    local fire=first(firesignal,Env.genv and Env.genv.firesignal)
+    if not connections then return false,false,"executor не предоставляет getconnections" end
+    for _,name in ipairs({"Activated","MouseButton1Click"}) do
+        local okSignal,signal=pcall(function() return button[name] end)
+        local ok,list=false,nil
+        if okSignal and signal then ok,list=pcall(connections,signal) end
+        if ok and type(list)=="table" and #list>0 then
+            if not fire and #list~=1 then return false,false,"неоднозначное количество обработчиков" end
+            if type(guard)=="function" then local g,allowed=pcall(guard); if not g or not allowed then return false,false,"условия изменились" end end
+            if not visible(button,root) or locked(button) then return false,false,"кнопка больше недоступна" end
+            -- From here an exception may mean the handler DID send; callers retain their journal.
+            if fire then local called,err=pcall(fire,signal); return true,called,called and nil or tostring(err) end
+            local called,err=pcall(function() list[1]:Fire() end)
+            return true,called,called and nil or tostring(err)
+        end
+    end
+    return false,false,"обработчик игровой кнопки не найден"
+end
+function N.openRebirthMenu(guard)
+    local root=gui(); if not root then return false,"нет PlayerGui" end
+    local nodes,complete=boundedDesc(root,40000); if not complete then return false,"неполный обход GUI" end
+    local hits={}
+    for _,obj in ipairs(nodes) do
+        if isa(obj,"GuiButton") and visible(obj,root) then
+            local name,label=norm(obj.Name),norm(text(obj) or "")
+            -- Only explicit menu-navigation names. A generic Rebirth button might BUY a rebirth.
+            if (name=="openrebirth" or name=="openrebirthmenu" or name=="rebirthmenu")
+                and (label=="" or label=="rebirth" or label=="rebirths") and not buttonIndex(obj) then hits[#hits+1]=obj end
+        end
+    end
+    if #hits~=1 then return false,"кнопок открытия Rebirth="..tostring(#hits) end
+    local attempted,called,err=N.fireButton(hits[1],guard)
+    return attempted and called,err or (attempted and "обработчик вызван" or "не вызван")
+end
+-- Require a unique visible modal/card that names this destination, the currency AND a price.
+-- Hidden stale labels, another modal's buttons and conflicting currencies do not count.
+function N.findPurchase(target,expectedCurrency,expectedPrice,balance)
+    local root=gui(); if not root then return nil,"PlayerGui недоступен" end
+    local nodes,complete=boundedDesc(root,40000); if not complete then return nil,"неполный обход GUI" end
+    local wanted,cur=norm(target),norm(expectedCurrency)
+    balance=W.finite(balance)
+    if wanted=="" or (cur~="coins" and cur~="riftcoins") or not balance then return nil,"неверный контекст покупки" end
+    local hits={}
+    for _,button in ipairs(nodes) do
+        if isa(button,"GuiButton") and visible(button,root) and not locked(button) then
+            local action=norm(text(button) or button.Name)
+            local allowed=action=="buy" or action=="purchase" or action=="unlock" or action=="confirmunlock"
+                or action=="buynow" or action=="yesunlock" or action=="confirm"
+            if allowed and not forbidden(action) then
+                local scope=button.Parent
+                for _=1,5 do
+                    if not scope or scope==root or isa(scope,"ScreenGui") then break end
+                    local near,done=boundedDesc(scope,180)
+                    if not done then break end
+                    local hasTarget,hasCurrency,bad,otherAction,display,displayExact=false,false,false,false,nil,false
+                    for _,o in ipairs(near) do
+                        if visible(o,root) then
+                            local name,content=norm(o.Name),text(o)
+                            local n=norm(content or "")
+                            if n:find(wanted,1,true) then hasTarget=true end
+                            if cur=="riftcoins" and (n:find("riftcoin",1,true) or n=="riftcoins") then hasCurrency=true end
+                            if cur=="coins" and (n=="coins" or n=="coin" or n:match("%dcoins?$")) then hasCurrency=true end
+                            if cur=="coins" and n:find("riftcoin",1,true) then bad=true end
+                            if forbidden(content or "") or forbidden(name) then bad=true end
+                            for _,field in ipairs({"Currency","CostCurrency","PriceCurrency","CurrencyName"}) do
+                                local v=attr(o,field)
+                                if v~=nil then
+                                    local cv=norm(v)
+                                    if cv==cur or (cur=="coins" and cv=="coin") or (cur=="riftcoins" and cv=="riftcoin") then hasCurrency=true
+                                    else bad=true end
+                                end
+                            end
+                            if isa(o,"GuiButton") and o~=button then
+                                local a=norm(text(o) or o.Name)
+                                if a~="cancel" and a~="close" and a~="back" and a~="no" then otherAction=true end
+                            end
+                            if name=="price" or name=="cost" or name=="pricetext" or name=="costtext" then
+                                local raw=nodeValue(o)
+                                local price=N.parsePrice(raw)
+                                if price and price>0 then
+                                    if display and not W.sameNumber(display,price,0.03) then bad=true
+                                    elseif fullNumericPrice(raw) then
+                                        if displayExact and not W.sameNumber(display,price,1e-9) then bad=true end
+                                        display,displayExact=price,true
+                                    elseif not displayExact then display=price end
+                                end
+                            end
+                        end
+                    end
+                    if hasTarget and hasCurrency and not bad and not otherAction and display
+                        and (not expectedPrice or W.sameNumber(display,expectedPrice,0.05)) then
+                        -- Prefer the game's numeric island config where available; no extra 5% wait.
+                        -- For a world purchase with only abbreviated text, retain a safety margin.
+                        local required=expectedPrice and math.max(expectedPrice,display)
+                            or (displayExact and display or display*1.05)
+                        if required<=balance then hits[#hits+1]={button=button,price=display}; break end
+                    end
+                    scope=scope.Parent
+                end
+            end
+        end
+    end
+    if #hits~=1 then return nil,"подходящих кнопок покупки с ценой="..tostring(#hits) end
+    return hits[1].button,hits[1].price
+end
+return N
+end
+
+__modules["features/rift_islands"] = function(use)
+-- Rift islands use their own config and native portal/UI, never the Main IslandService payload.
+local Env,Life,Ui=use("core/env"),use("shared/life"),use("core/ui")
+local W,N,J=use("features/world_data"),use("features/rift_native"),use("features/operation_journal")
+local R={}
+local OWNER="ts14-rift-island"
+local busy,nextTry,lastStatus,lastAt=false,0,nil,0
+local cfg
+local userId=Env.LocalPlayer and Env.LocalPlayer.UserId
+local journal,journalErr=J.new("rift_island",userId)
+local travelJournal,travelJournalErr=J.new("rift_island_travel",userId)
+local evidencePath="SlopixHub/TapSimulator/ts14_rift_islands_"..tostring(userId)..".state"
+local EVIDENCE_MAGIC="TS14_RIFT_ISLANDS_V1"
+local function log(s) print("[TAPSIM] TimeRift/острова: "..tostring(s)) end
+local function status(key,s)
+    if key~=lastStatus or os.clock()-lastAt>=60 then lastStatus,lastAt=key,os.clock(); log(s) end
+end
+local function isa(o,c) local ok,v=pcall(function() return o and o:IsA(c) end); return ok and v==true end
+local function children(o) local ok,v=pcall(function() return o and o:GetChildren() end); return ok and type(v)=="table" and v or nil end
+local function loadCfg()
+    if cfg then return cfg end
+    local ok,v=pcall(function()
+        local root=Env.ReplicatedStorage and Env.ReplicatedStorage:FindFirstChild("Shared")
+        if not root then return nil end
+        local q,head,found={root},1,{}
+        while head<=#q and head<=16000 do
+            local x=q[head]; head+=1
+            if x.Name=="RiftIslandConfig" and isa(x,"ModuleScript") then found[#found+1]=x end
+            local list=children(x); if not list then return nil end
+            for _,c in ipairs(list) do q[#q+1]=c end
+        end
+        if head<=#q or #found~=1 then return nil end
+        return require(found[1])
+    end)
+    if ok and type(v)=="table" and type(v.Islands)=="table" then cfg=v end
+    return cfg
+end
+local function current() local ok,d=pcall(Env.data); return ok and type(d)=="table" and d or nil end
+local function genericOpen(data,name)
+    local prog=type(data)=="table" and data.Progression
+    local map=type(prog)=="table" and prog.UnlockedIslands
+    if type(map)~="table" then return false end
+    for k,v in pairs(map) do if W.sameName(k,name) and v==true then return true end end
+    return false
+end
+local function ensureEvidence(P)
+    if P.riftEvidenceLoaded then return not P.riftEvidenceError end
+    P.riftEvidenceLoaded=true
+    P.verifiedRiftIslands={}
+    local f=Env.files or {}
+    if type(f.isfile)~="function" or type(f.readfile)~="function" or type(f.writefile)~="function"
+        or type(f.isfolder)~="function" or type(f.makefolder)~="function" then
+        P.riftEvidenceError="нет записи состояния островов"; return false
+    end
+    local ok,exists=pcall(f.isfile,evidencePath)
+    if not ok or type(exists)~="boolean" then P.riftEvidenceError="файл островов не читается"; return false end
+    if not exists then return true end
+    local got,raw=pcall(f.readfile,evidencePath)
+    if not got or type(raw)~="string" or raw:sub(1,#EVIDENCE_MAGIC)~=EVIDENCE_MAGIC
+        or (raw~=""..EVIDENCE_MAGIC and raw:sub(#EVIDENCE_MAGIC+1,#EVIDENCE_MAGIC+1)~="\n") then
+        P.riftEvidenceError="файл подтверждённых островов повреждён"; return false
+    end
+    local config=loadCfg()
+    if not config then P.riftEvidenceLoaded=false; return false end
+    for name in raw:sub(#EVIDENCE_MAGIC+2):gmatch("[^\n]+") do
+        if not config.Islands[name] or name:find("|",1,true) or name:find("\r",1,true) then
+            P.riftEvidenceError="неизвестный остров в файле"; return false
+        end
+        P.verifiedRiftIslands[name]=true
+    end
+    return true
+end
+local function recordEvidence(P,name)
+    if not ensureEvidence(P) then return false,P.riftEvidenceError or "нет конфига островов" end
+    local config=loadCfg()
+    if not config or type(config.Islands[name])~="table" or name:find("|",1,true)
+        or name:find("\n",1,true) or name:find("\r",1,true) then return false,"неверное имя острова" end
+    if P.verifiedRiftIslands[name] then return true end
+    local list={}
+    for old,yes in pairs(P.verifiedRiftIslands) do if yes then list[#list+1]=old end end
+    list[#list+1]=name; table.sort(list)
+    local raw=EVIDENCE_MAGIC.."\n"..table.concat(list,"\n")
+    local f=Env.files
+    local ok,err=pcall(function()
+        for _,folder in ipairs({"SlopixHub","SlopixHub/TapSimulator"}) do if not f.isfolder(folder) then f.makefolder(folder) end end
+        f.writefile(evidencePath,raw)
+        assert(f.isfile(evidencePath) and f.readfile(evidencePath)==raw,"запись островов не подтверждена")
+    end)
+    Env.elevate()
+    if not ok then P.riftEvidenceError=tostring(err); return false,P.riftEvidenceError end
+    P.verifiedRiftIslands[name]=true
+    return true
+end
+local function restoreAfterIsland(P)
+    if P.blockedByRiftIsland and P.phase=="blocked" and not P.stopRequested and not P.worldChanging
+        and not P.islandUncertain and not P.islandTravelUncertain and not P.previousIslandPending
+        and not P.hatchUncertain and not P.craftUncertain and not P.upgradeUncertain and not P.skillUncertain then
+        P.blockedByRiftIsland=nil
+        P.phase="check" -- the controller reinstates its own stage and holds
+    end
+end
+local function allowed(P,own,allowEgg)
+    local hatchOn,tapOn=Ui.on("AutoHatch"),Ui.on("AutoTap")
+    local d=current() -- UI and replica access can yield; validate P and toggles afterwards
+    local toggles=Ui.Toggles
+    return Life.alive and type(P)=="table" and Ui.__progressTest==P and P.worldName=="TimeRift"
+        and W.isCurrent(P,d) and not P.worldChanging and not P.stopRequested and not P.royalFinal
+        and (P.phase=="rebirth" or P.phase=="save" or P.phase=="hatch" or P.phase=="storage_wait")
+        and not P.holdHatch and not P.targetProbeRequired and not P.farmThresholdReached
+        and not P.previousHatchPending and not P.previousCraftPending and not P.previousIslandPending
+        and not P.hatchUncertain and not P.craftUncertain and not P.islandUncertain and not P.islandTravelUncertain
+        and not P.pending and not P.previousRebirthPending and not P.riftEvidenceError and not P.finalizing
+        and not P.craftBusy and not P.craftInFlight and not Ui.hatchMoving
+        and (allowEgg or not Ui.hatchInFlight) and not (Env.genv and Env.genv.__handoverPaused)
+        and hatchOn and tapOn and type(toggles)=="table"
+        and toggles.AutoHatch and toggles.AutoHatch.Value==true
+        and toggles.AutoTap and toggles.AutoTap.Value==true
+        and ((own and Ui.travelling==OWNER) or (not own and not Ui.travelling))
+end
+local function nextIsland(data,P)
+    local config=loadCfg()
+    if not config then return nil,"нет RiftIslandConfig.Islands" end
+    local list={}
+    for name,def in pairs(config.Islands) do
+        if type(name)=="string" and type(def)=="table" and W.norm(name)~="spawn" then
+            local price=W.finite(def.Price)
+            if price and price>0 then
+                local tagged={World="TimeRift"}; for k,v in pairs(def) do tagged[k]=v end
+                if tagged.World==nil then tagged.World="TimeRift" end
+                local good=W.coinPricing(tagged)
+                if tagged.World=="TimeRift" and good then list[#list+1]={name=name,def=def,price=price,order=W.finite(def.Order)} end
+            end
+        end
+    end
+    table.sort(list,function(a,b)
+        if a.order and b.order and a.order~=b.order then return a.order<b.order end
+        if a.price~=b.price then return a.price<b.price end
+        return a.name<b.name
+    end)
+    local at=type(data.Progression)=="table" and data.Progression.Island or nil
+    local hereIndex=0
+    for i,item in ipairs(list) do if W.sameName(at,item.name) then hereIndex=i end end
+    for i,item in ipairs(list) do
+        local state=W.islandState(data,item.name,P and P.verifiedRiftIslands)
+        if i>hereIndex and state~=true then
+            local dep=item.def.RequiredIsland or item.def.PreviousIsland or item.def.PrerequisiteIsland
+                or item.def.RequiresIsland or item.def.ParentIsland
+            if type(dep)=="string" and dep~="" and not W.sameName(dep,"Spawn") then
+                local prior=W.islandState(data,dep,P and P.verifiedRiftIslands)
+                if prior~=true then return nil,"жду подтверждения предыдущего острова "..dep end
+            end
+            return item
+        end
+    end
+    return nil,"следующий остров не найден или уже открыт"
+end
+local function findPortal(item)
+    local root=workspace:FindFirstChild("World2")
+    if not root then return nil,"World2 ещё не загружен" end
+    local q,head,matches={root},1,{}
+    local want=W.norm(item.name)
+    local byName=W.norm(item.def and item.def.PortalName)
+    while head<=#q and head<=20000 do
+        local node=q[head]; head+=1
+        local n=W.norm(node.Name)
+        if (isa(node,"Model") or isa(node,"BasePart")) and not n:find("return",1,true)
+            and (n==want or n==want.."island" or (byName~="" and n==byName)) then
+            local ancestor=node.Parent; local inReturn=false
+            local portalScope=n:find("portal",1,true)~=nil
+            for _=1,20 do
+                if not ancestor or ancestor==root then break end
+                local parentName=W.norm(ancestor.Name)
+                if parentName:find("return",1,true) then inReturn=true; break end
+                if parentName:find("portal",1,true) then portalScope=true end
+                ancestor=ancestor.Parent
+            end
+            if not inReturn and portalScope then matches[#matches+1]=node end
+        end
+        local list=children(node); if not list then return nil,"неполный обход World2" end
+        for _,c in ipairs(list) do q[#q+1]=c end
+    end
+    if head<=#q then return nil,"неполный обход World2" end
+    if #matches~=1 then return nil,"объектов портала "..item.name.."="..tostring(#matches) end
+    local node=matches[1]
+    local position
+    pcall(function()
+        if isa(node,"BasePart") then position=node.Position
+        else
+            local hit=node:FindFirstChild("Portal_Hitbox",true) or node:FindFirstChild("PortalTrigger",true)
+                or node:FindFirstChild("Hitbox",true)
+            if hit and isa(hit,"BasePart") then position=hit.Position else position=node:GetPivot().Position end
+        end
+    end)
+    return position,position and nil or "нет позиции портала"
+end
+local function root()
+    local c=Env.LocalPlayer and Env.LocalPlayer.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+local function move(position,P,guard)
+    if not position or type(guard)~="function" or not guard() then return false,false end
+    local hrp=root(); if not hrp then return false,false end
+    local attempted=false
+    local ok,moved=pcall(function()
+        if not guard() or not W.isCurrent(P,current()) then return false end
+        hrp.AssemblyLinearVelocity=Vector3.zero
+        attempted=true -- CFrame assignment can trigger a portal even when a later property errors
+        hrp.CFrame=CFrame.new(position+Vector3.new(0,2,0))
+        hrp.AssemblyAngularVelocity=Vector3.zero
+        return true
+    end)
+    return ok and moved==true,attempted,not ok and tostring(moved) or nil
+end
+-- For the hatch mover: a previously confirmed Rift island may be reached by its live portal.
+-- One unconfirmed possible transition is not repeated. No guess at RF.Travel arguments.
+function R.travel(island,guard)
+    local P=Ui.__progressTest; local data=current()
+    if type(P)~="table" or P.worldName~="TimeRift" or not W.isCurrent(P,data)
+        or P.islandTravelUncertain or P.islandTravelInFlight or not ensureEvidence(P)
+        or type(guard)~="function" or type(island)~="string" or island:find("|",1,true) then
+        return false,"переход не разрешён"
+    end
+    if W.sameName(data.Progression and data.Progression.Island,island) then return true,"уже на острове" end
+    if W.islandState(data,island,P.verifiedRiftIslands)~=true then return false,"доступ к Rift-острову не подтверждён" end
+    local config=loadCfg(); local def=config and config.Islands[island]
+    if type(def)~="table" then return false,"острова нет в RiftIslandConfig" end
+    local pos,why=findPortal({name=island,def=def}); if not pos then return false,why end
+    if not travelJournal then return false,"нет журнала перехода: "..tostring(travelJournalErr) end
+    local clear,err=travelJournal.check(); if not clear then P.islandTravelUncertain=true; return false,err end
+    local function valid()
+        local ok,v=pcall(guard)
+        return ok and v==true and Life.alive and Ui.__progressTest==P and not P.stopRequested
+            and not P.worldChanging and W.isCurrent(P,current())
+    end
+    if not valid() then return false,"отменено до перемещения" end
+    P.islandTravelInFlight=true
+    local token,writeErr,partial=travelJournal.begin("TimeRift|"..island.."|portal")
+    if not token then
+        if partial and not travelJournal.cancelUnsent(partial) then P.islandTravelUncertain=true end
+        P.islandTravelInFlight=false
+        return false,"журнал перехода: "..tostring(writeErr)
+    end
+    if not valid() then
+        if not travelJournal.cancelUnsent(token) then P.islandTravelUncertain=true end
+        P.islandTravelInFlight=false; return false,"отменено до перемещения"
+    end
+    local moved,attempted,moveErr=move(pos,P,valid)
+    if not moved then
+        if attempted then P.islandTravelUncertain=true
+        elseif not travelJournal.cancelUnsent(token) then P.islandTravelUncertain=true end
+        P.islandTravelInFlight=false; return false,"не удалось подойти к порталу: "..tostring(moveErr)
+    end
+    local deadline=os.clock()+12
+    repeat
+        local d=current()
+        if W.isCurrent(P,d) and W.sameName(d.Progression and d.Progression.Island,island) then
+            local recorded,recordErr=recordEvidence(P,island)
+            local done,saveErr=false,nil
+            if recorded then done,saveErr=travelJournal.finish(token) end
+            P.islandTravelInFlight=false
+            if done then return true,"остров подтверждён репликой" end
+            P.islandTravelUncertain=true; return false,"подтверждение не сохранено: "..tostring(recordErr or saveErr)
+        end
+        Life.wait(0.15)
+    until not valid() or os.clock()>=deadline
+    P.islandTravelInFlight=false; P.islandTravelUncertain=true
+    return false,"переход мог задержаться; повтор не выполняю"
+end
+local function recover(P,data)
+    if not ensureEvidence(P) then
+        if P.riftEvidenceError then P.islandUncertain=true; status("evidence",P.riftEvidenceError) end
+        return
+    end
+    local config=loadCfg(); if not config then return end
+    local here=data.Progression and data.Progression.Island
+    if type(here)=="string" and type(config.Islands[here])=="table" and not P.verifiedRiftIslands[here] then
+        local ok,err=recordEvidence(P,here)
+        if not ok then P.islandUncertain=true; status("evidence",tostring(err)); return end
+    end
+    if not P.islandTravelInFlight then
+        if not travelJournal then P.islandTravelUncertain=true; status("travel-journal",tostring(travelJournalErr)); return end
+        local raw,err=travelJournal.inspect()
+        if raw==nil then P.islandTravelUncertain=true; status("travel-journal",tostring(err)); return end
+        if type(raw)=="string" then
+            local name=raw:match("^TSV14_PENDING_V1|TimeRift|([^|]+)|portal$")
+            if name and W.sameName(here,name) then
+                local recorded=recordEvidence(P,name)
+                local done=recorded and travelJournal.confirmObserved("TimeRift|"..name.."|portal")
+                if done then P.islandTravelUncertain=false; log("поздний переход "..name.." подтверждён")
+                else P.islandTravelUncertain=true end
+            else P.islandTravelUncertain=true end
+        end
+    end
+    if not P.islandInFlight then
+        if not journal then P.islandUncertain=true; status("journal",tostring(journalErr)); return end
+        local raw,err=journal.inspect()
+        if raw==nil then P.islandUncertain=true; status("journal",tostring(err)); return end
+        if type(raw)=="string" then
+            local name,price,wasClosed=raw:match("^TSV14_PENDING_V1|TimeRift|([^|]+)|([^|]+)|g([01])$")
+            local exists=name and type(config.Islands[name])=="table"
+            local opened=exists and (W.islandState(data,name,P.verifiedRiftIslands)==true
+                or (wasClosed=="1" and genericOpen(data,name)))
+            if opened then
+                local recorded=recordEvidence(P,name)
+                local done=recorded and journal.confirmObserved("TimeRift|"..name.."|")
+                if done then P.islandUncertain=false; P.riftIslandPendingName=nil; log("позднее подтверждение острова "..name)
+                else P.islandUncertain=true end
+            else P.islandUncertain=true; P.riftIslandPendingName=name end
+        end
+    end
+    restoreAfterIsland(P)
+end
+Life.loop("rift:islands",1,function()
+    local P=Ui.__progressTest; local data=current()
+    if P and P.worldName=="TimeRift" and W.isCurrent(P,data) then recover(P,data) end
+    if busy or os.clock()<nextTry or not allowed(P,false,true) then return end
+    if not journal then status("journal","нет журнала покупки острова: "..tostring(journalErr)); nextTry=os.clock()+60; return end
+    local clear,why=journal.check()
+    if not clear then status("pending","покупку острова не повторяю: "..tostring(why)); nextTry=os.clock()+30; return end
+    local item,reason=nextIsland(data,P)
+    if not item then status("no:"..tostring(reason),tostring(reason)); nextTry=os.clock()+30; return end
+    local coins=W.coins(data)
+    if not coins or coins<item.price then
+        status("wait:"..item.name,"следующий "..item.name..", цена из RiftIslandConfig="..tostring(item.price)
+            .." RiftCoins; продолжаю яйца и ребёрты без накопительной паузы")
+        nextTry=os.clock()+2; return
+    end
+    local pos,missing=findPortal(item)
+    if not pos then status("portal:"..item.name,"портал "..item.name.." не найден: "..tostring(missing)); nextTry=os.clock()+30; return end
+    if not allowed(P,false,true) then return end
+    busy,Ui.travelling=true,OWNER
+    local ok,err=pcall(function()
+        local deadline=os.clock()+13
+        while Ui.hatchInFlight and allowed(P,true,true) and os.clock()<deadline do Life.wait(0.05) end
+        if not allowed(P,true,false) then return end
+        local moved,attempted,moveErr=move(pos,P,function() return allowed(P,true,false) end)
+        if not moved then
+            if attempted then P.islandTravelUncertain=true; log("портал мог сработать при ошибке перемещения: "..tostring(moveErr)) end
+            return
+        end
+        local untilGui=os.clock()+5
+        repeat
+            local d=current()
+            if not W.isCurrent(P,d) or not allowed(P,true,false) then return end
+            if W.islandState(d,item.name,P.verifiedRiftIslands)==true then
+                local recorded,why=recordEvidence(P,item.name)
+                if not recorded then P.islandUncertain=true; log("не сохранён доступ: "..tostring(why))
+                else log("доступ "..item.name.." подтверждён репликой") end
+                return
+            end
+            local balance=W.coins(d)
+            if not balance or balance<item.price then return end
+            local button,display=N.findPurchase(item.name,"RiftCoins",item.price,balance)
+            if button then
+                local genericWasClosed=not genericOpen(d,item.name)
+                local token,writeErr,partial=journal.begin("TimeRift|"..item.name.."|"..string.format("%.17g",display)
+                    .."|g"..(genericWasClosed and "1" or "0"))
+                if not token then
+                    if partial then journal.cancelUnsent(partial) end
+                    status("save", "не удалось сохранить ожидание острова: "..tostring(writeErr)); return
+                end
+                P.islandInFlight=true; P.riftIslandPendingName=item.name
+                local attempted,called,fireErr=N.fireButton(button,function()
+                    local fresh=current(); local nowItem=fresh and nextIsland(fresh,P)
+                    local again,shown=N.findPurchase(item.name,"RiftCoins",item.price,W.coins(fresh))
+                    return allowed(P,true,false) and W.isCurrent(P,fresh) and nowItem and nowItem.name==item.name
+                        and again==button and shown==display and W.coins(fresh) and W.coins(fresh)>=math.max(item.price,display)
+                end)
+                if not attempted then
+                    local cleared=journal.cancelUnsent(token)
+                    P.islandInFlight=false; P.riftIslandPendingName=nil
+                    if not cleared then P.islandUncertain=true end
+                    status("native","игровая кнопка острова не вызвана: "..tostring(fireErr)); return
+                end
+                if not called then log("ошибка после возможной отправки: "..tostring(fireErr)) end
+                log("нажата игровая кнопка "..item.name.." за "..tostring(display).." RiftCoins; жду реплику")
+                local untilResult=os.clock()+15
+                repeat
+                    local fresh=current()
+                    if W.isCurrent(P,fresh) and (W.islandState(fresh,item.name,P.verifiedRiftIslands)==true
+                        or (genericWasClosed and genericOpen(fresh,item.name))) then
+                        local recorded,recordErr=recordEvidence(P,item.name)
+                        local finished,saveErr=false,nil
+                        if recorded then finished,saveErr=journal.finish(token) end
+                        P.islandInFlight=false
+                        if finished then P.riftIslandPendingName=nil; log("остров "..item.name.." подтверждён")
+                        else P.islandUncertain=true; log("не сохранилось подтверждение: "..tostring(recordErr or saveErr)) end
+                        return
+                    end
+                    Life.wait(0.2)
+                until not Life.alive or P.stopRequested or os.clock()>=untilResult
+                P.islandInFlight=false; P.islandUncertain=true
+                log("разблокировка не подтверждена репликой; покупку не повторяю")
+                return
+            end
+            Life.wait(0.2)
+        until os.clock()>=untilGui
+        status("ui:"..item.name,"нет однозначной игровой кнопки "..item.name.." с ценой и RiftCoins; фарм продолжается")
+    end)
+    if Ui.travelling==OWNER then Ui.travelling=false end
+    busy=false; nextTry=os.clock()+30
+    if not ok then
+        if P.islandInFlight then P.islandInFlight=false; P.islandUncertain=true end
+        log("ошибка острова: "..tostring(err).."; отправленный запрос не повторяю")
+    end
+end)
+Life.onCleanup(function() if Ui.travelling==OWNER then Ui.travelling=false end end)
+return R
+end
+
+__modules["features/world_router"] = function(use)
+-- Main -> TimeRift supervisor. Arrival is only accepted from Progression.World.
+local Env,Life,Ui=use("core/env"),use("shared/life"),use("core/ui")
+local W,N,J=use("features/world_data"),use("features/rift_native"),use("features/operation_journal")
+local mainIslands=use("features/island_progress")
+local OWNER="ts14-world-entry"
+local Router={}
+local function isa(o,c) local ok,v=pcall(function() return o and o:IsA(c) end); return ok and v==true end
+local function children(o) local ok,v=pcall(function() return o and o:GetChildren() end); return ok and type(v)=="table" and v or nil end
+local function data() local ok,d=pcall(Env.data); return ok and type(d)=="table" and d or nil end
+local function root() local c=Env.LocalPlayer and Env.LocalPlayer.Character; return c and c:FindFirstChild("HumanoidRootPart") end
+local function entrance()
+    -- This exact live object led the user's prior test into TimeRift; it is a hint, not proof.
+    local model=workspace:FindFirstChild("World2Portal")
+    if not model then return nil,"Workspace.World2Portal не загружен" end
+    if isa(model,"BasePart") then return model end
+    local meshes=model:FindFirstChild("Meshes")
+    local observed=meshes and meshes:FindFirstChild("cool portal_Cylinder.025")
+    if observed and isa(observed,"BasePart") then return observed end
+    local q,head,candidates={model},1,{}
+    while head<=#q and head<=400 do
+        local node=q[head]; head+=1
+        if isa(node,"BasePart") then
+            local n=W.norm(node.Name)
+            if n=="portalhitbox" or n=="portaltrigger" or n=="entrancetrigger" then candidates[#candidates+1]=node end
+        end
+        local list=children(node); if not list then return nil,"неполный обход World2Portal" end
+        for _,c in ipairs(list) do q[#q+1]=c end
+    end
+    if head<=#q or #candidates~=1 then return nil,"не найден однозначный trigger World2Portal" end
+    return candidates[1]
+end
+local function safe(P,allowTravel)
+    return type(P)=="table" and not P.pending and not P.previousRebirthPending and not P.previousOtherWorldRebirthPending and not P.previousHatchPending
+        and not P.previousCraftPending and not P.previousIslandPending and not P.worldPurchaseInFlight and not P.hatchUncertain and not P.craftUncertain
+        and not P.islandUncertain and not P.islandTravelUncertain and not P.upgradeUncertain and not P.skillUncertain
+        and not P.worldTravelUncertain and not P.finalizing and not P.riftEvidenceError
+        and not P.craftBusy and not P.craftInFlight and not P.islandInFlight
+        and not P.islandTravelInFlight and not P.upgradeInFlight and not P.skillInFlight and not P.cleaning
+        and not P.locating and not P.clickerRefreshPending and not Ui.hatchInFlight and not Ui.hatchMoving
+        and (allowTravel or not Ui.travelling)
+end
+local function freshState(world)
+    return {phase="bootstrap",worldName=world,holdHatch=true,holdUpgrades=true,equipReady=false,
+        disableAutoCraft=true,holdCraft=true,holdSkillTree=true,holdTap=true,stopRequested=false,
+        gemWork={}}
+end
+function Router.start(emit)
+    local initial=Ui.__progressTest
+    local user=Env.LocalPlayer and Env.LocalPlayer.UserId
+    local worldJournal,worldJournalErr=J.new("world_travel",user)
+    local purchaseJournal,purchaseJournalErr=J.new("world_purchase",user)
+    local spawnJournal,spawnJournalErr=J.new("main_spawn_travel",user)
+    local f=Env.files or {}
+    local id=W.finite(user)
+    if not id or id<1 or id~=math.floor(id) or id>9007199254740991 then error("неизвестный UserId") end
+    local key=string.format("%.0f",id)
+    local stickyPath="SlopixHub/TapSimulator/ts14_entered_rift_"..key..".state"
+    local stickyMagic="TS14_ENTERED_RIFT_V1"
+    if type(f.isfile)~="function" or type(f.readfile)~="function" or type(f.writefile)~="function"
+        or type(f.isfolder)~="function" or type(f.makefolder)~="function" then error("нет функций записи состояния миров") end
+    local okFile,exists=pcall(f.isfile,stickyPath)
+    if not okFile or type(exists)~="boolean" then error("файл входа в TimeRift не читается") end
+    local everRift=false
+    if exists then
+        local got,raw=pcall(f.readfile,stickyPath)
+        if not got or raw~=stickyMagic then error("повреждён файл входа в TimeRift") end
+        everRift=true
+    end
+    local stickyWritten=everRift
+    local busy,nextClosed,nextOpen,started=false,0,0,false
+    local lastMsg,lastMsgAt=nil,0
+    local function log(msg)
+        local s=tostring(msg)
+        if s~=lastMsg or os.clock()-lastMsgAt>=45 then
+            lastMsg,lastMsgAt=s,os.clock(); emit("world","[МИРЫ v14] "..s)
+        end
+    end
+    local function markRift(P)
+        if everRift and stickyWritten then return true end
+        everRift=true -- before write; a write failure never resumes Main in this client
+        local ok,err=pcall(function()
+            for _,folder in ipairs({"SlopixHub","SlopixHub/TapSimulator"}) do if not f.isfolder(folder) then f.makefolder(folder) end end
+            f.writefile(stickyPath,stickyMagic)
+            assert(f.isfile(stickyPath) and f.readfile(stickyPath)==stickyMagic,"подтверждение записи не прошло")
+        end)
+        Env.elevate()
+        if not ok then
+            P.worldChanging,P.holdHatch,P.holdTap,P.phase=true,true,true,"blocked"
+            log("TimeRift обнаружен, но переход не сохранился: "..tostring(err).."; Main не возобновляю")
+            return false
+        end
+        stickyWritten=true
+        return true
+    end
+    local function reconcileOtherWorld(d,other,remembered)
+        local stem=other=="TimeRift" and "ts14_rift_" or other=="Main" and "ts30_" or nil
+        if not stem then return false,"неизвестный предыдущий мир" end
+        local path="SlopixHub/TapSimulator/"..stem.."rebirth_"..key..".state"
+        local ok,has=pcall(f.isfile,path)
+        if not ok or type(has)~="boolean" then return false,"старый запрос ребёрта не читается" end
+        local raw
+        if has then local got; got,raw=pcall(f.readfile,path); if not got or type(raw)~="string" then return false,"старый запрос ребёрта не читается" end end
+        local diskBefore=raw and tonumber(raw:match("^TS30_RB_PENDING_V1:(%d+)$")) or nil
+        if raw and raw~="TS30_NO_PENDING_V1" and not diskBefore then return false,"повреждён старый запрос ребёрта" end
+        local memBefore=type(remembered)=="table" and W.finite(remembered.before) or nil
+        if remembered and not memBefore then return false,"неизвестен счётчик старого ребёрта" end
+        if diskBefore and memBefore and diskBefore~=memBefore then return false,"разные старые запросы ребёрта" end
+        local before=diskBefore or memBefore
+        if before then
+            local observed=W.rebirthsFor(d,other)
+            if not observed or observed<=before then return false,"ожидаю подтверждение ребёрта мира "..other end
+            if diskBefore then
+                local saved,err=pcall(function()
+                    assert(f.readfile(path)==raw,"старый журнал изменился")
+                    f.writefile(path,"TS30_NO_PENDING_V1")
+                    assert(f.isfile(path) and f.readfile(path)=="TS30_NO_PENDING_V1","запись не подтверждена")
+                end)
+                Env.elevate()
+                if not saved then return false,"подтверждение старого ребёрта не сохранилось: "..tostring(err) end
+            end
+            log("подтверждён и отделён ребёрт предыдущего мира "..other)
+        end
+        return true
+    end
+    local function live(P)
+        return Life.alive and not Ui.__globalStop and type(P)=="table" and Ui.__progressTest==P
+            and not P.stopRequested and not (Env.genv and Env.genv.__handoverPaused)
+            and Ui.Toggles and Ui.Toggles.AutoTap and Ui.Toggles.AutoTap.Value==true
+            and Ui.Toggles.AutoHatch and Ui.Toggles.AutoHatch.Value==true
+    end
+    local function installStop()
+        if not Env.genv then return end
+        Env.genv.ts30TestStop=function()
+            Ui.__globalStop=true
+            local P=Ui.__progressTest
+            if P then P.stopRequested=true; P.holdTap=true; P.holdHatch=true; P.holdCraft=true; P.disableAutoCraft=true end
+            Ui.stopAll()
+            pcall(function() if type(Ui.syncNativeClicker)=="function" then Ui.syncNativeClicker() end end)
+            print("[TAPSIM] ПРОГРЕССИЯ | остановлено; уже отправленный запрос отменить нельзя")
+        end
+    end
+    local function beginController(P,world)
+        P.worldName=world
+        local ok,result=pcall(function() return use("features/progress_test").start(emit) end)
+        if not ok then
+            P.holdHatch,P.holdUpgrades,P.holdCraft,P.phase=true,true,true,"blocked"
+            log("контроллер "..world.." не запущен: "..tostring(result)); return false
+        end
+        P.controllerStarted=true
+        installStop()
+        return true
+    end
+    local function resumeMain(P,holds,phaseBefore)
+        if not live(P) or Ui.__progressTest~=P then return end
+        P.worldChanging=false
+        -- If an action became uncertain while draining, never undo its protective hold.
+        if P.phase==phaseBefore and not P.hatchUncertain and not P.craftUncertain
+            and not P.islandUncertain and not P.islandTravelUncertain and not P.worldTravelUncertain then
+            P.holdHatch,P.holdCraft,P.disableAutoCraft=holds[1],holds[2],holds[3]
+            P.holdUpgrades,P.holdSkillTree=holds[4],holds[5]
+        end
+    end
+    local function beginRoute(P)
+        local holds={P.holdHatch,P.holdCraft,P.disableAutoCraft,P.holdUpgrades,P.holdSkillTree}
+        local phase=P.phase
+        P.worldChanging=true
+        P.holdHatch,P.holdCraft,P.disableAutoCraft,P.holdUpgrades,P.holdSkillTree=true,true,true,true,true
+        return holds,phase
+    end
+    local function toSpawn(P)
+        local d=data(); local prog=d and d.Progression
+        if not prog or prog.World~="Main" then return false,"мир изменился" end
+        if not spawnJournal then return false,"нет журнала Main/Spawn: "..tostring(spawnJournalErr) end
+        if prog.Island=="Spawn" then
+            local done,err=spawnJournal.confirmObserved("Main|Spawn|menu")
+            if not done then P.islandTravelUncertain=true; return false,tostring(err) end
+            return true
+        end
+        local clear,why=spawnJournal.check()
+        if not clear then P.islandTravelUncertain=true; return false,"старый Main/Spawn не подтверждён: "..tostring(why) end
+        local token,err,partial=spawnJournal.begin("Main|Spawn|menu")
+        if not token then
+            if partial and not spawnJournal.cancelUnsent(partial) then P.islandTravelUncertain=true end
+            return false,"журнал Main/Spawn: "..tostring(err)
+        end
+        local sent,detail=mainIslands.travel("Spawn",function()
+            local x=data()
+            return live(P) and P.worldChanging and W.world(x)=="Main" and Ui.travelling==OWNER
+        end)
+        if not sent then
+            if P.islandTravelUncertain or P.islandTravelInFlight then
+                P.islandTravelUncertain=true -- a possibly sent travel remains in the journal
+            elseif not spawnJournal.cancelUnsent(token) then P.islandTravelUncertain=true end
+            return false,"переход на Main/Spawn: "..tostring(detail)
+        end
+        local deadline=os.clock()+12
+        repeat
+            local x=data(); local p=x and x.Progression
+            if p and p.World=="Main" and p.Island=="Spawn" then
+                local done,saveErr=spawnJournal.finish(token)
+                if not done then P.islandTravelUncertain=true; return false,tostring(saveErr) end
+                return true
+            end
+            -- Do not erase a potentially late Spawn request merely because the user arrived
+            -- elsewhere; it is irrelevant in Rift but will be rechecked on a later Main entry.
+            if W.world(x)=="TimeRift" then return true end
+            Life.wait(0.15)
+        until not live(P) or os.clock()>=deadline
+        P.islandTravelUncertain=true
+        return false,"Main/Spawn не подтверждён после возможного перехода"
+    end
+    local function approach(part,P)
+        if not live(P) or W.world(data())~="Main" then return false,"условия изменились",false end
+        local hrp=root(); if not hrp or not part or not part.Parent then return false,"нет персонажа/портала",false end
+        local distOk,dist=pcall(function() return (hrp.Position-part.Position).Magnitude end)
+        if not distOk or type(dist)~="number" or dist>650 then return false,"портал слишком далеко от Spawn или нет расстояния",false end
+        local attempted=false
+        local ok,moved=pcall(function()
+            if not live(P) or W.world(data())~="Main" then return false end
+            hrp.AssemblyLinearVelocity=Vector3.zero
+            attempted=true
+            hrp.CFrame=part.CFrame+Vector3.new(0,2,0)
+            hrp.AssemblyAngularVelocity=Vector3.zero
+            return true
+        end)
+        return ok and moved==true,ok and (moved and nil or "условия изменились") or tostring(moved),attempted
+    end
+    local function enterOpen(P,part)
+        if not worldJournal then log("нет журнала перехода: "..tostring(worldJournalErr)); return false end
+        local clear,why=worldJournal.check()
+        if not clear then P.worldTravelUncertain=true; log("старый переход не подтверждён, не повторяю: "..tostring(why)); return false end
+        local token,err,partial=worldJournal.begin("Main|TimeRift|portal")
+        if not token then
+            if partial then worldJournal.cancelUnsent(partial) end
+            log("не сохранился журнал перехода: "..tostring(err)); return false
+        end
+        if not live(P) or not W.world2Open(data()) or W.world(data())~="Main" then
+            if not worldJournal.cancelUnsent(token) then P.worldTravelUncertain=true end
+            return false
+        end
+        local moved,moveErr,attempted=approach(part,P)
+        if not moved then
+            if attempted then P.worldTravelUncertain=true
+            elseif not worldJournal.cancelUnsent(token) then P.worldTravelUncertain=true end
+            log("не подошёл к входу: "..tostring(moveErr)); return false
+        end
+        log("входной портал World2Portal: ожидаю подтверждение TimeRift в реплике")
+        local deadline=os.clock()+15
+        repeat
+            local d=data()
+            if W.world(d)=="TimeRift" then
+                local ok,saveErr=worldJournal.finish(token)
+                if not ok then P.worldTravelUncertain=true; log("переход подтверждён, но журнал не очищен: "..tostring(saveErr)); return false end
+                log("переход подтверждён: TimeRift")
+                return true
+            end
+            Life.wait(0.15)
+        until not live(P) or os.clock()>=deadline
+        P.worldTravelUncertain=true
+        log("возможный переход ещё не подтверждён; повтор не выполняю")
+        return false
+    end
+    local function buyClosed(P,part)
+        if not purchaseJournal then log("покупка мира недоступна без журнала: "..tostring(purchaseJournalErr)); return end
+        local clear,why=purchaseJournal.check()
+        if not clear then log("предыдущая покупка мира не подтверждена: "..tostring(why).."; Main продолжает фарм"); return end
+        local moved,err,attempted=approach(part,P)
+        if not moved then
+            if attempted then P.worldTravelUncertain=true end
+            log("подойти к закрытому миру не удалось: "..tostring(err)); return
+        end
+        local untilGui=os.clock()+5
+        repeat
+            local d=data()
+            if W.world(d)=="TimeRift" or W.world2Open(d) then return end
+            if not live(P) or W.world(d)~="Main" then return end
+            local coins=W.coins(d)
+            if coins then
+                local target="Time Rift"
+                local button,price=N.findPurchase(target,"Coins",nil,coins)
+                if not button then target="World 2"; button,price=N.findPurchase(target,"Coins",nil,coins) end
+                if button then
+                    local token,writeErr,partial=purchaseJournal.begin("Main|TimeRift|"..string.format("%.17g",price))
+                    if not token then
+                        if partial then purchaseJournal.cancelUnsent(partial) end
+                        log("ожидание покупки мира не сохранилось: "..tostring(writeErr)); return
+                    end
+                    P.worldPurchaseInFlight=true
+                    local attempted,called,fireErr=N.fireButton(button,function()
+                        local fresh=data()
+                        local again,shown=N.findPurchase(target,"Coins",nil,W.coins(fresh))
+                        return live(P) and P.worldChanging and W.world(fresh)=="Main" and not W.world2Open(fresh)
+                            and W.heavenOpen(fresh) and again==button and shown==price
+                            -- findPurchase has rechecked any required rounding margin.
+                            and W.coins(fresh) and W.coins(fresh)>=price
+                    end)
+                    if not attempted then
+                        local cleared=purchaseJournal.cancelUnsent(token)
+                        P.worldPurchaseInFlight=false
+                        if not cleared then P.worldPurchaseUncertain=true end
+                        log("кнопка мира не вызвана: "..tostring(fireErr)); return
+                    end
+                    if not called then log("ошибка после возможной покупки мира: "..tostring(fireErr)) end
+                    log("нажата игровая кнопка TimeRift, показанная цена="..tostring(price).." Coins; жду реплику")
+                    local deadline=os.clock()+15
+                    repeat
+                        local fresh=data()
+                        if W.world2Open(fresh) or W.world(fresh)=="TimeRift" then
+                            local done,clearErr=purchaseJournal.finish(token)
+                            P.worldPurchaseInFlight=false
+                            if not done then P.worldPurchaseUncertain=true; log("не сохранено подтверждение: "..tostring(clearErr)) end
+                            return
+                        end
+                        Life.wait(0.2)
+                    until not live(P) or os.clock()>=deadline
+                    P.worldPurchaseInFlight=false; P.worldPurchaseUncertain=true
+                    log("покупка мира не подтверждена: повтор запрещён; Main продолжает фарм")
+                    return
+                end
+            end
+            Life.wait(0.2)
+        until os.clock()>=untilGui
+        log("нет однозначной кнопки мира с ценой в Coins; продолжаю Main без паузы накопления")
+    end
+    local function switchToRift(P)
+        if not safe(P,false) then log("перед сменой мира жду подтверждения уже отправленных действий"); return false end
+        if not markRift(P) then return false end
+        local nextP=freshState("TimeRift")
+        nextP.riftTestFloor=P.riftTestFloor
+        Ui.__progressTest=nextP
+        if not beginController(nextP,"TimeRift") then return false end
+        everRift=true
+        log("активна отдельная прогрессия TimeRift: RiftCoins, RiftGems и RiftRebirths; Main больше не фармится")
+        return true
+    end
+    Life.loop("world:router",0.5,function()
+        local d=data(); local world=W.world(d); local P=Ui.__progressTest
+        if not P or not world or Ui.__globalStop then return end
+        if not started then
+            if worldJournal and world=="TimeRift" then
+                local resolved=worldJournal.confirmObserved("Main|TimeRift|")
+                if not resolved then P.previousIslandPending=true end
+            end
+            if purchaseJournal and (world=="TimeRift" or W.world2Open(d)) then
+                local resolved=purchaseJournal.confirmObserved("Main|TimeRift|")
+                if not resolved then P.previousIslandPending=true end
+            end
+            if P.previousWorldName and P.previousWorldName~=world and P.previousRebirthPending then
+                P.previousOtherWorldRebirthPending={world=P.previousWorldName,before=P.previousRebirthPending.before}
+                P.previousRebirthPending=nil
+            end
+            local other=world=="TimeRift" and "Main" or (P.previousOtherWorldRebirthPending and P.previousOtherWorldRebirthPending.world)
+            if other then
+                local q=P.previousOtherWorldRebirthPending
+                local reconciled,why=reconcileOtherWorld(d,other,q)
+                if not reconciled then
+                    P.holdHatch,P.holdTap,P.phase=true,true,"blocked"
+                    log(tostring(why).."; автоматическую смену не запускаю")
+                    return
+                end
+                P.previousOtherWorldRebirthPending=nil
+            end
+            if world=="TimeRift" and not markRift(P) then return end
+            started=true
+            P.worldName=world
+            P.worldChanging=world=="Main" and (W.world2Open(d) or everRift) or false
+            if world=="Main" and everRift then
+                -- A saved Rift arrival forbids re-starting Main's farm after a manual return.
+                P.holdTap,P.holdHatch,P.phase=true,true,"world_return"
+                log("TimeRift посещён ранее: Main больше не фармлю; ожидаю вход во второй мир")
+                pcall(function() if Ui.syncNativeClicker then Ui.syncNativeClicker() end end)
+                installStop()
+            elseif not beginController(P,world) then return end
+            if P.worldChanging and W.world2Open(d) then
+                P.holdTap=true
+                pcall(function() if Ui.syncNativeClicker then Ui.syncNativeClicker() end end)
+            end
+            if world=="TimeRift" then everRift=true; log("уже в TimeRift: обратно в Main не перемещаюсь") end
+        end
+        if not live(P) then return end
+        if world=="TimeRift" and P.worldName~="TimeRift" then
+            P.worldChanging=true
+            if worldJournal then
+                local ok=worldJournal.confirmObserved("Main|TimeRift|")
+                if ok then P.worldTravelUncertain=false end
+            end
+            if purchaseJournal then purchaseJournal.confirmObserved("Main|TimeRift|") end
+            switchToRift(P)
+            return
+        end
+        if world=="TimeRift" then everRift=true; return end
+        if world~="Main" then return end
+        if P.worldName~="Main" then
+            P.worldChanging=true
+            if not safe(P,false) then return end
+            local route=freshState("Main"); route.worldChanging=true; route.holdTap=true
+            Ui.__progressTest=route; P=route
+            pcall(function() if type(Ui.syncNativeClicker)=="function" then Ui.syncNativeClicker() end end)
+            installStop()
+            log("обнаружен возврат в Main: фарм первого мира не возобновляю")
+        end
+        if P.islandTravelUncertain and spawnJournal and type(d.Progression)=="table" and d.Progression.Island=="Spawn" then
+            local raw=spawnJournal.inspect()
+            if type(raw)=="string" and raw=="TSV14_PENDING_V1|Main|Spawn|menu" then
+                if spawnJournal.confirmObserved("Main|Spawn|menu") then
+                    P.islandTravelUncertain=false; log("задержавшийся Main/Spawn подтверждён")
+                end
+            end
+        end
+        local open=W.world2Open(d)
+        if open and purchaseJournal then
+            local ok=purchaseJournal.confirmObserved("Main|TimeRift|")
+            if ok then P.worldPurchaseUncertain=false end
+        end
+        local wantClosed=not open and not everRift and W.heavenOpen(d) and os.clock()>=nextClosed
+        if busy or (not open and not wantClosed) or (open and os.clock()<nextOpen) then return end
+        busy=true
+        local holds,oldPhase=beginRoute(P)
+        local waitUntil=os.clock()+15
+        while live(P) and not safe(P,false) and os.clock()<waitUntil do Life.wait(0.1) end
+        if not live(P) then busy=false; return end
+        if not safe(P,false) then
+            log("жду незавершённый запрос перед порталом")
+            if not open then resumeMain(P,holds,oldPhase); nextClosed=os.clock()+30 end
+            busy=false; return
+        end
+        Ui.travelling=OWNER
+        local ok,err=pcall(function()
+            local spawn,why=toSpawn(P)
+            if not spawn then log(why); return end
+            if W.world(data())=="TimeRift" or not live(P) then return end
+            local part,missing=entrance()
+            if not part then log(missing); return end
+            if W.world2Open(data()) then enterOpen(P,part) else buyClosed(P,part) end
+        end)
+        if Ui.travelling==OWNER then Ui.travelling=false end
+        busy=false
+        if not ok then log("ошибка входа: "..tostring(err)) end
+        local fresh=data()
+        if W.world(fresh)=="TimeRift" then
+            if worldJournal then
+                local done=worldJournal.confirmObserved("Main|TimeRift|")
+                if done then P.worldTravelUncertain=false end
+            end
+            switchToRift(P)
+        elseif W.world2Open(fresh) or everRift then
+            nextOpen=os.clock()+10
+            P.holdTap=true
+            pcall(function() if Ui.syncNativeClicker then Ui.syncNativeClicker() end end)
+            -- Do not return to Main farming when TimeRift is already accessible.
+        else
+            resumeMain(P,holds,oldPhase); nextClosed=os.clock()+60
+        end
+    end)
+    installStop()
+    Life.onCleanup(function() if Ui.travelling==OWNER then Ui.travelling=false end end)
+    return true
+end
+return Router
+end
+
 __modules["core/env"] = function(use) -- src/games/tapsim/core/env.luau
 -- Tap Simulator: Reborn. The game's data and remotes; everything else comes from shared/env.
 --
@@ -313,6 +1891,7 @@ __modules["features/craft"] = function(use) -- 30M v7: guarded, explicit 100% pe
 local Env = use("core/env")
 local Life = use("shared/life")
 local Ui = use("core/ui")
+local W = use("features/world_data")
 local RS, Options, tab = Env.ReplicatedStorage, Ui.Options, Ui.Tabs.Craft
 
 local function load(path)
@@ -547,6 +2126,29 @@ end
 local function goTo(def)
     local hrp = root()
     if not hrp or not allowed() then return false end
+    local P = Ui.__progressTest
+    if P and P.worldName == "TimeRift" then
+        -- Only a live, unique interaction point under World2; never use Main fallback positions.
+        local world = workspace:FindFirstChild("World2")
+        if not world or not W.isCurrent(P, Env.data()) then return false end
+        local queue, head, matches = { world }, 1, {}
+        while head <= #queue and head <= 20000 do
+            local node = queue[head]; head += 1
+            local ok, isPart = pcall(function() return node:IsA("BasePart") end)
+            local tagged=false
+            if ok and isPart and node.Name==def.point and Env.CollectionService then
+                local got,yes=pcall(function() return Env.CollectionService:HasTag(node,"InteractionPoint") end)
+                tagged=got and yes==true
+            end
+            if tagged then matches[#matches + 1] = node end
+            local got, children = pcall(function() return node:GetChildren() end)
+            if not got then return false end
+            for _, child in ipairs(children) do queue[#queue + 1] = child end
+        end
+        if head <= #queue or #matches ~= 1 or not allowed() then return false end
+        if teleport(matches[1].CFrame) then Life.wait(0.35); return allowed() end
+        return false
+    end
     local here, places = hrp.Position, {}
     for _, place in ipairs(def.places) do places[#places + 1] = modelPivot(place.model) or place.fallback end
     table.sort(places, function(a, b) return (a - here).Magnitude < (b - here).Magnitude end)
@@ -4203,13 +5805,14 @@ end)
 return {}
 end
 __modules["features/island_progress"] = function(use)
--- Open the next affordable island during progression only. The server owns the save: a sent
--- request is NOT an unlock; UnlockedIslands must actually change. The portal and prices come
--- from this game session, not a hard-coded guide. This worker shares the movement lock with
--- hatching, crafting, cleanup and rebirth. Already-sent requests cannot be cancelled.
+-- Open the next affordable island at every progression stage. A sent request is NOT an unlock:
+-- UnlockedIslands must actually change. Portal/order/price come from the game configuration.
+-- A short movement reservation drains an already-sent egg before travelling, so immediate
+-- hatching cannot starve island access. No extra saving pause or rebirth wait is introduced.
 local Env = use("core/env")
 local Life = use("shared/life")
 local Ui = use("core/ui")
+local W = use("features/world_data")
 local RS = Env.ReplicatedStorage
 local OWNER = "ts30-island"
 local RETRY = 25
@@ -4334,15 +5937,30 @@ local function portal(candidate)
     return isa(part, "BasePart") and part or nil
 end
 local function tradePaused() return Env.genv and Env.genv.__handoverPaused == true end
-local function runAllowed(P, own)
-    return Life.alive and type(P) == "table" and Ui.__progressTest == P and not P.stopRequested
-        and P.phase == "rebirth" and not P.eggFixed and not P.rebirthLocked and not P.farmThresholdReached
-        and not P.holdHatch and not P.holdCraft and not P.pending and not P.cleaning
+local function runAllowed(P, own, allowHatchInFlight)
+    if type(P) ~= "table" then return false end
+    local hatchOn, tapOn, teleportOn = Ui.on("AutoHatch"), Ui.on("AutoTap"), Ui.on("HatchTeleport")
+    local snapshot = read() -- these calls can yield: re-read P and toggles afterwards
+    local toggles = Ui.Toggles
+    if not Life.alive or Ui.__progressTest ~= P or P.stopRequested or P.worldName ~= "Main"
+        or P.worldChanging or not W.isCurrent(P, snapshot) or type(toggles) ~= "table"
+        or not toggles.AutoHatch or toggles.AutoHatch.Value ~= true
+        or not toggles.HatchTeleport or toggles.HatchTeleport.Value ~= true
+        or (not P.rebirthLocked and (not toggles.AutoTap or toggles.AutoTap.Value ~= true)) then return false end
+    local farm = P.phase == "rebirth" and not P.eggFixed and not P.rebirthLocked
+        and not P.farmThresholdReached and not P.holdHatch and not P.holdCraft
+    local later = (P.eggFixed or P.rebirthLocked) and (P.phase == "save" or P.phase == "hatch"
+        or P.phase == "storage_wait" or P.phase == "target_wait" or P.phase == "locked_wait")
+    if later and (P.targetProbeRequired or (P.phase == "hatch" and P.holdHatch)) then return false end
+    -- A due probe has priority, even if the controller has not yet set its boolean guard.
+    local nowActive = (tonumber(P.activeClock) or 0) + math.max(0, os.clock() - (P.lastTick or os.clock()))
+    if later and not P.rebirthLocked and nowActive >= (tonumber(P.targetNextProbeAt) or math.huge) then return false end
+    return (farm or later) and not P.pending and not P.cleaning
         and not P.previousHatchPending and not P.previousRebirthPending and not P.previousCraftPending
         and not P.previousIslandPending and not P.islandUncertain and not P.islandTravelUncertain
         and not P.hatchUncertain and not P.craftUncertain and not P.craftBusy and not P.craftInFlight
-        and not Ui.hatchInFlight and not Ui.hatchMoving and not P.locating and not tradePaused()
-        and Ui.on("AutoHatch") and Ui.on("AutoTap") and Ui.on("HatchTeleport")
+        and (allowHatchInFlight or not Ui.hatchInFlight) and not Ui.hatchMoving and not P.locating and not tradePaused()
+        and hatchOn and (P.rebirthLocked or tapOn) and teleportOn
         and ((own and Ui.travelling == OWNER) or (not own and not Ui.travelling))
 end
 
@@ -4351,11 +5969,13 @@ end
 -- A successful dispatch is not evidence that the player arrived or the target streamed in.
 local function travel(island, guard)
     local P = Ui.__progressTest
-    if type(P) ~= "table" or type(island) ~= "string" or island == "" or type(guard) ~= "function" then
+    if type(P) ~= "table" or P.worldName ~= "Main" or not W.isCurrent(P, read())
+        or type(island) ~= "string" or island == "" or type(guard) ~= "function" then
         return false, "нет данных перехода"
     end
     local function allowed()
         if not Life.alive or Ui.__progressTest ~= P or P.stopRequested or tradePaused()
+            or P.worldName ~= "Main" or not W.isCurrent(P, read())
             or P.islandTravelInFlight or P.islandTravelUncertain then return false end
         local ok, value = pcall(guard)
         return ok and value == true
@@ -4367,8 +5987,21 @@ local function travel(island, guard)
     if not allowed() or not unlocked(data, island) then return false, "переход отменён или остров закрыт" end
     local packet = { Island = island, Source = "Menu" }
     if isa(r, "RemoteEvent") then
-        local ok, err = pcall(function() r:FireServer(packet) end)
-        return ok, ok and "отправлен" or ("ошибка Travel: " .. tostring(err))
+        if not allowed() then return false, "Travel отменён до отправки" end
+        P.islandTravelInFlight=true
+        local attempted=false
+        local ok, err = pcall(function()
+            local fresh=read()
+            local yes, permitted=pcall(guard)
+            if not Life.alive or Ui.__progressTest~=P or P.stopRequested or tradePaused()
+                or not W.isCurrent(P,fresh) or not unlocked(fresh,island) or not yes or permitted~=true then return end
+            attempted=true
+            r:FireServer(packet)
+        end)
+        P.islandTravelInFlight=false
+        if attempted and not ok then P.islandTravelUncertain=true end
+        if not attempted then return false, "Travel отменён до отправки" end
+        return ok, ok and "отправлен" or ("ошибка после возможной отправки Travel: " .. tostring(err))
     end
     local slot = { sent = false, done = false, cancelled = false }
     P.islandTravelInFlight = true
@@ -4379,7 +6012,7 @@ local function travel(island, guard)
         local fresh = read()
         local okGuard, yes = pcall(guard)
         if slot.cancelled or not elevated or not Life.alive or Ui.__progressTest ~= P or P.stopRequested or tradePaused()
-            or not okGuard or yes ~= true or not unlocked(fresh, island) then
+            or not okGuard or yes ~= true or not W.isCurrent(P,fresh) or not unlocked(fresh, island) then
             slot.cancelled, slot.done = true, true
             return
         end
@@ -4553,7 +6186,7 @@ local function status(key, text)
 end
 Life.loop("island:progress", 1, function()
     local P = Ui.__progressTest
-    if busy or not runAllowed(P, false) or P.islandInFlight or P.islandTravelInFlight then return end
+    if busy or not runAllowed(P, false, true) or P.islandInFlight or P.islandTravelInFlight then return end
     if os.clock() < nextTry then return end
     local data = read()
     if not data then return end
@@ -4566,12 +6199,18 @@ Life.loop("island:progress", 1, function()
         nextTry = os.clock() + 1
         return
     end
-    if not runAllowed(P, false) then return end
+    if not runAllowed(P, false, true) then return end
+    -- Claim the shared travel lock without yielding. It stops new hatches, while an already
+    -- sent egg is allowed to finish. This is only done once a next island is affordable.
     busy, Ui.travelling = true, OWNER
-    nextTry = os.clock() + RETRY
-    local ok, result = pcall(purchase, P, candidate)
+    local ok, result = pcall(function()
+        local deadline = os.clock() + 13
+        while Ui.hatchInFlight and runAllowed(P, true, true) and os.clock() < deadline do Life.wait(0.05) end
+        if not runAllowed(P, true, false) then return "cancelled-before-purchase" end
+        return purchase(P, candidate)
+    end)
     if ok then
-        nextTry = os.clock() + (result == "opened" and 1 or RETRY)
+        nextTry = os.clock() + ((result == "opened" or result == "cancelled-before-purchase") and 1 or RETRY)
     else
         nextTry = os.clock() + RETRY
         if P.islandInFlight and type(P.islandPending) == "table" and P.islandPending.sent then
@@ -4580,7 +6219,7 @@ Life.loop("island:progress", 1, function()
         else
             if type(P.islandPending) == "table" then P.islandPending.cancelled = true end
             P.islandInFlight, P.islandPending = false, nil
-            log("ошибка до покупки острова: " .. tostring(result) .. "; продолжу прокачку")
+            log("ошибка до покупки острова: " .. tostring(result) .. "; продолжу прогрессию")
         end
     end
     if Ui.travelling == OWNER then Ui.travelling = false end
@@ -4598,21 +6237,35 @@ __modules["features/hatch"] = function(use) -- src/games/tapsim/features/hatch.l
 --
 -- The server only hatches an egg you stand next to (Error "TooFar"), so the hub walks you to it.
 -- Each egg is a model in workspace.Eggs, but only while it is streamed in (near you), so where each
--- one stands is also recorded below and learned from the map as you pass eggs (see EGG_POSITIONS).
+-- one stands is also recorded below and learned from the map as you pass eggs (see MAIN_EGG_POSITIONS).
 -- Count follows the game's rule: 8 with the x8 pass or an OctoHatch boost, else 3, else 1, each
 -- only if affordable. Auto = true is what the real auto hatch sends, so secret pity keeps building.
 
 local Env = use("core/env")
 local Life = use("shared/life")
 local Ui = use("core/ui")
--- At 300M/s the 30M egg is fixed, but rebirths can still be allowed until 900M/s.
--- V12's rebirthLocked alone conflated these two stages; both flags identify target mode.
+local W = use("features/world_data")
+local HatchResult = use("features/hatch_result")
+local Journal = use("features/operation_journal")
+-- The legacy field eggFixed now marks only the 300M/s Luck stage; eggs remain dynamic.
+-- Royal final is tracked independently; both clickers stay enabled.
 local function targetMode(P)
     return type(P) == "table" and (P.eggFixed == true or P.rebirthLocked == true)
 end
 -- Optional game-native island travel; failure to load must not kill the old hatch worker.
 local islandOk, islandApi = pcall(use, "features/island_progress")
 if not islandOk or type(islandApi) ~= "table" then islandApi = nil end
+local riftOk, riftApi = pcall(use, "features/rift_islands")
+if not riftOk or type(riftApi) ~= "table" then riftApi = nil end
+local eggJournal, eggJournalErr = Journal.new("egg", Env.LocalPlayer and Env.LocalPlayer.UserId)
+do
+    local P = Ui.__progressTest
+    local clear, why = eggJournal and eggJournal.check()
+    if P and (not eggJournal or not clear) then
+        P.previousHatchPending = true
+        P.hatchJournalIssue = tostring(why or eggJournalErr)
+    end
+end
 
 local Options = Ui.Options
 local RS = Env.ReplicatedStorage
@@ -4620,34 +6273,29 @@ local tab = Ui.Tabs.Pets
 
 -- Rules ----------------------------------------------------------------------------------------
 
+-- The user confirmed that the former 300M-per-egg 30M event is no longer in the game.
+-- Stale configs, cached coordinates and the old farm floor must not make us wait for it.
+local function is30M(value)
+    local n = string.lower(tostring(value or "")):gsub("[^%w]", "")
+    for _, part in ipairs({ "30m", "30000000" }) do
+        local cursor = 1
+        while true do
+            local at = n:find(part, cursor, true)
+            if not at then break end
+            local before = at > 1 and n:sub(at - 1, at - 1) or ""
+            local after = n:sub(at + #part, at + #part)
+            if not before:match("%d") and not after:match("%d") then return true end
+            cursor = at + 1
+        end
+    end
+    return false
+end
+local function retired30M(egg, price, display)
+    return tonumber(price) == 300000000 and (is30M(egg) or is30M(display))
+end
+
 -- Egg name -> { price, island, pets = { name = chance% } } from LaunchEggConfig.
 local EGGS = {}
-local function progressCoinPriceMeta(def)
-    local function fields(value)
-        for _, key in ipairs({ "Currency", "PriceCurrency", "CostCurrency", "CurrencyName" }) do
-            local v = value[key]
-            if v ~= nil then
-                if type(v) ~= "string" then return false end
-                local name = v:lower():gsub("[^%w]", "")
-                if name ~= "coin" and name ~= "coins" then return false end
-            end
-        end
-        for _, key in ipairs({ "Gems", "Tokens", "PaidTokens", "Robux", "CandyCorn", "Tickets", "EventCurrency" }) do
-            local v = value[key]
-            if v ~= nil and v ~= false then
-                local n = tonumber(v)
-                if not n or n ~= n or n < 0 or n == math.huge or n > 0 then return false end
-            end
-        end
-        return true
-    end
-    if not fields(def) then return false end
-    for _, key in ipairs({ "Cost", "Price", "Costs", "Prices" }) do
-        local v = def[key]
-        if type(v) == "table" and not fields(v) then return false end
-    end
-    return true
-end
 local EggPricing, GamepassPerks, BoostFormula
 do
     local ok, cfg = Env.call(function()
@@ -4659,7 +6307,7 @@ do
             if type(def) == "table" and name ~= "Test" then
                 EGGS[name] = {
                     price = tonumber(def.Price) or 0,
-                    coinPricing = progressCoinPriceMeta(def),
+                    raw = def,
                     island = def.Island,
                     zone = def.Zone,
                     world = def.World,
@@ -4711,21 +6359,6 @@ local function totalPrice(data, egg, count)
     return price * count
 end
 
--- Для теста не подменяем игровые цены локальным предположением при ошибке модуля.
-local function progressStrictPrice(data, egg)
-    local def = EGGS[egg]
-    if type(data) ~= "table" or not def or not def.coinPricing or not EggPricing
-        or type(EggPricing.GetUnitPrice) ~= "function" or type(EggPricing.GetTotal) ~= "function" then
-        return nil
-    end
-    local ok1, one = Env.call(EggPricing.GetUnitPrice, data, egg, def.price)
-    local ok3, three = Env.call(EggPricing.GetTotal, data, egg, def.price, 3)
-    if ok1 and ok3 and tonumber(one) == 300000000 and tonumber(three) == 900000000 then
-        return 900000000
-    end
-    return nil
-end
-
 local function canOcto(data)
     local function has(module, method, key)
         if not module then
@@ -4740,7 +6373,12 @@ end
 -- A live price function is mandatory for the 20% check; no guessed fallback is used.
 local function progressBatchPrice(data, egg, count)
     local def = EGGS[egg]
-    if type(data) ~= "table" or not def or not def.coinPricing or not EggPricing or type(EggPricing.GetTotal) ~= "function"
+    local P = Ui.__progressTest
+    local acceptable = def and W.coinPricing(def.raw)
+    if P and not W.isCurrent(P, data) then return nil end
+    local eggWorld = def and (type(def.world) == "string" and def.world ~= "" and def.world or "Main")
+    if not eggWorld or W.world(data) ~= eggWorld then return nil end
+    if type(data) ~= "table" or not def or not acceptable or not EggPricing or type(EggPricing.GetTotal) ~= "function"
         or type(def.price) ~= "number" or def.price <= 0 or def.price ~= def.price or def.price == math.huge then return nil end
     local ok, raw = Env.call(EggPricing.GetTotal, data, egg, def.price, count)
     local price = ok and tonumber(raw) or nil
@@ -4761,10 +6399,10 @@ local function progressFreeSlots(data)
     return math.huge
 end
 
--- Progression: the largest permitted batch fitting in 20% of the current wallet.
--- After permanent lock: strictly three 30M eggs for 900 million, up to all current coins.
+-- Before 300M/s: the largest batch within 20% of the current wallet.
+-- Afterwards: exactly x3 of the selected progressing egg, using available coins.
 local function hatchCount(data, egg)
-    local coins = type(data) == "table" and type(data.Currencies) == "table" and tonumber(data.Currencies.Coins) or nil
+    local coins = W.coins(data)
     if not coins or coins < 0 or coins ~= coins or coins == math.huge or not EGGS[egg] then return nil end
     local P = Ui.__progressTest
     if P then
@@ -4780,8 +6418,10 @@ local function hatchCount(data, egg)
             if one and one <= coins * 0.20 then return 1 end
             return nil
         end
-        if P.phase == "hatch" and targetMode(P) and egg == P.eggGoal
-            and progressStrictPrice(data, egg) == 900000000 and coins >= 900000000 then return 3 end
+        if P.phase == "hatch" and targetMode(P) then
+            local three = progressFreeSlots(data) >= 3 and progressBatchPrice(data, egg, 3) or nil
+            if three and three <= coins then return 3 end
+        end
         return nil
     end
     if canOcto(data) and totalPrice(data, egg, 8) <= coins then return 8 end
@@ -4794,7 +6434,7 @@ end
 -- kept here (read from the map when the hub was written). An egg missing from this list dropped
 -- out of auto hatch whenever you were elsewhere -- the October 24 Heaven egg, the priciest one,
 -- did exactly that -- so eggs are also learned as they stream in, and saved (see learn below).
-local EGG_POSITIONS = {
+local MAIN_EGG_POSITIONS = {
     Heaven = Vector3.new(-8, 15352, -2108),
     Basic = Vector3.new(6, -511, -1833),
     Spotted = Vector3.new(-5, -511, -1822),
@@ -4816,6 +6456,12 @@ local EGG_POSITIONS = {
 
 -- Spots learned from the map, kept between sessions so the next update's eggs work once seen.
 local LEARNED_FILE = "SlopixHub/TapSimulator/egg-spots.json"
+local RIFT_FILE = "SlopixHub/TapSimulator/egg-spots-rift-v14.json"
+local RIFT_EGG_POSITIONS = {}
+local function positions(egg)
+    local def = EGGS[egg]
+    return def and def.world == "TimeRift" and RIFT_EGG_POSITIONS or MAIN_EGG_POSITIONS
+end
 local files = Env.files
 do
     local ok, saved = pcall(function()
@@ -4826,18 +6472,30 @@ do
         local x, y, z = type(spot) == "table" and tonumber(spot[1]), type(spot) == "table" and tonumber(spot[2]),
             type(spot) == "table" and tonumber(spot[3])
         -- A saved spot was seen on the map, so it beats the list above if an update moved an egg.
-        if type(name) == "string" and x and y and z and EGGS[name] then
-            EGG_POSITIONS[name] = Vector3.new(x, y, z)
+        if type(name) == "string" and x and y and z and EGGS[name] and EGGS[name].world ~= "TimeRift" then
+            MAIN_EGG_POSITIONS[name] = Vector3.new(x, y, z)
         end
     end
 end
 
-local function saveLearned()
+do
+    local ok, saved = pcall(function()
+        return Env.canCache and files.isfile(RIFT_FILE) and Env.HttpService:JSONDecode(files.readfile(RIFT_FILE))
+    end)
+    if ok and type(saved) == "table" then
+        for name, spot in pairs(saved) do
+            local def = EGGS[name]
+            local x, y, z = type(spot) == "table" and tonumber(spot[1]), type(spot) == "table" and tonumber(spot[2]), type(spot) == "table" and tonumber(spot[3])
+            if def and def.world == "TimeRift" and x and y and z then RIFT_EGG_POSITIONS[name] = Vector3.new(x,y,z) end
+        end
+    end
+end
+local function saveLearned(egg)
     if not (files.writefile and files.isfolder and files.makefolder) then
         return
     end
     local out = {}
-    for name, spot in pairs(EGG_POSITIONS) do
+    for name, spot in pairs(positions(egg)) do
         out[name] = { math.floor(spot.X * 10) / 10, math.floor(spot.Y * 10) / 10, math.floor(spot.Z * 10) / 10 }
     end
     pcall(function()
@@ -4846,17 +6504,18 @@ local function saveLearned()
                 files.makefolder(folder)
             end
         end
-        files.writefile(LEARNED_FILE, Env.HttpService:JSONEncode(out))
+        files.writefile(EGGS[egg] and EGGS[egg].world == "TimeRift" and RIFT_FILE or LEARNED_FILE, Env.HttpService:JSONEncode(out))
     end)
     Env.elevate()
 end
 
 -- Records where an egg stands the first time it is seen (or when it has moved), and saves it.
 local function learn(egg, position)
-    local known = EGG_POSITIONS[egg]
+    local store = positions(egg)
+    local known = store[egg]
     if EGGS[egg] and (not known or (known - position).Magnitude > 5) then
-        EGG_POSITIONS[egg] = position
-        saveLearned()
+        store[egg] = position
+        saveLearned(egg)
     end
 end
 
@@ -4875,58 +6534,61 @@ local function eggPosition(egg)
             return pivot.Position
         end
     end
-    return EGG_POSITIONS[egg]
-end
-
--- Для текущего ивента сохранённая координата не заменяет реальную модель.
-local function progressLivePosition(egg)
-    local model = eggModel(egg)
-    if not model then return nil end
-    local ok, pivot = pcall(model.GetPivot, model)
-    if ok and pivot and pivot.Position then
-        learn(egg, pivot.Position)
-        return pivot.Position
-    end
-    return nil
+    return positions(egg)[egg]
 end
 
 -- Explicit world/zone/island requirements come from the live egg config. Never substitute
 -- a stale world coordinate for access to a locked island. Unknown/missing requirements are
 -- logged by the accompanying diagnostic rather than being invented from web guides.
-local function farmAreaOpen(data, def)
+local function farmAreaOpen(data, def, egg, allowTravel)
+    if type(def) ~= "table" then return false, "нет конфига яйца" end
     local prog = type(data) == "table" and type(data.Progression) == "table" and data.Progression or nil
-    if type(def.world) == "string" and def.world ~= "" then
-        if not prog or type(prog.World) ~= "string" or prog.World ~= def.world then
-            return false, "мир=" .. tostring(def.world) .. ", текущий=" .. tostring(prog and prog.World)
+    local expectedWorld = type(def.world) == "string" and def.world ~= "" and def.world or "Main"
+    if not prog or W.world(data) ~= expectedWorld then return false, "яйцо другого мира" end
+    local eggs = type(data.Eggs) == "table" and data.Eggs.Unlocked or nil
+    if type(eggs) == "table" and eggs[egg] == false then return false, "яйцо явно закрыто" end
+    if expectedWorld == "TimeRift" then
+        local P = Ui.__progressTest
+        local eligibleEggFlag = type(eggs) == "table" and eggs[egg] == true
+        local island = W.islandState(data, def.island, P and P.verifiedRiftIslands)
+        local zone = W.zoneState(data, def.zone)
+        if island ~= true and not eligibleEggFlag then return false, "Rift-остров не подтверждён" end
+        if zone == false and not eligibleEggFlag then return false, "Rift-зона явно закрыта" end
+        if zone ~= true and not eligibleEggFlag and not (allowTravel and island == true) then
+            return false, "Rift-зона не подтверждена"
+        end
+        local good, why = W.coinPricing(def.raw)
+        if not good then return false, tostring(why) end
+    else
+        if type(def.zone) == "string" and def.zone ~= "" and def.zone ~= "Spawn" then
+            local zones = prog and type(prog.UnlockedZones) == "table" and prog.UnlockedZones or nil
+            if not zones or zones[def.zone] ~= true then return false, "зона=" .. tostring(def.zone) .. " не подтверждена" end
+        end
+        local island = def.island
+        if island ~= nil and island ~= "" and island ~= "Spawn" then
+            local islands = prog and type(prog.UnlockedIslands) == "table" and prog.UnlockedIslands or nil
+            if not islands or islands[island] ~= true then return false, "остров=" .. tostring(island) .. " закрыт" end
         end
     end
-    if type(def.zone) == "string" and def.zone ~= "" and def.zone ~= "Spawn" then
-        local zones = prog and type(prog.UnlockedZones) == "table" and prog.UnlockedZones or nil
-        if not zones or zones[def.zone] ~= true then return false, "зона=" .. tostring(def.zone) .. " не подтверждена" end
-    end
-    local island = def.island
-    if island ~= nil and island ~= "" and island ~= "Spawn" then
-        local islands = prog and type(prog.UnlockedIslands) == "table" and prog.UnlockedIslands or nil
-        if not islands or islands[island] ~= true then return false, "остров=" .. tostring(island) .. " закрыт" end
-    end
-    return true, "доступ по конфигу подтверждён"
+    return true, "доступ по доступным данным"
 end
 local function hatchable(data, egg)
     if Ui.__progressTest then
         local P, def = Ui.__progressTest, EGGS[egg]
         if not def then return false end
-        if P.phase == "rebirth" and not targetMode(P) then
-            local open = farmAreaOpen(data, def)
-            if not open then return false end
-            -- An unlocked island can be visited even if its egg's old coordinate is absent.
-            local travelHint = islandApi and type(def.island) == "string" and def.island ~= ""
-            return eggPosition(egg) ~= nil or travelHint ~= nil and travelHint ~= false
-        end
-        return P.eggGoal == egg and progressLivePosition(egg) ~= nil
+        if retired30M(egg, def.price, def.display) then return false end
+        local eggName = W.norm(egg)
+        if eggName == "test" or eggName:find("robux", 1, true) or eggName:find("exclusive", 1, true) then return false end
+        local open = farmAreaOpen(data, def, egg, true)
+        if not open then return false end
+        -- A cached coordinate is only a travel hint. The final send requires a live stand.
+        local api = P.worldName == "TimeRift" and riftApi or islandApi
+        local travelHint = api and type(def.island) == "string" and def.island ~= ""
+        return eggPosition(egg) ~= nil or travelHint ~= nil and travelHint ~= false
     end
     local eggs = type(data.Eggs) == "table" and data.Eggs.Unlocked
     if type(eggs) ~= "table" or eggs[egg] ~= true or not eggPosition(egg) then return false end
-    return farmAreaOpen(data, EGGS[egg])
+    return farmAreaOpen(data, EGGS[egg], egg)
 end
 
 -- Почему яйцо пропускается: раз в 5 минут пишем в консоль, чтобы не гадать.
@@ -5108,10 +6770,9 @@ local SWITCH_MARGIN = 1.15 -- новое яйцо берём, только ес�
 local current -- the egg being hatched now
 local refused = {} -- egg -> os.clock() until which it is skipped (NotEnoughCoins, IslandLocked)
 
--- Farm-only monotonic price floor. Compare the per-egg base price from the same live game
--- config used for selection (not the x1/x3/x8 batch total). Once selected, a cheaper egg is
--- never used, including after a rebirth. The account-scoped file also preserves the floor on
--- a full client restart when the executor supports files; the 30M locked phase ignores it.
+-- Monotonic price floor applies in every stage. Compare the per-egg base price from the live
+-- game config (not batch total); persist the floor account-by-account. The only migration
+-- exception is the explicitly retired 30M event, which must not pin the farm to a missing egg.
 local FARM_FLOOR_MAGIC = "TS30_FARM_EGG_PRICE_V1"
 local function finitePositive(value)
     local n = tonumber(value)
@@ -5136,7 +6797,7 @@ local function saveFarmFloor(P)
         end
         return false
     end
-    local path = "SlopixHub/TapSimulator/ts30_farm_egg_" .. key .. ".state"
+    local path = "SlopixHub/TapSimulator/" .. (P.worldName == "TimeRift" and "ts14_rift_farm_egg_" or "ts30_farm_egg_") .. key .. ".state"
     local text = FARM_FLOOR_MAGIC .. "\n" .. string.format("%.17g", price) .. "\n" .. egg
     local ok, err = pcall(function()
         for _, folder in ipairs({ "SlopixHub", "SlopixHub/TapSimulator" }) do
@@ -5169,22 +6830,44 @@ local function loadFarmFloor(P)
     P.farmEggFloorLoaded = true
     P.farmEggFloor, P.farmEggName = 0, nil
     P.farmEggKey = farmStorageKey()
+    P.farmMemoryKey = P.farmEggKey and (P.worldName == "TimeRift" and P.farmEggKey .. ":TimeRift" or P.farmEggKey) or nil
     local key = P.farmEggKey
     local function consider(price, egg)
         local n = finitePositive(price)
+        local def = type(egg) == "string" and EGGS[egg] or nil
+        if n and retired30M(egg, n, def and def.display) then
+            if not P.retiredEggNoted then
+                P.retiredEggNoted = true
+                logEgg("старое ивентовое 30M удалено: не использую его как минимальную цену")
+            end
+            return false
+        end
         if n and n > (P.farmEggFloor or 0) then
             P.farmEggFloor, P.farmEggName = n, type(egg) == "string" and egg or nil
         end
+        return true
     end
     local env = type(Env.genv) == "table" and Env.genv or nil
     if env and type(env.__TS30FarmEggLevels) ~= "table" then env.__TS30FarmEggLevels = {} end
-    local mem = env and key and env.__TS30FarmEggLevels[key] or nil
+    local mem = env and P.farmMemoryKey and env.__TS30FarmEggLevels[P.farmMemoryKey] or nil
     if type(mem) == "table" then consider(mem.price, mem.egg) end
+    if P.worldName=="TimeRift" and finitePositive(P.riftTestFloor) then
+        local names={}
+        for name,def in pairs(EGGS) do
+            if def.world=="TimeRift" and W.sameNumber(def.price,P.riftTestFloor) then names[#names+1]=name end
+        end
+        table.sort(names)
+        consider(P.riftTestFloor,names[1] or "ранее_подтверждённый_Rift_уровень")
+    end
     local previousEgg = P.previousFarmEgg
-    if type(previousEgg) == "string" and EGGS[previousEgg] then consider(EGGS[previousEgg].price, previousEgg) end
+    if type(previousEgg) == "string" and EGGS[previousEgg] and P.previousWorldName == P.worldName
+        and (EGGS[previousEgg].world == "TimeRift" and P.worldName == "TimeRift"
+            or EGGS[previousEgg].world ~= "TimeRift" and P.worldName == "Main") then
+        consider(EGGS[previousEgg].price, previousEgg)
+    end
     local diskPrice = 0
     if key and farmFilesAvailable() then
-        local path = "SlopixHub/TapSimulator/ts30_farm_egg_" .. key .. ".state"
+        local path = "SlopixHub/TapSimulator/" .. (P.worldName == "TimeRift" and "ts14_rift_farm_egg_" or "ts30_farm_egg_") .. key .. ".state"
         local okExists, exists = pcall(files.isfile, path)
         Env.elevate()
         if not okExists then
@@ -5200,7 +6883,7 @@ local function loadFarmFloor(P)
             if not diskPrice or not egg then
                 P.farmEggFloorError = "повреждён или не прочитан сохранённый уровень яйца"
             else
-                consider(diskPrice, egg)
+                if not consider(diskPrice, egg) then diskPrice = 0 end
             end
         end
     end
@@ -5209,7 +6892,7 @@ local function loadFarmFloor(P)
         return false
     end
     if env and key and P.farmEggFloor > 0 then
-        env.__TS30FarmEggLevels[key] = { price = P.farmEggFloor, egg = P.farmEggName }
+        env.__TS30FarmEggLevels[P.farmMemoryKey] = { price = P.farmEggFloor, egg = P.farmEggName }
     end
     if P.farmEggFloor > (diskPrice or 0) and not saveFarmFloor(P) then
         P.farmEggSavePending, P.farmEggRetryAt = true, os.clock() + 5
@@ -5229,7 +6912,7 @@ local function rememberFarmEgg(P, egg, price)
         P.farmEggFloor, P.farmEggName = price, egg
         local env = type(Env.genv) == "table" and Env.genv or nil
         if env and P.farmEggKey and type(env.__TS30FarmEggLevels) == "table" then
-            env.__TS30FarmEggLevels[P.farmEggKey] = { price = price, egg = egg }
+            env.__TS30FarmEggLevels[P.farmMemoryKey] = { price = price, egg = egg }
         end
         if not saveFarmFloor(P) then
             P.farmEggSavePending, P.farmEggRetryAt = true, os.clock() + 5
@@ -5243,7 +6926,7 @@ local function rememberFarmEgg(P, egg, price)
         P.farmEggName = egg -- equal-price alternatives are allowed; keep the last active one
         local env = type(Env.genv) == "table" and Env.genv or nil
         if env and P.farmEggKey and type(env.__TS30FarmEggLevels) == "table" then
-            env.__TS30FarmEggLevels[P.farmEggKey] = { price = price, egg = egg }
+            env.__TS30FarmEggLevels[P.farmMemoryKey] = { price = price, egg = egg }
         end
     end
     return true
@@ -5291,28 +6974,43 @@ end
 local function chooseEgg(data)
     if Ui.__progressTest then
         local P = Ui.__progressTest
-        if P.holdHatch or P.stopRequested or P.farmStorageFull
-            or (P.eggFixed and P.targetProbeRequired and not P.rebirthLocked) then return nil end
-        if P.phase == "rebirth" and not targetMode(P) and not P.farmThresholdReached then
-            if not loadFarmFloor(P) then return nil end
-            -- Never downgrade after selecting an expensive egg, even after a rebirth or a
-            -- temporary missing stand. Equal-price alternatives are allowed; the current
-            -- one wins ties. If none fits 20%, wait instead of buying something cheaper.
-            for _, egg in ipairs(eggsByPrice(data)) do
-                local price = EGGS[egg] and finitePositive(EGGS[egg].price) or nil
-                if price and price >= (P.farmEggFloor or 0) and hatchCount(data, egg) then
-                    if Ui.__progressTest ~= P or P.phase ~= "rebirth" or targetMode(P) or P.farmThresholdReached
-                        or P.stopRequested or P.holdHatch or P.farmStorageFull then return nil end
-                    if not rememberFarmEgg(P, egg, price) then return nil end
-                    return egg
-                end
-            end
+        local function stageAllowed()
+            if not Life.alive or Ui.__progressTest ~= P or P.holdHatch or P.stopRequested
+                or P.farmStorageFull or Ui.travelling or (Env.genv and Env.genv.__handoverPaused)
+                or (P.eggFixed and P.targetProbeRequired and not P.rebirthLocked) then return false end
+            return (P.phase == "rebirth" and not targetMode(P) and not P.farmThresholdReached)
+                or (P.phase == "hatch" and targetMode(P))
+        end
+        if not stageAllowed() or not loadFarmFloor(P) or not stageAllowed() then return nil end
+        if P.royalFinal then
+            local def = EGGS.Royal
+            if P.worldName ~= "TimeRift" or not def or def.world ~= "TimeRift" or def.price < (P.farmEggFloor or 0) then return nil end
+            if hatchable(data, "Royal") and hatchCount(data, "Royal") == 3 then P.eggGoal = "Royal"; return "Royal" end
             return nil
         end
-        local goal = P.eggGoal
-        if P.phase ~= "hatch" or not targetMode(P) or not goal or not EGGS[goal]
-            or not hatchable(data, goal) or os.clock() < (refused[goal] or 0) then return nil end
-        return hatchCount(data, goal) == 3 and goal or nil
+        local coins = W.coins(data)
+        if P.coinRefusedSnapshot ~= nil and coins ~= P.coinRefusedSnapshot then
+            P.coinRefusedSnapshot, P.coinRefusedEgg = nil, nil
+        end
+        -- Sorted highest base price first, respecting the persisted floor in ALL stages.
+        -- An absent/locked stand is not proof of access; the send checks its live model.
+        for _, egg in ipairs(eggsByPrice(data)) do
+            local price = EGGS[egg] and finitePositive(EGGS[egg].price) or nil
+            local refusedSameBalance = egg == P.coinRefusedEgg and P.coinRefusedSnapshot ~= nil
+                and coins == P.coinRefusedSnapshot
+            if not refusedSameBalance and price and price >= (P.farmEggFloor or 0) and hatchCount(data, egg) then
+                -- A config entry is only a candidate until its live stand can be reached. Do
+                -- not permanently raise the floor for a missing/removed model or closed island.
+                if not stageAllowed() or P.farmEggFloorError or P.farmEggSavePending then return nil end
+                local fresh = Env.data()
+                if type(fresh) ~= "table" or not hatchable(fresh, egg) or not hatchCount(fresh, egg)
+                    or not stageAllowed() or price < (P.farmEggFloor or 0) then return nil end
+                P.eggGoal = egg
+                return egg
+            end
+            if not stageAllowed() then return nil end
+        end
+        return nil
     end
     if LOCK_EGG ~= "" then
         local egg = LOCK_EGG
@@ -5480,6 +7178,8 @@ local function goToEgg(egg)
     if not hrp then return false, "no_root", "персонаж ещё не готов" end
     local def = EGGS[egg]
     local destinationIsland = def and type(def.island) == "string" and def.island ~= "" and def.island or "Spawn"
+    local P = Ui.__progressTest
+    local islandApi = P and P.worldName == "TimeRift" and riftApi or islandApi
     if not target and not islandApi then return false, "no_position", "нет координат стойки и игрового перехода" end
     Ui.hatchMoving = true
     setHatchStage("перемещение к " .. tostring(egg))
@@ -5533,7 +7233,7 @@ local function goToEgg(egg)
             end
             local data = Env.data()
             local access = "нет конфига яйца"
-            if def then local _, why = farmAreaOpen(data, def); access = why end
+            if def then local _, why = farmAreaOpen(data, def, egg); access = why end
             detail ..= "; island=" .. tostring(def and def.island) .. ", zone=" .. tostring(def and def.zone)
                 .. ", world=" .. tostring(def and def.world) .. ", " .. tostring(access)
             return
@@ -5560,7 +7260,9 @@ end
 
 -- Requests -------------------------------------------------------------------------------------
 
-local seq = 7000000 -- well clear of the game client's own counter
+local envSeq = Env.genv and tonumber(Env.genv.__TS14HatchSeq) or nil
+local seq = envSeq and envSeq >= 700000000 and envSeq < 9007199254740000 and math.floor(envSeq)==envSeq
+    and envSeq or 700000000 -- distinct from the previous V13 range
 local waiting
 Life.onCleanup(function()
     local slot = waiting
@@ -5573,7 +7275,7 @@ Life.spawn("hatch:results", function()
         local ok, err = pcall(function()
             local remote = Env.remote("EggService", "EggHatchResult")
             Life.connect(remote.OnClientEvent, function(payload)
-                if waiting and type(payload) == "table" then
+                if waiting and waiting.sent and type(payload) == "table" then
                     if payload.Seq == waiting.seq then
                         local slot = waiting
                         if not slot.result then
@@ -5611,11 +7313,17 @@ end
 local function hatchDenied(P, egg, count)
     if not Life.alive then return "скрипт остановлен" end
     if type(P) ~= "table" or Ui.__progressTest ~= P then return "нет активного состояния фермы" end
+    local hatchOn = Ui.on("AutoHatch")
+    local snapshot = Env.data() -- both operations may yield; check everything below afterwards
+    if not Life.alive or Ui.__progressTest ~= P then return "нет активного состояния фермы" end
     if P.stopRequested then return "нажата остановка" end
+    if P.worldChanging or not W.isCurrent(P, snapshot) then return "смена мира / нет подтверждения текущего мира" end
+    if P.finalizing then return "закрепляю Royal x3" end
+    if P.royalFinal and egg ~= "" and egg ~= "Royal" then return "финал разрешает только Royal x3" end
     if P.hatchUncertain then return "предыдущий запрос яйца не подтверждён" end
     if P.craftUncertain then return "предыдущий запрос крафта не подтверждён" end
     if P.islandUncertain or P.islandTravelUncertain or P.previousIslandPending then return "остров или переход не подтверждён" end
-    if P.previousHatchPending then return "ожидается запрос яйца прошлой копии" end
+    if P.previousHatchPending then return "не подтверждён запрос яйца прошлой копии или журнал" end
     if P.previousRebirthPending and not targetMode(P) then return "ожидается ребёрт прошлой копии" end
     if P.previousCraftPending then return "ожидается крафт прошлой копии" end
     if P.pending and not targetMode(P) then return "ожидается ребёрт" end
@@ -5624,7 +7332,8 @@ local function hatchDenied(P, egg, count)
     if P.craftBusy or P.craftInFlight then return "идёт крафт" end
     if P.farmStorageFull then return "жду место в рюкзаке" end
     if P.holdHatch then return "пауза контроллера: " .. tostring(P.note or P.phase or "?") end
-    if not Ui.on("AutoHatch") then return "AutoHatch выключен" end
+    local toggle = Ui.Toggles and Ui.Toggles.AutoHatch
+    if not hatchOn or not toggle or toggle.Value ~= true then return "AutoHatch выключен" end
     if Ui.travelling then return "персонаж занят другим перемещением" end
     if Env.genv and Env.genv.__handoverPaused then return "пауза фермы" end
     if not resultReady then return "ожидаю подключение EggHatchResult" end
@@ -5632,19 +7341,69 @@ local function hatchDenied(P, egg, count)
         if count == 1 or count == 3 or count == 8 then return nil end
         return "недопустимое количество яиц на прокачке"
     end
-    if P.phase == "hatch" and targetMode(P) and egg == P.eggGoal and count == 3 then return nil end
+    if P.phase == "hatch" and targetMode(P) and count == 3
+        and (egg == "" or egg == P.eggGoal) then return nil end
     return "фаза " .. tostring(P.phase) .. " не разрешает эту партию"
 end
 
 -- A live model and current player position must still agree immediately before sending.
 -- The recorded coordinate is only a travel hint, never proof of a current stand.
+local P_RIFT_CURRENCY_NOTED = false
+local function riftModelCurrency(model)
+    local queue, head, found = { model }, 1, false
+    while head <= #queue and head <= 500 do
+        local node=queue[head]; head += 1
+        for _, field in ipairs({ "Currency", "PriceCurrency", "CostCurrency", "CurrencyName" }) do
+            local ok, value=pcall(function() return node:GetAttribute(field) end)
+            if not ok then return false, "не читается валюта стойки" end
+            if value ~= nil then
+                local n=W.norm(value)
+                if n~="riftcoins" and n~="riftcoin" then return false, "стойка называет другую валюту" end
+                found=true
+            end
+        end
+        local typed,isString=pcall(function() return node:IsA("StringValue") end)
+        if not typed then return false, "не читается тип элемента стойки" end
+        if isString then
+            local ok,value=pcall(function()
+                if W.norm(node.Name)=="currency" then return node.Value end
+            end)
+            if not ok then return false, "не читается валюта стойки" end
+            if value~=nil then
+                local n=W.norm(value)
+                if n~="riftcoins" and n~="riftcoin" then return false, "стойка называет другую валюту" end
+                found=true
+            end
+        end
+        local ok,children=pcall(function() return node:GetChildren() end)
+        if not ok or type(children)~="table" then return false, "неполный обход стойки" end
+        for _, child in ipairs(children) do queue[#queue+1]=child end
+    end
+    if head<=#queue then return false, "слишком большая стойка для проверки валюты" end
+    return true, found and "RiftCoins на стойке" or "RiftCoins по карте WorldConfig; списание сервером не доказано"
+end
 local function liveEggAccess(data, egg, farm)
     local def, model = EGGS[egg], eggModel(egg)
     if not def or not model then return false, "модель стойки больше не загружена" end
-    if farm then
-        local open, why = farmAreaOpen(data, def)
-        if not open then return false, tostring(why) end
+    local open, why = farmAreaOpen(data, def, egg, true)
+    if not open then return false, tostring(why) end
+    if def.world == "TimeRift" then
+        local flags=type(data.Eggs)=="table" and data.Eggs.Unlocked or nil
+        local explicitlyUnlocked=type(flags)=="table" and flags[egg]==true
+        if W.zoneState(data,def.zone)~=true and not explicitlyUnlocked then
+            local here=type(data.Progression)=="table" and data.Progression.Island
+            if type(def.island)~="string" or not W.sameName(here,def.island) then
+                return false, "Rift-зона не подтверждена и текущий остров не совпадает"
+            end
+        end
+        local good, detail=riftModelCurrency(model)
+        if not good then return false, detail end
+        if not P_RIFT_CURRENCY_NOTED then
+            P_RIFT_CURRENCY_NOTED=true
+            hatchDiagnostic("rift-currency", detail, math.huge)
+        end
     end
+    if retired30M(egg, def.price, def.display) then return false, "старое ивентовое 30M удалено" end
     local hrp, center = root(), eggCenter(model)
     if not hrp or not center then return false, "нет персонажа или позиции модели" end
     local ok, distance = pcall(function() return (hrp.Position - center).Magnitude end)
@@ -5680,13 +7439,11 @@ local function hatch(egg, count)
     -- A growing balance may make a *larger* batch affordable after selection. The selected
     -- 1/3/8 is still valid if its own live price, pass and slots fit; equality to the new maximum
     -- would discard a safe request. The auto loop also refreshes count after travelling.
-    if P.phase == "rebirth" and not targetMode(P) and progressFreeSlots(fresh) < count then
-        return cancel("число свободных мест изменилось")
-    end
+    if progressFreeSlots(fresh) < count then return cancel("число свободных мест изменилось") end
     local expected = progressBatchPrice(fresh, egg, count)
     local check = Env.data()
-    local coins = check and type(check.Currencies) == "table" and tonumber(check.Currencies.Coins) or nil
-    local rb = check and type(check.Statistics) == "table" and tonumber(check.Statistics.Rebirths) or nil
+    local coins = W.coins(check)
+    local rb = W.rebirths(check)
     if not allowed() or Ui.hatchInFlight then return cancel() end
     if not expected then return cancel("игровая формула цены партии недоступна") end
     if not coins or coins ~= coins or coins < 0 or coins == math.huge or not rb then
@@ -5697,19 +7454,18 @@ local function hatch(egg, count)
         if expected > coins * 0.20 then return cancel("партия превышает 20% текущего баланса") end
         if count == 8 and not canOcto(check) then return cancel("x8 больше не доступен") end
     else
-        if progressStrictPrice(check, egg) ~= 900000000 or expected ~= 900000000 or coins < expected
-            or (P.rebirthLocked and P.lockedRebirths == nil) then
-            return cancel("не подтверждены цена 30M x3, баланс 900 млн или окончательный счётчик")
+        if count ~= 3 or coins < expected or ((P.rebirthLocked or P.royalFinal) and P.lockedRebirths == nil) then
+            return cancel("не подтверждены цена x3, доступный баланс или окончательный счётчик")
         end
-        -- Before the 900M/s lock, rebirths are allowed between batches. The current count
+        -- Before the Royal finale, rebirths are allowed between batches. The current count
         -- must still stay unchanged across this specific request's final checks. After lock,
         -- any unexpected change from the saved baseline is a safety stop as in V12.
         local oldPending = P.previousRebirthPending or P.pending
         local oldBefore = type(oldPending) == "table" and tonumber(oldPending.before) or nil
         local knownPriorConfirmation = oldBefore ~= nil and oldBefore == P.lockedRebirths and rb > oldBefore
-        if P.rebirthLocked and rb ~= P.lockedRebirths and not knownPriorConfirmation then
+        if (P.rebirthLocked or P.royalFinal) and rb ~= P.lockedRebirths and not knownPriorConfirmation then
             P.holdHatch, P.holdCraft, P.phase = true, true, "blocked"
-            P.note = "после фиксации 30M изменилось число ребёртов: " .. tostring(P.lockedRebirths)
+            P.note = "после фиксации Royal x3 изменилось число ребёртов: " .. tostring(P.lockedRebirths)
                 .. " -> " .. tostring(rb) .. "; источник неизвестен"
             if type(P.log) == "function" then pcall(P.log, P.note .. "; новые яйца остановлены") end
             return cancel(P.note)
@@ -5719,7 +7475,6 @@ local function hatch(egg, count)
     -- rebirths, free slots, phase, live model, island and distance before the send.
     expected = progressBatchPrice(check, egg, count)
     if not expected then return cancel("не удалось повторно проверить игровую цену") end
-    if not farm and expected ~= 900000000 then return cancel("цена 30M x3 изменилась") end
     -- Identity elevation itself can yield in some executors. Do it before the final pricing and
     -- snapshot, never between the last guard and FireServer. A changed price must be rechecked too.
     Env.elevate()
@@ -5728,12 +7483,9 @@ local function hatch(egg, count)
     expected = progressBatchPrice(repriceData, egg, count)
     if not expected then return cancel("не удалось проверить последнюю цену партии") end
     if farm and count == 8 and not canOcto(repriceData) then return cancel("x8 больше не доступен") end
-    if not farm and (expected ~= 900000000 or progressStrictPrice(repriceData, egg) ~= 900000000) then
-        return cancel("цена 30M x3 больше не подтверждена")
-    end
     local last = Env.data()
-    local lastCoins = last and type(last.Currencies) == "table" and tonumber(last.Currencies.Coins) or nil
-    local lastRb = last and type(last.Statistics) == "table" and tonumber(last.Statistics.Rebirths) or nil
+    local lastCoins = W.coins(last)
+    local lastRb = W.rebirths(last)
     if not allowed() or Ui.hatchInFlight then return cancel() end
     if farm ~= (P.phase == "rebirth" and not targetMode(P)) then return cancel("фаза сменилась до отправки") end
     if not lastCoins or lastCoins ~= lastCoins or lastCoins < 0 or lastCoins == math.huge or lastRb ~= rb then
@@ -5741,22 +7493,58 @@ local function hatch(egg, count)
     end
     if farm then
         if expected > lastCoins * 0.20 then return cancel("партия больше 20% свежего баланса") end
-        if progressFreeSlots(last) < count then return cancel("свободных мест для партии больше нет") end
-    elseif lastCoins < 900000000 then return cancel("свежий баланс меньше 900 млн") end
+    elseif expected > lastCoins then return cancel("свежего баланса недостаточно для x3") end
+    if progressFreeSlots(last) < count then return cancel("свободных мест для партии больше нет") end
     local access, accessReason = liveEggAccess(last, egg, farm)
     if not access then return cancel(accessReason) end
-    if farm then
-        local price, floor = EGGS[egg] and finitePositive(EGGS[egg].price), finitePositive(P.farmEggFloor)
-        if P.farmEggFloorError or (floor and (not price or price < floor)) then
-            return cancel("яйцо дешевле закреплённого уровня прокачки")
-        end
+    local price, floor = EGGS[egg] and finitePositive(EGGS[egg].price), finitePositive(P.farmEggFloor)
+    if not P.farmEggFloorLoaded or P.farmEggFloorError or P.farmEggSavePending
+        or not price or not floor or price < floor then
+        return cancel("яйцо дешевле сохранённого уровня или уровень не подтверждён")
     end
     if not allowed() or Ui.hatchInFlight then return cancel() end
+    if not eggJournal then hatchFailClosed(P, "журнал яйца недоступен: " .. tostring(eggJournalErr)); return cancel("нет журнала") end
+    if seq >= 9007199254740000 then hatchFailClosed(P, "исчерпана последовательность Seq"); return cancel("Seq") end
+    if egg:find("|",1,true) or egg:find("\n",1,true) then return cancel("недопустимое имя яйца") end
     seq += 1
-    local slot = { seq = seq, egg = egg, wake = Instance.new("BindableEvent") }
-    waiting = slot
-    Ui.hatchInFlight = true
-    P.lastHatchSendAt = os.clock()
+    if Env.genv then Env.genv.__TS14HatchSeq = seq end
+    local slot = { seq = seq, egg = egg, world = P.worldName, sent = false, wake = Instance.new("BindableEvent") }
+    waiting, Ui.hatchInFlight = slot, true -- reserve before a potentially yielding disk write
+    local token, writeErr, partial = eggJournal.begin(slot.world .. "|" .. tostring(slot.seq) .. "|" .. egg
+        .. "|" .. tostring(count) .. "|" .. string.format("%.17g", expected))
+    if not token then
+        local clean = partial and eggJournal.cancelUnsent(partial)
+        if waiting == slot then waiting=nil end
+        Ui.hatchInFlight=false; slot.wake:Destroy()
+        hatchFailClosed(P, "до отправки не удалось сохранить журнал яйца: " .. tostring(writeErr)
+            .. (partial and not clean and "; частичный маркер сохранён" or ""))
+        return nil, false, false
+    end
+    local function cancelPrepared(reason)
+        local clean, why = eggJournal.cancelUnsent(token)
+        if waiting == slot then waiting=nil end
+        Ui.hatchInFlight=false; slot.wake:Destroy()
+        if not clean then hatchFailClosed(P, "запрос не отправлен, но маркер не очищен: " .. tostring(why)) end
+        return cancel(reason)
+    end
+    -- The journal write can yield: repeat price, currency, world, balance, position and guards.
+    local afterSave=Env.data()
+    local rechecked=progressBatchPrice(afterSave,egg,count)
+    Env.elevate()
+    local sendData=Env.data()
+    local sendCoins,sendRb=W.coins(sendData),W.rebirths(sendData)
+    local sendAccess,sendReason=liveEggAccess(sendData,egg,farm)
+    local budgetOk=sendCoins and (farm and expected<=sendCoins*0.20 or not farm and count==3 and expected<=sendCoins)
+    if not allowed() or not W.isCurrent(P,sendData) or P.worldName~=slot.world or not rechecked
+        or not W.sameNumber(rechecked,expected) or not sendCoins or sendRb~=rb or not budgetOk
+        or progressFreeSlots(sendData)<count or not sendAccess
+        or farm ~= (P.phase=="rebirth" and not targetMode(P))
+        or not P.farmEggFloorLoaded or P.farmEggFloorError or P.farmEggSavePending
+        or not EGGS[egg] or not finitePositive(P.farmEggFloor) or EGGS[egg].price<P.farmEggFloor then
+        return cancelPrepared("условия изменились после записи: " .. tostring(sendReason or "цена/мир/баланс"))
+    end
+    slot.sent, slot.sentAt = true, os.clock()
+    P.lastHatchSendAt = slot.sentAt
     if farm then P.farmSpendWatchUntil = os.clock() + 15 end
     local sent, err = pcall(function()
         remote:FireServer({ Egg = egg, Count = count, Auto = true, Seq = slot.seq })
@@ -5765,93 +7553,69 @@ local function hatch(egg, count)
         Ui.hatchInFlight = false
         if waiting == slot then waiting = nil end
         slot.wake:Destroy()
-        hatchFailClosed(P, "ошибка отправки яйца: " .. tostring(err))
+        hatchFailClosed(P, "ошибка после возможной отправки яйца: " .. tostring(err))
         return nil, true, false
     end
     setHatchStage("ожидание ответа для " .. tostring(egg))
     hatchDiagnostic("sent", "запрос отправлен: " .. tostring(egg) .. " x" .. tostring(count)
-        .. ", цена " .. tostring(expected) .. ", баланс " .. tostring(lastCoins) .. "; жду ответ сервера", 30)
-    -- Timeout protects against a missing response. A matching response wakes the worker
-    -- immediately; no polling or fixed inter-request delay remains on the success path.
+        .. ", цена " .. tostring(expected) .. ", баланс " .. tostring(sendCoins) .. "; жду ответ сервера", 30)
     task.delay(12, function()
-        if waiting == slot and not slot.result then
-            slot.timedOut = true
-            slot.wake:Fire()
-        end
+        if waiting == slot and not slot.result then slot.timedOut=true; slot.wake:Fire() end
     end)
     while Life.alive and not slot.result and not slot.timedOut do slot.wake.Event:Wait() end
-    Ui.hatchInFlight = false
-    if waiting == slot then waiting = nil end
-    slot.wake:Destroy()
-    if farm then P.farmSpendWatchUntil = os.clock() + 15 end
-    local result = slot.result
-    local refusal = type(result) == "table" and (result.Error or (result.Success ~= true and result.Reason)) or nil
-    if type(result) == "table" and refusal and not result.Error then result.Error = refusal end
-    local verified = false
-    if not result then
-        if Life.alive then hatchFailClosed(P, "нет ответа на яйцо: запрос мог остаться на сервере") end
-    elseif type(result) == "table" and result.Success == true and result.Error ~= nil then
-        hatchFailClosed(P, "сервер прислал противоречивый ответ на яйцо")
-    elseif type(result) == "table" and result.Success == true then
-        local pets = type(result.Pets) == "table" and #result.Pets or 0
-        local explicit = tonumber(result.Rolls) or tonumber(result.Count) or tonumber(result.HatchCount)
-            or tonumber(result.Amount) or (pets > 0 and pets or nil)
-        local spent = result.Spent ~= nil and tonumber(result.Spent) or nil
-        if (result.Egg ~= nil and result.Egg ~= egg) or explicit ~= count
-            or (result.Spent ~= nil and spent ~= expected) then
-            hatchFailClosed(P, "сервер не подтвердил яйцо " .. tostring(egg) .. " x" .. tostring(count)
-                .. " по проверенной цене " .. tostring(expected) .. " (Rolls/Count=" .. tostring(explicit)
-                .. ", Spent=" .. tostring(result.Spent) .. ")")
+    local result=slot.result
+    local verdict, rolls, why=HatchResult.classify(result,egg,count,expected,slot.world,slot.seq)
+    if verdict~="unknown" then
+        local done,saveErr=eggJournal.finish(token)
+        if not done then verdict,why="unknown","ответ получен, но журнал не очищен: " .. tostring(saveErr) end
+    end
+    if waiting==slot then waiting=nil end
+    Ui.hatchInFlight=false; slot.wake:Destroy()
+    if farm then P.farmSpendWatchUntil=os.clock()+15 end
+    if type(Ui.__recordHatchResult)=="function" and result then
+        pcall(Ui.__recordHatchResult,result,verdict,rolls)
+    end
+    local verified=false
+    if verdict=="unknown" then
+        hatchFailClosed(P,"яйцо " .. tostring(egg) .. " x" .. tostring(count) .. ": " .. tostring(why)
+            .. "; возможный запрос сохранён и не повторяется")
+        if type(P.resetRoyal)=="function" then pcall(P.resetRoyal,"неподтверждённое яйцо") end
+    elseif verdict=="success" then
+        verified=true
+        result.ConfirmedRolls=rolls -- may exceed Count: an observed bonus roll is not an error
+        hatchDiagnostic("confirmed", "сервер подтвердил " .. tostring(egg) .. " x" .. tostring(count)
+            .. ", фактических роллов=" .. tostring(rolls), 30)
+        if farm then P.farmBatches=(P.farmBatches or 0)+1
         else
-            verified = true
-            hatchDiagnostic("confirmed", "сервер подтвердил открытие: " .. tostring(egg) .. " x" .. tostring(count), 30)
-            if farm then
-                P.farmBatches = (P.farmBatches or 0) + 1
-            else
-                local at = os.clock()
-                if P.lastHatchAt then
-                    local list = P.actualBatchIntervals
-                    list[#list + 1] = at - P.lastHatchAt
-                    while #list > 20 do table.remove(list, 1) end
-                end
-                P.lastHatchAt = at
-                P.confirmedBatches = (P.confirmedBatches or 0) + 1
+            local at=os.clock()
+            if P.lastHatchAt then
+                local list=P.actualBatchIntervals
+                list[#list+1]=at-P.lastHatchAt
+                while #list>20 do table.remove(list,1) end
+            end
+            P.lastHatchAt=at
+            P.confirmedBatches=(P.confirmedBatches or 0)+1
+            if type(P.observeRoyal)=="function" and Ui.__progressTest==P and not P.stopRequested and not P.worldChanging then
+                pcall(P.observeRoyal,egg,count,tonumber(result.Spent),slot.sentAt)
             end
         end
-    elseif type(result) == "table" and result.Error == "NotEnoughCoins" then
-        if farm then
-            refused[egg] = os.clock() + 5
-        else
-            P.coinRefusedSnapshot = lastCoins
-            P.holdHatch, P.phase, P.phaseAt = true, "save", P.activeClock
-            P.note = "сервер сообщил нехватку монет; жду обновления баланса на 30M x3"
-        end
-    elseif type(result) == "table" and result.Error == "StorageFull" then
-        P.storageNeeded = math.max(count, tonumber(result.Needed) or count)
-        if farm then
-            P.farmStorageFull = true
-            P.note = "рюкзак заполнен; жду существующую чистку или крафт"
-        else
-            P.holdHatch, P.phase, P.phaseAt = true, "storage_wait", P.activeClock
-            P.note = "рюкзак заполнен; жду свободные места"
-        end
-        if type(P.log) == "function" then pcall(P.log, P.note) end
-    elseif type(result) == "table" and (result.Error == "RateLimited" or result.Error == "TooFar") then
-        -- Explicit refusal; no successful opening is counted.
-    elseif type(result) == "table" and (refusal ~= nil or result.Success == false) then
-        if farm then
-            refused[egg] = os.clock() + 60
-            if type(P.log) == "function" then pcall(P.log, "сервер отклонил " .. tostring(egg)
-                .. ": " .. tostring(refusal or "Success=false") .. "; пропускаю на 60 с") end
-        else
-            P.holdHatch, P.phase, P.phaseAt = true, "target_wait", P.activeClock
-            P.serverDeniedUntil = os.clock() + 60
-            P.serverDeniedReason = tostring(refusal or "Success=false")
-            P.note = "сервер отклонил 30M: " .. P.serverDeniedReason
-            if type(P.log) == "function" then pcall(P.log, P.note .. "; другое яйцо не выбираю") end
-        end
     else
-        hatchFailClosed(P, "непонятный ответ на яйцо: " .. tostring(type(result) == "table" and (result.Error or result.Reason) or result))
+        if type(P.resetRoyal)=="function" then pcall(P.resetRoyal,"сервер отказал в партии") end
+        local refusal = result.Error or result.Reason or "Rejected"
+        if result.Error==nil or result.Error==false or result.Error=="" then result.Error=refusal end
+        if refusal=="NotEnoughCoins" then
+            if farm then refused[egg]=os.clock()+5
+            else P.coinRefusedSnapshot,P.coinRefusedEgg=sendCoins,egg; P.note="сервер сообщил нехватку монет; жду обновления баланса для x3" end
+        elseif refusal=="StorageFull" then
+            P.storageNeeded=math.max(count,tonumber(result.Needed) or count)
+            if farm then P.farmStorageFull=true; P.note="рюкзак заполнен; жду существующую чистку или крафт"
+            else P.holdHatch,P.phase,P.phaseAt=true,"storage_wait",P.activeClock; P.note="рюкзак заполнен; жду свободные места" end
+            if type(P.log)=="function" then pcall(P.log,P.note) end
+        elseif refusal~="RateLimited" and refusal~="TooFar" then
+            refused[egg]=os.clock()+60
+            if type(P.log)=="function" then pcall(P.log,"сервер отклонил " .. tostring(egg) .. ": " .. tostring(refusal)
+                .. "; повторю позже, дешевле сохранённого уровня не выбираю") end
+        end
     end
     return result, true, verified
 end
@@ -5905,14 +7669,14 @@ local box = tab:AddGroupbox({ Side = "Left", Name = "Auto hatch", IconName = "eg
 box:AddToggle("AutoHatch", {
     Text = "Auto hatch",
     Default = false,
-    Tooltip = "Progression: up to 20% of current coins per batch. After lock: only 30M x3, all available coins.",
+    Tooltip = "Select the highest affordable accessible egg, never downgrade. Before 300M/s: up to 20% per batch; afterwards x3 using available coins.",
 })
 Ui.automation("AutoHatch")
 box:AddDropdown("HatchMode", {
     Text = "Egg",
     Values = { BEST, CHOSEN, ISLAND },
     Default = BEST,
-    Tooltip = "During progression the selected egg price never drops: if it becomes unavailable or too expensive, the farm waits. After lock it uses only 30M x3.",
+    Tooltip = "The selected egg's base-price level never drops; when unavailable or unaffordable the farm waits. Islands continue opening when affordable.",
 })
 local initialEggs = eggChoices()
 box:AddDropdown("HatchEgg", {
@@ -5972,17 +7736,18 @@ end
 
 local function noEggDetail(data)
     local P = Ui.__progressTest
-    local coins = type(data) == "table" and type(data.Currencies) == "table" and tonumber(data.Currencies.Coins) or nil
+    local coins = W.coins(data)
     local slots = progressFreeSlots(data)
     local total, accessible, cooling = 0, 0, 0
-    if type(P) == "table" and P.phase == "rebirth" and not targetMode(P) then
+    if type(P) == "table" and (P.phase == "rebirth" or (P.phase == "hatch" and targetMode(P))) then
         local islands = type(data.Progression) == "table" and data.Progression.UnlockedIslands or nil
         for egg, def in pairs(EGGS) do
             total += 1
-            local open = farmAreaOpen(data, def)
-            local hasPosition = EGG_POSITIONS[egg] ~= nil or eggModel(egg) ~= nil
+            local open = farmAreaOpen(data, def, egg, true)
+            local hasPosition = positions(egg)[egg] ~= nil or eggModel(egg) ~= nil
                 or (islandApi and type(def.island) == "string" and def.island ~= "")
-            if def.coinPricing and def.price > 0 and open and hasPosition then
+            if def.coinPricing and def.price > 0 and open and hasPosition
+                and not retired30M(egg, def.price, def.display) then
                 if os.clock() < (refused[egg] or 0) then cooling += 1 else accessible += 1 end
             end
         end
@@ -5991,10 +7756,10 @@ local function noEggDetail(data)
     end
     local pricing = type(EggPricing) == "table" and type(EggPricing.GetTotal) == "function"
     local budget = coins and coins >= 0 and coins * 0.20 or nil
-    local budgetText = targetMode(P) and "на 30M x3 нужно 900 млн, доступен весь баланс"
+    local budgetText = targetMode(P) and "x3 по игровой цене на доступный баланс"
         or ("лимит на партию 20%=" .. tostring(budget))
     local floorText = ""
-    if P and P.phase == "rebirth" and not targetMode(P) then
+    if P then
         if P.farmEggFloorError then floorText = ", ошибка уровня яйца=" .. tostring(P.farmEggFloorError)
         elseif finitePositive(P.farmEggFloor) then
             floorText = ", уровень=" .. tostring(P.farmEggName) .. " от " .. tostring(P.farmEggFloor)
@@ -6010,9 +7775,10 @@ end
 local function handleMoveFailure(egg, reason, detail)
     if reason == "paused" then return end
     local P = Ui.__progressTest
-    local farm = P and P.phase == "rebirth" and not targetMode(P) and not P.farmThresholdReached
-        and not P.holdHatch and not P.stopRequested and not P.pending and not P.cleaning
-    local skip = farm and (reason == "model_missing" or reason == "no_position" or reason == "no_center"
+    local active = P and ((P.phase == "rebirth" and not targetMode(P) and not P.farmThresholdReached)
+        or (P.phase == "hatch" and targetMode(P)))
+        and not P.holdHatch and not P.stopRequested
+    local skip = active and (reason == "model_missing" or reason == "no_position" or reason == "no_center"
         or reason == "not_near" or reason == "trip_error")
     local extra = ""
     if skip then
@@ -6026,13 +7792,16 @@ end
 
 local function autoLoop()
     local tooFar = 0
+    local lastWorld
     while Life.alive do
         local P = Ui.__progressTest
+        if P and P.worldName ~= lastWorld then current = nil; table.clear(refused); lastWorld = P.worldName end
         local sampleEgg = targetMode(P) and P.eggGoal or ""
         local sampleCount = targetMode(P) and 3 or 1
         local blocked = hatchDenied(P, sampleEgg, sampleCount)
         if Ui.hatchInFlight then blocked = "другая партия ещё ожидает ответ" end
         if blocked then
+            if P and type(P.resetRoyal)=="function" and not P.royalFinal then pcall(P.resetRoyal,"пауза открытия") end
             stop()
             note = "Ожидание: " .. tostring(blocked)
             setHatchStage("пауза: " .. tostring(blocked))
@@ -6047,6 +7816,13 @@ local function autoLoop()
             if targetMode(P) then task.wait() else Life.wait(0.5) end
             continue
         end
+        if targetMode(P) and P.phase == "hatch" and progressFreeSlots(data) < 3 then
+            P.storageNeeded = 3
+            P.holdHatch, P.phase, P.phaseAt = true, "storage_wait", P.activeClock
+            P.note = "меньше трёх свободных мест; жду существующую чистку"
+            if type(P.log) == "function" then pcall(P.log, P.note) end
+            continue
+        end
         setHatchStage("выбор доступного яйца")
         local egg = chooseEgg(data)
         if not egg then
@@ -6059,7 +7835,7 @@ local function autoLoop()
         if egg ~= current then
             current, tooFar = egg, 0
             pcall(function() Env.LocalPlayer:SetAttribute("TAPSIM_Egg", egg) end)
-            logEgg(string.format("выбрано %s (цена в конфиге %s, предварительно x%d; запрос ещё не отправлен)",
+            logEgg(string.format("кандидат %s (цена в конфиге %s, предварительно x%d; проверяю стойку)",
                 egg, tostring(EGGS[egg] and EGGS[egg].price), hatchCount(data, egg) or 0))
         end
         local count = hatchCount(data, egg)
@@ -6102,6 +7878,24 @@ local function autoLoop()
             continue
         end
         if hatchDenied(P, egg, count) then if targetMode(P) then task.wait() else Life.wait(0.1) end; continue end
+        -- Only a reachable live stand may advance the durable no-downgrade floor. Save BEFORE
+        -- sending; if the write fails or a probe starts during the write, no hatch is sent.
+        local standData=Env.data()
+        local standOK,standWhy=liveEggAccess(standData,egg,P.phase=="rebirth" and not targetMode(P))
+        if not standOK then
+            refused[egg]=os.clock()+15
+            hatchDiagnostic("stand-unconfirmed", "стойка "..tostring(egg).." не подтверждена: "..tostring(standWhy)
+                .."; достигнутый уровень не понижаю",15)
+            if targetMode(P) then task.wait() else Life.wait(0.2) end
+            continue
+        end
+        local basePrice = EGGS[egg] and finitePositive(EGGS[egg].price) or nil
+        if not basePrice or basePrice < (P.farmEggFloor or 0) or not rememberFarmEgg(P, egg, basePrice) then
+            hatchDiagnostic("floor-save", "не удалось закрепить уровень " .. tostring(egg) .. "; запрос не отправлен", 20)
+            if targetMode(P) then task.wait() else Life.wait(0.2) end
+            continue
+        end
+        if hatchDenied(P, egg, count) then if targetMode(P) then task.wait() else Life.wait(0.1) end; continue end
         applyAutoDelete(egg)
         if hatchDenied(P, egg, count) then if targetMode(P) then task.wait() else Life.wait(0.1) end; continue end
         clearWaiting()
@@ -6112,7 +7906,7 @@ local function autoLoop()
             pause("The egg request is not confirmed; safety pause.", 0.5)
         elseif result.Success and verified then
             tooFar = 0
-            local got = tonumber(result.Rolls) or (type(result.Pets) == "table" and #result.Pets > 0 and #result.Pets) or count
+            local got = tonumber(result.ConfirmedRolls) or count
             stats.eggs += got
             stats.spent += tonumber(result.Spent) or 0
             stats.started = stats.started or os.clock()
@@ -6140,7 +7934,7 @@ local function autoLoop()
             hatchDiagnostic("server-far", "сервер отклонил " .. tostring(egg) .. ": TooFar; попробую подойти снова", 15)
             if not Ui.on("HatchTeleport") then
                 pause("Too far from the " .. egg .. " egg; teleport is off.", 2)
-            elseif tooFar >= 3 and P and P.phase == "rebirth" and not targetMode(P) then
+            elseif tooFar >= 3 and P then
                 refused[egg] = os.clock() + 15
                 tooFar = 0
                 hatchDiagnostic("server-far-skip", "три отказа TooFar для " .. tostring(egg)
@@ -6238,83 +8032,8 @@ end)
 
 Life.onCleanup(stop)
 
--- Разрешаем только однозначно найденный в живом конфиге 30M за 300 млн / 900 млн за x3.
-local function is30M(value)
-    local n = string.lower(tostring(value or "")):gsub("[^%w]", "")
-    local function token(part)
-        local cursor = 1
-        while true do
-            local at = n:find(part, cursor, true)
-            if not at then return false end
-            local before = at > 1 and n:sub(at - 1, at - 1) or ""
-            local after = n:sub(at + #part, at + #part)
-            if not before:match("%d") and not after:match("%d") then return true end
-            cursor = at + 1
-        end
-    end
-    return token("30m") or token("30000000")
-end
-local function progressTarget(data)
-    if type(data) ~= "table" then return nil, "нет реплики" end
-    local found, matches = nil, 0
-    for name, def in pairs(EGGS) do
-        if type(name) == "string" and def.price == 300000000 and (is30M(name) or is30M(def.display)) then
-            found, matches = name, matches + 1
-        end
-    end
-    if matches ~= 1 then return nil, "30M не найден однозначно в игровом конфиге (совпадений: " .. matches .. ")" end
-    if progressStrictPrice(data, found) ~= 900000000 then return nil, "цена 30M x3 не подтверждена как 900 млн" end
-    -- Отметка Eggs.Unlocked сама по себе не является подтверждённым запретом доступа.
-    -- Явный отказ игры обработаем отдельно; другое яйцо вместо 30M выбирать нельзя.
-    -- Старая сохранённая координата НЕ доказывает, что ивентовая стойка ещё существует.
-    local visible = progressLivePosition(found) ~= nil
-    return found, visible and "ready" or "no_position", 900000000
-end
-
--- Если стойка ещё не стримится, прибываем к последней точке или к Spawn и смотрим модель.
--- Одна сохранённая координата без живой модели не считается доступным ивентом.
-local function progressLocate(egg)
-    local P = Ui.__progressTest
-    if not P or not Life.alive or P.stopRequested or P.previousHatchPending
-        or P.previousCraftPending or P.craftBusy or P.craftInFlight
-        or P.previousIslandPending or P.islandUncertain or P.islandTravelUncertain
-        or Ui.travelling or not Ui.on("HatchTeleport")
-        or (Env.genv and Env.genv.__handoverPaused) then return false end
-    if progressLivePosition(egg) then return true end
-    local destination, hrp = eggPosition(egg) or EGG_POSITIONS.Basic, root()
-    if not destination or not hrp then return false end
-    Ui.hatchMoving = true
-    local ok = pcall(function()
-        if islandApi and type(islandApi.travel) == "function" then
-            local def = EGGS[egg]
-            local island = def and type(def.island) == "string" and def.island ~= "" and def.island or "Spawn"
-            local sent = islandApi.travel(island, function()
-                return Life.alive and not P.stopRequested and not Ui.travelling
-                    and not P.islandTravelUncertain and not (Env.genv and Env.genv.__handoverPaused)
-            end)
-            if sent then
-                local deadline = os.clock() + 3
-                while Life.alive and not P.stopRequested and not P.islandTravelUncertain
-                    and not progressLivePosition(egg) and os.clock() < deadline do Life.wait(0.2) end
-                if progressLivePosition(egg) then return end
-            end
-        end
-        if P.islandTravelUncertain then return end
-        Env.streamAround(destination, 5)
-        if not Life.alive or P.stopRequested or Ui.travelling
-            or (Env.genv and Env.genv.__handoverPaused) then return end
-        hrp = root()
-        if not hrp then return end
-        hrp.AssemblyLinearVelocity = Vector3.zero
-        hrp.CFrame = CFrame.new(destination + Vector3.new(0, 6, 0))
-        Life.wait(3)
-    end)
-    Env.elevate()
-    Ui.hatchMoving = false
-    return ok and progressLivePosition(egg) ~= nil
-end
-
-return { progressTarget = progressTarget, progressLocate = progressLocate }
+-- Dynamic selector and goToEgg replace the removed 30M-only target/locator.
+return { progressDynamic = true }
 end
 __modules["features/home"] = function(use) -- src/games/tapsim/features/home.luau
 -- Home tab: the shared welcome box plus your live currencies and progress.
@@ -8233,6 +9952,7 @@ __modules["features/pets"] = function(use) -- src/games/tapsim/features/pets.lua
 local Env = use("core/env")
 local Life = use("shared/life")
 local Ui = use("core/ui")
+local W = use("features/world_data")
 
 local tab = Ui.Tabs.Pets
 local box = tab:AddGroupbox({ Side = "Right", Name = "Auto equip", IconName = "star" })
@@ -8255,10 +9975,12 @@ end
 
 local FINAL_EQUIP_GAP = 600
 local function equipAllowed(mode, allowClean)
-    if not Life.alive or (Env.genv and Env.genv.__handoverPaused) then return false end
     local P = Ui.__progressTest
+    local snapshot = P and Env.data() -- can yield; identity/phase checks follow it
+    if not Life.alive or Ui.__progressTest ~= P or (Env.genv and Env.genv.__handoverPaused) then return false end
     if P then
-        if P.equipReady ~= true or P.stopRequested or (P.cleaning and not allowClean)
+        if P.equipReady ~= true or P.stopRequested or P.worldChanging or P.royalFinal or P.finalizing
+            or not W.isCurrent(P, snapshot) or (P.cleaning and not allowClean)
             or P.craftBusy or P.craftInFlight then return false end
         local expected = (P.eggFixed or P.rebirthLocked) and "Luck" or "Clicks"
         if mode ~= expected or equipModeNow() ~= expected then return false end
@@ -8266,7 +9988,7 @@ local function equipAllowed(mode, allowClean)
     return true
 end
 
--- All senders, including cleanup and trade recovery, share the same 600 s gate after 900M/s.
+-- Legacy gate remains for old states; the Royal finale itself disallows EquipBest entirely.
 -- Record a final-stage attempt before FireServer: a transport error may still have sent it.
 function Ui.tryEquipBest(mode, allowClean)
     local requestedMode = mode or equipModeNow()
@@ -8276,7 +9998,7 @@ function Ui.tryEquipBest(mode, allowClean)
     Env.elevate()
     if not equipAllowed(requestedMode, allowClean == true) then return false, "not-ready" end
     local P, now = Ui.__progressTest, os.clock()
-    if P and P.rebirthLocked then
+    if P and (P.rebirthLocked or P.royalFinal) then
         local last = P.finalEquipLastAt
         if not last and P.lastEquipMode == "Luck" then last = P.lastEquipAt end
         local nextAt = tonumber(P.finalEquipNotBefore) or 0
@@ -8298,7 +10020,7 @@ function Ui.tryEquipBest(mode, allowClean)
             end
             return false, "not-saved"
         end
-        if Ui.__progressTest ~= P or not equipAllowed(requestedMode, allowClean == true) or not P.rebirthLocked then
+        if Ui.__progressTest ~= P or not equipAllowed(requestedMode, allowClean == true) or not (P.rebirthLocked or P.royalFinal) then
             P.finalEquipBusy = false
             return false, "not-ready"
         end
@@ -8312,6 +10034,7 @@ function Ui.tryEquipBest(mode, allowClean)
     if Env.genv and Env.LocalPlayer and Env.LocalPlayer.UserId then
         if type(Env.genv.__TS30EquipHistory) ~= "table" then Env.genv.__TS30EquipHistory = {} end
         history, key = Env.genv.__TS30EquipHistory, tostring(Env.LocalPlayer.UserId)
+        if P and P.worldName == "TimeRift" then key ..= ":TimeRift" end
         history[key] = { at = now, mode = requestedMode, success = false }
     end
     local sent, err = pcall(function() remote:FireServer({ Action = "EquipBest", Mode = requestedMode }) end)
@@ -9613,6 +11336,7 @@ __modules["features/skilltree"] = function(use)
 local Env = use("core/env")
 local Life = use("shared/life")
 local Ui = use("core/ui")
+local W = use("features/world_data")
 
 local tab = Ui.Tabs.Tapping
 local box = tab:AddGroupbox({ Side = "Left", Name = "Skill tree", IconName = "git-branch" })
@@ -9632,7 +11356,7 @@ box:AddButton({
 local label = box:AddLabel("Waiting for the game's skill formula.", true)
 local PACE = 0.3
 local FORMULA, NODES, priorities = nil, {}, {}
-local configCurrencyConflicts = {}
+local configCurrencyConflicts, riftConfigConflicts, riftConfigReady = {}, {}, false
 local confirmedThisRun = 0
 local lastOutcome = "ожидаю формулу"
 local lastSummary = ""
@@ -9719,7 +11443,7 @@ local function currencySafe(def)
         end
         for k, v in pairs(t) do
             local key = normalized(k)
-            if key == "coins" or key == "coin" or key == "tokens" or key == "token"
+            if key == "coins" or key == "coin" or key == "riftcoins" or key == "riftcoin" or key == "riftgems" or key == "riftgem" or key == "tokens" or key == "token"
                 or key == "paidtokens" or key == "robux" or key == "candycorn"
                 or key == "tickets" or key == "eventcurrency" then
                 if nonzero(v) then denied = true end
@@ -9742,6 +11466,57 @@ local function currencySafe(def)
     return not denied
 end
 
+-- Analyze a Rift node and all nested cost records; malformed/too-deep tables are not purchases.
+local function inspectRiftCost(root)
+    if type(root) ~= "table" then return false, true end
+    local seen, visiting, budget, found, bad = {}, {}, 500, false, false
+    local other = { coins=true, coin=true, riftcoins=true, riftcoin=true, gems=true, gem=true,
+        tokens=true, token=true, paidtokens=true, robux=true, candycorn=true, tickets=true,
+        eventcurrency=true, money=true }
+    local function visit(t, depth)
+        if type(t) ~= "table" or bad then return end
+        if visiting[t] then bad=true; return end
+        if seen[t] then return end
+        budget -= 1
+        if budget < 0 or depth > 8 then bad=true; return end
+        seen[t], visiting[t] = true, true
+        for k,v in pairs(t) do
+            local key=W.norm(k)
+            if key=="currency" or key=="costcurrency" or key=="pricecurrency" or key=="currencyname"
+                or key=="requiredcurrency" or key=="paymentcurrency" or key=="costtype" or key=="pricetype" then
+                local n=W.norm(v)
+                if n=="riftgems" or n=="riftgem" then found=true else bad=true end
+            elseif key=="riftgems" or key=="riftgem" or other[key] then
+                if v~=nil and v~=false then
+                    local n=W.finite(v)
+                    if n==nil then bad=true elseif n>0 then
+                        if key=="riftgems" or key=="riftgem" then found=true else bad=true end
+                    end
+                end
+            elseif (key=="cost" or key=="price" or key=="costs" or key=="prices")
+                and type(v)=="string" and W.finite(v)==nil then bad=true end
+            if type(v)=="table" then visit(v,depth+1) end
+        end
+        visiting[t]=nil
+    end
+    visit(root,0)
+    return found,bad
+end
+local function riftScope(node, meta, requireWorld)
+    local found=false
+    for _,t in ipairs({node,meta}) do
+        if type(t)=="table" then
+            for _,key in ipairs({"RequiredWorld","World"}) do
+                local v=t[key]
+                if v~=nil and v~=false and v~="" then
+                    if v~="TimeRift" then return false end
+                    found=true
+                end
+            end
+        end
+    end
+    return not requireWorld or found
+end
 local function loadFormula()
     local ok, value = Env.call(function()
         return require(Env.ReplicatedStorage.Shared.Progression.SkillTreeFormula)
@@ -9758,24 +11533,31 @@ local function loadFormula()
     table.sort(names)
     if #names == 0 then FORMULA, NODES, priorities = nil, {}, {}; return false end
     FORMULA, NODES, priorities = value, names, {}
-    configCurrencyConflicts = {}
+    configCurrencyConflicts, riftConfigConflicts, riftConfigReady = {}, {}, false
     -- Если второй конфиг явно называет у того же ключа другую валюту, сохраняем
     -- консервативный запрет v5. Отсутствие этого конфига не подменяет Nodes.
     local gotConfig, cfg = Env.call(function()
         return require(Env.ReplicatedStorage.Shared.Progression.SkillTreeConfig)
     end)
     if gotConfig and type(cfg) == "table" then
-        local visited, budget = {}, 5000
-        local function walk(t, depth)
-            if type(t) ~= "table" or visited[t] or budget <= 0 or depth > 20 then return end
-            visited[t] = true
-            budget -= 1
-            if type(t.Name) == "string" and value.Nodes[t.Name] ~= nil and not currencySafe(t) then
-                configCurrencyConflicts[t.Name] = true
-            end
-            for _, child in pairs(t) do if type(child) == "table" then walk(child, depth + 1) end end
+        local visited, budget, complete = {}, 5000, true
+        local function mark(name,t)
+            if type(name)~="string" or value.Nodes[name]==nil or type(t)~="table" then return end
+            if not currencySafe(t) then configCurrencyConflicts[name]=true end
+            local _,bad=inspectRiftCost(t)
+            if bad or not riftScope(t,t.Data,false) then riftConfigConflicts[name]=true end
         end
-        walk(cfg, 0)
+        local function walk(t, depth)
+            if type(t)~="table" or visited[t] then return end
+            if budget<=0 or depth>20 then complete=false; return end
+            visited[t]=true; budget-=1
+            mark(t.Name,t); mark(t.Id,t)
+            for key,child in pairs(t) do
+                if type(child)=="table" then mark(key,child); walk(child,depth+1) end
+            end
+        end
+        walk(cfg,0)
+        riftConfigReady=complete
     end
     -- Доступные автоклик/доход идут раньше остальных. Родители доходных узлов тоже
     -- получают приоритет: иначе полезная ветка не будет открываться.
@@ -9809,12 +11591,22 @@ local function unlockedFlag(value)
     return value == true or (type(value) == "number" and value > 0)
 end
 
+local function riftGemNode(node, meta)
+    if not riftScope(node,meta,true) then return false end
+    local found,bad=inspectRiftCost(node)
+    local foundMeta,badMeta=inspectRiftCost(meta)
+    return (found or foundMeta) and not bad and not badMeta
+end
 local function eligibility(data, name)
     local node = FORMULA and FORMULA.Nodes and FORMULA.Nodes[name]
     if type(node) ~= "table" or type(node.Data) ~= "table" then return false, nil, "схема" end
     local meta = node.Data
     if forbiddenSkill(name) then return false, nil, "запрещённая ветка" end
-    if configCurrencyConflicts[name] or not currencySafe(node) or not currencySafe(meta) then return false, nil, "валюта" end
+    if W.world(data) == "TimeRift" then
+        if not riftConfigReady or riftConfigConflicts[name] or not riftGemNode(node, meta) then return false, nil, "валюта" end
+    elseif W.world(data) == "Main" then
+        if configCurrencyConflicts[name] or not currencySafe(node) or not currencySafe(meta) then return false, nil, "валюта" end
+    else return false, nil, "мир" end
     local tree = type(data) == "table" and type(data.SkillTree) == "table" and data.SkillTree.Unlocked or nil
     if type(tree) ~= "table" then return false, nil, "нет данных" end
     local state = tree[name]
@@ -9836,7 +11628,7 @@ local function eligibility(data, name)
         if type(world) ~= "string" or not progression or progression.World ~= world then return false, nil, "мир" end
     end
     local currencies = type(data.Currencies) == "table" and data.Currencies or nil
-    local gems = currencies and tonumber(currencies.Gems) or nil
+    local gems = W.gems(data)
     if not gems or gems ~= gems or gems < 0 or gems == math.huge then return false, nil, "нет данных" end
     local ok, raw = Env.call(FORMULA.GetPrice, data, name)
     local price = ok and tonumber(raw) or nil
@@ -9866,14 +11658,14 @@ local function observeAccepted(data)
     end
 end
 
-local function summarize(reasons, cheapestName, cheapestPrice, gems)
+local function summarize(reasons, cheapestName, cheapestPrice, gems, gemKey)
     local order = { "открыто", "родитель", "остров", "мир", "мало гемов", "валюта", "запрещённая ветка", "цена", "схема", "нет данных", "жду реплику", "повтор позже" }
     local parts = {}
     for _, reason in ipairs(order) do
         if reasons[reason] then parts[#parts + 1] = reason .. "=" .. tostring(reasons[reason]) end
     end
     if cheapestName then
-        parts[#parts + 1] = string.format("ближайший %s=%s Gems при балансе %s", cheapestName, tostring(cheapestPrice), tostring(gems or "?"))
+        parts[#parts + 1] = string.format("ближайший %s=%s %s при балансе %s", cheapestName, tostring(cheapestPrice), tostring(gemKey or "гемы"), tostring(gems or "?"))
     end
     return #parts > 0 and table.concat(parts, ", ") or "нет подходящих узлов"
 end
@@ -9918,14 +11710,14 @@ Life.spawn("skills:auto", function()
             end
         end
         if not active(P) then Life.wait(0.2); continue end
-        local gems = type(data) == "table" and type(data.Currencies) == "table" and data.Currencies.Gems or nil
-        local summary = summarize(reasons, cheapestName, cheapestPrice, gems)
+        local gems = W.gems(data)
+        local summary = summarize(reasons, cheapestName, cheapestPrice, gems, W.gemKey(data))
         if not best then
             reportSkills(lastOutcome .. "; доступно=0", summary)
             Life.wait(2)
             continue
         end
-        lastOutcome = string.format("пробую %s за %s Gems; доступно=%d", best, tostring(bestPrice), available)
+        lastOutcome = string.format("пробую %s за %s %s; доступно=%d", best, tostring(bestPrice), tostring(W.gemKey(data) or "гемы"), available)
         reportSkills(lastOutcome, summary)
         P.skillInFlight = true
         local called, ok, response = pcall(Env.invokeGuarded, "SkillTreeService", "Unlock", function()
@@ -10188,6 +11980,8 @@ __modules["features/tap"] = function(use) -- src/games/tapsim/features/tap.luau
 local Env = use("core/env")
 local Life = use("shared/life")
 local Ui = use("core/ui")
+local W = use("features/world_data")
+local RiftNative = use("features/rift_native")
 
 local Options = Ui.Options
 local tab = Ui.Tabs.Tapping
@@ -10252,12 +12046,14 @@ Life.spawn("tap:auto", function()
         -- Ui.tapDemand: another feature (breaking a creature or a meteor, which taps hit from
         -- 14 studs) needs taps even while auto tap is off.
         if (Ui.on("AutoTap") or Ui.tapDemand)
-            and not (Ui.__progressTest and (Ui.__progressTest.holdTap or Ui.__progressTest.rebirthLocked)) then
-            -- Identity elevation may yield while the final 900M/s lock is committed.
+            and not (Ui.__progressTest and (Ui.__progressTest.holdTap or Ui.__progressTest.stopRequested or Ui.__progressTest.rebirthLocked))
+            and not (Env.genv and Env.genv.__handoverPaused) then
+            -- Identity elevation may yield while the progression state changes.
             -- Re-read all guards after it, immediately before generating/sending a tap.
             Env.elevate()
             local P = Ui.__progressTest
             if not Life.alive or not (Ui.on("AutoTap") or Ui.tapDemand)
+                or Ui.__progressTest ~= P
                 or (P and (P.holdTap or P.stopRequested or P.rebirthLocked))
                 or (Env.genv and Env.genv.__handoverPaused) then continue end
             if unanswered >= STALL_TAPS and os.clock() - lastAnswer > STALL_SECONDS then
@@ -10308,7 +12104,10 @@ function Ui.syncNativeClicker()
     local remote = Env.remote("AutoClickService", "AutoClickRequested")
     Env.elevate() -- may yield: read the final state only after elevation
     local P = Ui.__progressTest
-    local enabled = Life.alive and Ui.on("AutoClicker")
+    local enabled = Ui.on("AutoClicker") -- may yield; all live state is re-read afterwards
+    if Ui.__progressTest ~= P then return end -- the new controller owns its own clicker sync
+    local toggle = Ui.Toggles and Ui.Toggles.AutoClicker
+    enabled = enabled and Life.alive and Ui.__progressTest == P and toggle and toggle.Value == true
         and not (P and (P.holdTap or P.stopRequested or P.rebirthLocked))
         and not (Env.genv and Env.genv.__handoverPaused)
     remote:FireServer({ Enabled = enabled == true })
@@ -10525,6 +12324,18 @@ Life.loop("tap:rebirth", 0.25, function()
 end)
 
 local function progressPack(data, remaining)
+    if W.world(data) == "TimeRift" then
+        local P = Ui.__progressTest
+        if not P or P.worldName ~= "TimeRift" or not W.isCurrent(P, data) then
+            return nil, nil, nil, "мир не подтверждён"
+        end
+        local item, why = RiftNative.findRebirth(data)
+        if not item then P.riftPackCandidate = nil; return nil, nil, nil, why end
+        if not item.amount or item.amount > remaining then return nil, nil, nil, "пакет недоступен" end
+        P.riftPackCandidate = item
+        return item.index, item.amount, item.price, nil
+    end
+    if W.world(data) ~= "Main" then return nil, nil, nil, "неизвестный мир" end
     if not RebirthConfig or type(RebirthConfig.GetPrice) ~= "function" then
         return nil, nil, nil, "нет игрового RebirthConfig"
     end
@@ -10559,6 +12370,13 @@ end
 -- доказывает, какой из них верен для этой версии сервера.
 local function progressExplain(data)
     if type(data) ~= "table" then return "нет данных" end
+    if W.world(data) == "TimeRift" then
+        local up = type(data.Upgrades) == "table" and data.Upgrades.RiftRebirthButtons or nil
+        local item, why = RiftNative.findRebirth(data)
+        return "RiftRebirthButtons=" .. tostring(up) .. "; " .. (item and
+            ("видимая кнопка=" .. tostring(item.index) .. ", x" .. tostring(item.amount) .. ", цена=" .. tostring(item.price) .. " RiftCoins")
+            or tostring(why)) .. "; запрос вызывает игровой обработчик, серверная схема не угадана"
+    end
     local upgrades = type(data.Upgrades) == "table" and data.Upgrades.RebirthButtons or 0
     local world = worldOf(data)
     local selectedCount = buttonCount(data)
@@ -11128,6 +12946,7 @@ __modules["features/upgrades"] = function(use) -- src/games/tapsim/features/upgr
 local Env = use("core/env")
 local Life = use("shared/life")
 local Ui = use("core/ui")
+local W = use("features/world_data")
 
 local Options = Ui.Options
 local tab = Ui.Tabs.Tapping
@@ -11144,7 +12963,7 @@ end
 
 local function currencyIn(def)
     if type(def) ~= "table" then return nil end
-    local result, mixed, seen = nil, false, {}
+    local result, mixed, seen, visiting, budget = nil, false, {}, {}, 500
     local function add(value)
         if type(value) ~= "string" or value == "" then return end
         local normalized = value:lower():gsub("%s+", "")
@@ -11157,7 +12976,7 @@ local function currencyIn(def)
                 if type(v) ~= "string" or v == "" then mixed = true else add(v) end
             end
         end
-        for _, key in ipairs({ "Gems", "Coins", "Tokens", "PaidTokens", "Robux", "CandyCorn", "Tickets", "EventCurrency" }) do
+        for _, key in ipairs({ "Gems", "RiftGems", "Coins", "RiftCoins", "Tokens", "PaidTokens", "Robux", "CandyCorn", "Tickets", "EventCurrency" }) do
             local v = value[key]
             if v ~= nil and v ~= false then
                 local n = tonumber(v)
@@ -11167,25 +12986,39 @@ local function currencyIn(def)
         end
     end
     local function costs(value, depth)
-        if type(value) ~= "table" or seen[value] then return end
-        if depth > 6 then mixed = true; return end
-        seen[value] = true
+        if type(value) ~= "table" or mixed then return end
+        if visiting[value] then mixed = true; return end
+        if seen[value] then return end
+        budget -= 1
+        if depth > 6 or budget < 0 then mixed = true; return end
+        seen[value], visiting[value] = true, true
         fields(value)
         for _, child in pairs(value) do
             if type(child) == "table" then costs(child, depth + 1) end
         end
+        visiting[value] = nil
     end
     fields(def)
-    for _, key in ipairs({ "Cost", "Price", "Costs", "Prices" }) do
-        local v = def[key]
-        if type(v) == "table" then costs(v, 0)
-        elseif type(v) == "string" and not tonumber(v) then mixed = true end
+    local roots={def, type(def.Data)=="table" and def.Data or nil}
+    for i=1,2 do
+        local root=roots[i]
+        if type(root)=="table" then
+            if i==2 then fields(root) end
+            for _,key in ipairs({"Cost","Price","Costs","Prices"}) do
+                local v=root[key]
+                if type(v)=="table" then costs(v,0)
+                elseif type(v)=="string" and not tonumber(v) then mixed=true end
+            end
+        end
     end
     return mixed and "mixed currencies" or result
 end
 local function upgradeCurrency(name)
     if not ok or type(cfg) ~= "table" then return nil end
-    local containers = { cfg.Upgrades, cfg.Definitions, cfg.Items, cfg.ByName, cfg }
+    local rootData = type(cfg.Data)=="table" and cfg.Data or nil
+    local containers = { cfg.Upgrades, cfg.Definitions, cfg.Items, cfg.ByName, cfg, rootData,
+        rootData and rootData.Upgrades, rootData and rootData.Definitions,
+        rootData and rootData.Items, rootData and rootData.ByName }
     local result, mixed = nil, false
     local function record(found)
         if found == "mixed currencies" then mixed = true
@@ -11193,7 +13026,7 @@ local function upgradeCurrency(name)
             if result and result ~= found then mixed = true else result = found end
         end
     end
-    for i = 1, 5 do
+    for i = 1, 10 do
         local group = containers[i]
         if type(group) == "table" then
             record(currencyIn(group[name]))
@@ -11218,6 +13051,13 @@ local function upgradeRelevant(name)
     if forbidden(name) then return false end
     local function badDef(def)
         if type(def) ~= "table" then return false end
+        local current = W.world(Env.data())
+        for _, scoped in ipairs({ def, type(def.Data)=="table" and def.Data or {} }) do
+            for _, key in ipairs({ "World", "RequiredWorld" }) do
+                local required = scoped[key]
+                if required ~= nil and required ~= false and required ~= "" and required ~= current then return true end
+            end
+        end
         for _, key in ipairs({ "Name", "Id", "DisplayName", "Title", "Description", "Tooltip", "Category" }) do
             if forbidden(def[key]) then return true end
         end
@@ -11230,8 +13070,11 @@ local function upgradeRelevant(name)
         return false
     end
     if ok and type(cfg) == "table" then
-        local containers = { cfg.Upgrades, cfg.Definitions, cfg.Items, cfg.ByName, cfg }
-        for i = 1, 5 do
+        local rootData = type(cfg.Data)=="table" and cfg.Data or nil
+        local containers = { cfg.Upgrades, cfg.Definitions, cfg.Items, cfg.ByName, cfg, rootData,
+            rootData and rootData.Upgrades, rootData and rootData.Definitions,
+            rootData and rootData.Items, rootData and rootData.ByName }
+        for i = 1, 10 do
             local group = containers[i]
             if type(group) == "table" then
                 if badDef(group[name]) then return false end
@@ -11245,7 +13088,10 @@ local function upgradeRelevant(name)
 end
 local function gemUpgrade(name)
     local currency = upgradeCurrency(name)
-    return type(currency) == "string" and currency:lower():gsub("%s+", "") == "gems" and upgradeRelevant(name)
+    local data = Env.data()
+    local wanted = W.world(data) == "TimeRift" and "riftgems" or W.world(data) == "Main" and "gems" or nil
+    return wanted ~= nil and type(currency) == "string" and currency:lower():gsub("[^%w]", "") == wanted
+        and upgradeRelevant(name)
 end
 
 box:AddToggle("AutoUpgrade", {
@@ -13874,14 +15720,9 @@ end
 -- Carry the last selected farming egg across a same-client V11/V12 reload. V12's own
 -- account-scoped persisted maximum still wins if it is higher than this last selection.
 local previousFarmEgg = nil
-if type(prevState) == "table" and prevState.eggFixed ~= true and prevState.rebirthLocked ~= true then
+local previousWorldName = type(prevState) == "table" and (prevState.worldName or "Main") or nil
+if type(prevState) == "table" then
     if type(prevState.farmEggName) == "string" then previousFarmEgg = prevState.farmEggName end
-    if not previousFarmEgg then
-        pcall(function()
-            local value = Env.LocalPlayer and Env.LocalPlayer:GetAttribute("TAPSIM_Egg")
-            if type(value) == "string" then previousFarmEgg = value end
-        end)
-    end
 end
 local previousHatchPending = prevUi and (prevUi.hatchInFlight == true
     or (type(prevState) == "table" and (prevState.previousHatchPending == true or prevState.hatchUncertain == true))) or false
@@ -13894,6 +15735,31 @@ local previousCraftPending = type(prevState) == "table" and (prevState.craftInFl
 local previousIslandPending = type(prevState) == "table" and (prevState.islandInFlight == true
     or prevState.islandUncertain == true or prevState.islandTravelInFlight == true
     or prevState.islandTravelUncertain == true or prevState.previousIslandPending == true) or false
+-- Stop a still-running older Rift test and carry unresolved state, even if its userId is absent.
+local oldRift = Env.genv and Env.genv.__RIFT_TEST
+if type(oldRift) == "table" then
+    local same = oldRift.userId == nil or tonumber(oldRift.userId) == tonumber(Env.LocalPlayer and Env.LocalPlayer.UserId)
+    if oldRift.running and type(Env.genv.stopRiftTest) == "function" then pcall(Env.genv.stopRiftTest) end
+    if oldRift.running then
+        local untilStop = os.clock() + 15
+        while oldRift.running and os.clock() < untilStop do task.wait(0.1) end
+    end
+    if oldRift.running then error("предыдущий Rift-тест ещё не завершился; новая ферма не запускается") end
+    if same and (oldRift.pending or oldRift.hatchUncertain) then previousHatchPending = true end
+    if oldRift.running or (same and oldRift.travelUncertain) then previousIslandPending = true end
+end
+local testPath = "ts_rift_test_pending_" .. tostring(Env.LocalPlayer and Env.LocalPlayer.UserId) .. ".state"
+local riftTestFloor
+if type(Env.files.isfile) == "function" and type(Env.files.readfile) == "function" then
+    local ok, exists = pcall(Env.files.isfile, testPath)
+    if not ok or type(exists) ~= "boolean" then previousHatchPending = true
+    elseif exists then
+        local read, raw = pcall(Env.files.readfile, testPath)
+        local value = read and type(raw)=="string" and raw:match("^RIFT_TEST_CLEAR_V1|([^|]+)$") or nil
+        local n = use("features/world_data").finite(value)
+        if not n then previousHatchPending = true else riftTestFloor = n end
+    end
+end
 if type(previous) == "table" and type(previous.Ui) == "table" and previous.Ui.Library then
     pcall(previous.Ui.Library.Unload, previous.Ui.Library)
     Env.genv.__SlopixHub = nil
@@ -13906,11 +15772,12 @@ local Ui = use("core/ui")
 -- Защита с самого начала, ДО запуска модулей и автозагрузки старых настроек.
 -- Тест запускать на свежем входе в игру, не во время открытого трейда.
 Ui.__progressTest = {
-    phase = "bootstrap", holdHatch = true, holdUpgrades = true, equipReady = false,
+    phase = "bootstrap", worldName = use("features/world_data").world(Env.data()),
+    holdHatch = true, holdUpgrades = true, equipReady = false,
     disableAutoCraft = true, holdCraft = true, stopRequested = false,
     previousHatchPending = previousHatchPending, previousRebirthPending = previousRebirthPending,
     previousCraftPending = previousCraftPending, previousIslandPending = previousIslandPending,
-    previousFarmEgg = previousFarmEgg,
+    previousFarmEgg = previousFarmEgg, previousWorldName = previousWorldName, riftTestFloor = riftTestFloor,
     skillUncertain = previousSkillUncertain, upgradeUncertain = previousUpgradeUncertain,
     holdTap = true, -- до проверки диска не накапливаем возможный сбрасываемый баланс
 }
@@ -13921,7 +15788,7 @@ local FEATURES = {
     -- Only the requested farm, plus local anti-AFK, performance, and egg reveal UI.
     "features/home", "features/performance",
     "features/tap", "features/upgrades", "features/skilltree",
-    "features/island_progress", "features/hatch", "features/holdreveal", "features/pets", "features/craft", "features/craft_continue",
+    "features/island_progress", "features/rift_islands", "features/hatch", "features/holdreveal", "features/pets", "features/craft", "features/craft_continue",
 }
 
 local function load(name)
@@ -14865,6 +16732,7 @@ __modules["shared/ui"] = function(use) -- src/shared/ui.luau
 local Env = use("shared/env")
 local Life = use("shared/life")
 local Http = use("shared/http")
+local World = use("features/world_data")
 
 local LIBRARY_URL = "https://raw.githubusercontent.com/TrustyCoding/slopix-hub/main/ui/Library.lua"
 
@@ -14957,7 +16825,16 @@ local TEST_GEM_AUTOMATION = { AutoUpgrade=true, AutoSkillTree=true }
 function Ui.on(name)
     local P = Ui.__progressTest
     if P and not TEST_ALLOWED_TOGGLES[name] then return false end
+    local worldAction = name == "AutoTap" or name == "AutoClicker" or name == "AutoHatch"
+        or name == "HatchTeleport" or name == "AutoEquipBest" or name == "AutoUpgrade"
+        or name == "AutoSkillTree" or name == "AutoCraft"
+    if P and worldAction then
+        local ok, snapshot = pcall(Env.data)
+        if Ui.__progressTest ~= P or not ok or not World.isCurrent(P, snapshot) then return false end
+        if P.worldChanging and name ~= "AutoTap" and name ~= "AutoClicker" then return false end
+    end
     if P and P.rebirthLocked and (name == "AutoTap" or name == "AutoClicker") then return false end
+    if P and (P.royalFinal or P.finalizing) and name == "AutoEquipBest" then return false end
     if P and name == "AutoCraft" and (P.phase ~= "rebirth" or P.eggFixed or P.rebirthLocked or P.farmThresholdReached
         or P.disableAutoCraft or P.holdCraft or P.stopRequested or P.craftUncertain or P.previousCraftPending
         or (Env.genv and Env.genv.__handoverPaused)) then return false end
@@ -14992,6 +16869,7 @@ function Ui.stopAll(moversOnly, temporaryTradePause)
     -- Обычная Stop all отменяет тест. Пауза трейда не должна отменять его.
     if not moversOnly and not temporaryTradePause and Ui.__progressTest then
         Ui.__progressTest.stopRequested = true
+        Ui.__globalStop = true
     end
     for _, entry in ipairs(automation) do
         if not (moversOnly and entry.stays) then
@@ -28195,22 +30073,24 @@ end
 getgenv().Library = Library
 return Library
 end
--- ТЕСТ 30M: одна копия на 1-2 аккаунтах. Не изменяет GitHub или другие клиенты.
--- До lock яйца ограничены 20% текущего баланса на партию; после lock только 30M x3.
+-- Контроллер прогрессии: старые 300M/900M-маркеры сохранены, фиксированной цели 30M нет.
+-- До 300M/s яйца ограничены 20% баланса на партию; далее выбор лучшего доступного яйца x3.
 -- Следующая партия отправляется после подтверждённого ответа; скорость сервера не предполагается.
 __modules["features/progress_test"] = function(use)
     local Env = use("core/env")
     local Life = use("shared/life")
     local Ui = use("core/ui")
+    local W = use("features/world_data")
+    local Native = use("features/rift_native")
+    local Royal = use("features/royal_policy")
+    local Journal = use("features/operation_journal")
 
-    local BATCH_PRICE = 900000000
-    local REQUIRED_INCOME = 300000000 -- Clicks coins/s: permanently select 30M
-    local STOP_REBIRTH_INCOME = 900000000 -- Luck coins/s: independently and permanently stop rebirths
+    local REQUIRED_INCOME = 300000000 -- Clicks coins/s: permanently start Luck stage
     local WINDOW = 10
     local REQUIRED_WINDOWS = 3
     local START_SETTLE = 7
     local REPLY_TIMEOUT = 15
-    local REBIRTH_GAP = 20 -- before 30M: send-to-send
+    local REBIRTH_GAP = 20 -- before 300M/s: send-to-send
     local TARGET_REBIRTH_GAP = 120 -- after 300M/s: send-to-send
     local TARGET_PROBE_PERIOD = 600 -- isolated Luck-income checks, measured start-to-start
     local REBIRTH_SYNC_SECONDS = 2 -- дать реплике счётчика и баланса стабилизироваться
@@ -28220,7 +30100,7 @@ __modules["features/progress_test"] = function(use)
     local REPORT_SECONDS = 30
     -- Legacy V11/V12 marker proves the 300M/s egg transition only, never the 900M/s stop.
     local LOCK_MAGIC = "TS30_LOCK_V1"
-    local FINAL_LOCK_MAGIC = "TS30_REBIRTH_STOP_900_V1"
+    local FINAL_LOCK_MAGIC = "TS14_ROYAL_FINAL_V1"
     local NO_PENDING_MAGIC = "TS30_NO_PENDING_V1"
     local PENDING_MAGIC = "TS30_RB_PENDING_V1:"
     local IO_MAGIC = "TS30_IO_OK_V1"
@@ -28234,15 +30114,12 @@ __modules["features/progress_test"] = function(use)
 
     local function readValues()
         local data = Env.data()
-        if type(data) ~= "table" then return nil, nil, nil end
-        local stats = type(data.Statistics) == "table" and data.Statistics or nil
-        local currencies = type(data.Currencies) == "table" and data.Currencies or nil
-        local rebirths = number(stats and stats.Rebirths)
-        if rebirths and math.floor(rebirths) ~= rebirths then rebirths = nil end
-        return data, rebirths, number(currencies and currencies.Coins)
+        local P = Ui.__progressTest
+        if type(data) ~= "table" or not P or not W.isCurrent(P, data) then return data, nil, nil end
+        return data, W.rebirths(data), W.coins(data)
     end
 
-    -- Before deciding the 900M/s stop, require a complete, stable equipped-team replica.
+    -- Royal observation requires a complete, stable equipped-team replica.
     -- This verifies team identity, not that the server actually honored EquipBest(Luck).
     local function teamSignature(data)
         local pets = type(data) == "table" and data.Pets or nil
@@ -28327,24 +30204,35 @@ __modules["features/progress_test"] = function(use)
             or type(tap.hasAutoRebirth) ~= "function" then
             error("не загружен безопасный модуль ребёртов")
         end
-        local hatchApiReady = type(hatch) == "table" and type(hatch.progressTarget) == "function"
-            and type(hatch.progressLocate) == "function"
+        local hatchApiReady = type(hatch) == "table" and hatch.progressDynamic == true
 
         local userId = number(Env.LocalPlayer and Env.LocalPlayer.UserId)
         if not userId or userId < 1 or math.floor(userId) ~= userId then
             error("не удалось определить UserId для отдельного состояния аккаунта")
         end
+        -- Module load normally follows bootstrap, but independently check here too: if the
+        -- hatch module was required before Ui.__progressTest existed, its startup check had no P.
+        local hatchJournal, hatchJournalErr = Journal.new("egg", userId)
+        local clear, why = hatchJournal and hatchJournal.check()
+        if not hatchJournal or not clear then
+            P.previousHatchPending = true
+            P.hatchJournalIssue = tostring(why or hatchJournalErr or "журнал яйца не подтверждён")
+        end
         local userKey = string.format("%.0f", userId)
-        local lockPath = "SlopixHub/TapSimulator/ts30_hatch_" .. userKey .. ".lock"
-        local finalLockPath = "SlopixHub/TapSimulator/ts30_rebirth_stop_900_" .. userKey .. ".lock"
-        local pendingPath = "SlopixHub/TapSimulator/ts30_rebirth_" .. userKey .. ".state"
-        local probePath = "SlopixHub/TapSimulator/ts30_luck_probe_" .. userKey .. ".state"
-        local equipPath = "SlopixHub/TapSimulator/ts30_final_luck_equip_" .. userKey .. ".state"
-        local ioPath = "SlopixHub/TapSimulator/ts30_io_" .. userKey .. ".probe"
+        local world = P.worldName
+        if world ~= "Main" and world ~= "TimeRift" then error("мир не подтверждён") end
+        local memKey = world == "TimeRift" and userKey .. ":TimeRift" or userKey
+        local stem = world == "TimeRift" and "ts14_rift_" or "ts30_"
+        local lockPath = "SlopixHub/TapSimulator/" .. stem .. "hatch_" .. userKey .. ".lock"
+        local finalLockPath = "SlopixHub/TapSimulator/ts14_royal_final_" .. userKey .. ".lock"
+        local pendingPath = "SlopixHub/TapSimulator/" .. stem .. "rebirth_" .. userKey .. ".state"
+        local probePath = "SlopixHub/TapSimulator/" .. stem .. "luck_probe_" .. userKey .. ".state"
+        local equipPath = "SlopixHub/TapSimulator/" .. stem .. "final_luck_equip_" .. userKey .. ".state"
+        local ioPath = "SlopixHub/TapSimulator/" .. stem .. "io_" .. userKey .. ".probe"
         local genv = Env.genv or {}
         if type(genv.__TS30Locks) ~= "table" then genv.__TS30Locks = {} end
-        if type(genv.__TS30RebirthStops900) ~= "table" then genv.__TS30RebirthStops900 = {} end
-        local locks, finalLocks = genv.__TS30Locks, genv.__TS30RebirthStops900
+        if type(genv.__TS14RoyalFinals) ~= "table" then genv.__TS14RoyalFinals = {} end
+        local locks, finalLocks = genv.__TS30Locks, genv.__TS14RoyalFinals
         local files = Env.files or {}
         local canReadLock = type(files.isfile) == "function" and type(files.readfile) == "function"
         local canWriteLock = canReadLock and type(files.writefile) == "function"
@@ -28362,7 +30250,7 @@ __modules["features/progress_test"] = function(use)
             Env.elevate()
             return ok, ok and nil or tostring(err)
         end
-        local finalLockStamp
+        local finalLockStamp, finalLockRebirths
         local function wallTime()
             if type(os.time) ~= "function" then return nil end
             local ok, stamp = pcall(os.time)
@@ -28387,50 +30275,53 @@ __modules["features/progress_test"] = function(use)
             Env.elevate()
             if not ok then return nil, "не читается маркер фазы яиц" end
             if not exists then
-                if locks[userKey] then return nil, "маркер фазы яиц пропал из файлов" end
+                if locks[memKey] then return nil, "маркер фазы яиц пропал из файлов" end
                 return false, nil
             end
             local readOk, value = pcall(files.readfile, lockPath)
             Env.elevate()
             if not readOk or value ~= LOCK_MAGIC then return nil, "повреждён маркер фазы яиц" end
-            locks[userKey] = true
+            locks[memKey] = true
             return true, nil
         end
         local function saveLock()
             -- Даже при ошибке в этой сессии обратный переход запрещён.
-            locks[userKey] = true
+            locks[memKey] = true
             return writeChecked(lockPath, LOCK_MAGIC)
         end
         local function readFinalLock()
+            -- A 900M marker from V13 remains on disk but is no longer the user's stop condition.
+            if world == "Main" then return false, nil end
             if not canWriteLock then return nil, "экзекутор не поддерживает сохранение состояния" end
             local ok, exists = pcall(files.isfile, finalLockPath)
             Env.elevate()
-            if not ok then return nil, "не читается маркер остановки ребёртов 900 млн/с" end
+            if not ok then return nil, "не читается маркер финала Royal" end
             if not exists then
-                if finalLocks[userKey] then return nil, "маркер остановки ребёртов 900 млн/с пропал из файлов" end
+                if finalLocks[memKey] then return nil, "маркер финала Royal пропал из файлов" end
                 return false, nil
             end
             local readOk, value = pcall(files.readfile, finalLockPath)
             Env.elevate()
-            if not readOk or type(value) ~= "string" then return nil, "повреждён маркер остановки ребёртов 900 млн/с" end
-            finalLockStamp = nil
-            if value ~= FINAL_LOCK_MAGIC then
-                local digits = value:match("^TS30_REBIRTH_STOP_900_V1:(%d+)$")
-                local stamp = number(digits)
-                if not stamp or stamp < 1 or stamp > MAX_SAFE_INTEGER or math.floor(stamp) ~= stamp then
-                    return nil, "повреждён маркер остановки ребёртов 900 млн/с"
-                end
-                finalLockStamp = stamp
+            if not readOk or type(value) ~= "string" then return nil, "повреждён маркер финала Royal" end
+            local digits, rbDigits = value:match("^TS14_ROYAL_FINAL_V1:(%d+):(%d+)$")
+            local stamp, rb = number(digits), number(rbDigits)
+            if not stamp or stamp > MAX_SAFE_INTEGER or math.floor(stamp)~=stamp
+                or not rb or rb > MAX_SAFE_INTEGER or math.floor(rb)~=rb then
+                return nil, "повреждён маркер финала Royal"
             end
-            finalLocks[userKey] = true
+            finalLockStamp, finalLockRebirths = stamp>0 and stamp or nil, rb
+            finalLocks[memKey] = true
             return true, nil
         end
         local function saveFinalLock()
             -- The timestamp also protects the first cooldown after a complete restart.
-            finalLocks[userKey] = true
+            finalLocks[memKey] = true
+            local rb=number(P.lockedRebirths)
+            if not rb or rb>MAX_SAFE_INTEGER or math.floor(rb)~=rb then return false,"нет достоверного счётчика RiftRebirths" end
             local stamp = wallTime()
             finalLockStamp = stamp and (stamp + 1) or nil
-            local value = finalLockStamp and (FINAL_LOCK_MAGIC .. ":" .. string.format("%.0f", finalLockStamp)) or FINAL_LOCK_MAGIC
+            local value = FINAL_LOCK_MAGIC .. ":" .. string.format("%.0f", finalLockStamp or 0)
+                .. ":" .. string.format("%.0f", rb)
             return writeChecked(finalLockPath, value)
         end
         local function readPending()
@@ -28465,8 +30356,6 @@ __modules["features/progress_test"] = function(use)
         P.holdCraft, P.disableAutoCraft = true, true
         P.holdUpgrades = true
         P.requiredIncome = REQUIRED_INCOME
-        P.stopRebirthIncome = STOP_REBIRTH_INCOME
-        P.batchPrice = BATCH_PRICE
         P.activeClock = 0
         P.phaseAt = 0
         P.lastTick = os.clock()
@@ -28475,7 +30364,7 @@ __modules["features/progress_test"] = function(use)
         P.confirmed = 0
         if type(genv.__TS30LastRebirthSend) ~= "table" then genv.__TS30LastRebirthSend = {} end
         local lastSends = genv.__TS30LastRebirthSend
-        local lastSent = number(lastSends[userKey])
+        local lastSent = number(lastSends[memKey])
         P.nextSendAt = lastSent and (lastSent + REBIRTH_GAP) or 0 -- сохраняется при перезагрузке скрипта в том же клиенте
         P.nextLocateAt = 0
         P.farmMode = nil
@@ -28486,8 +30375,10 @@ __modules["features/progress_test"] = function(use)
         P.farmResyncUntil = 0
         P.measureRebirths = nil
         P.nextClickerRefresh = 0
-        P.eggFixed = false -- permanent 300M/s stage, compatible with the old TS30_LOCK_V1
-        P.rebirthLocked = false -- separate permanent 900M/s stop, never inferred from the old marker
+        P.eggFixed = false -- legacy field: permanent 300M/s stage, not a fixed egg
+        P.rebirthLocked = false -- legacy flag is not the Royal finale
+        P.royalFinal, P.finalizing = false, false
+        P.royalPolicy = Royal.new()
         P.targetProbeRequired, P.targetNextProbeAt = false, 0
         P.targetPrevRebirths = nil
         P.eggGoal = nil
@@ -28500,11 +30391,11 @@ __modules["features/progress_test"] = function(use)
         P.actualBatchIntervals = {}
         P.confirmedBatches = 0
         P.farmBatches = 0
-        P.note = "проверяю аккаунт и 30M"
+        P.note = "проверяю аккаунт и состояние прогрессии"
         P.remoteError = nil
 
         local function log(text)
-            emit("progress", "[30M FARM v13] " .. tostring(text))
+            emit("progress", "[ПРОГРЕССИЯ v14 " .. world .. "] " .. tostring(text))
         end
         P.log = log
         local function phase(name, note)
@@ -28529,12 +30420,6 @@ __modules["features/progress_test"] = function(use)
                 end
             end)
             if not P.clickerStoppedForSafety then log("тумблер автокликера не выключился; останови клиент вручную") end
-        end
-        local function disableFarmClicks()
-            -- Set the hard guard before any potentially yielding UI/remote operation.
-            P.holdTap = true
-            pcall(Ui.set, "AutoTap", false)
-            stopNativeClicker() -- also explicitly asks the server to disable its clicker
         end
         local function blocked(reason)
             P.holdHatch, P.holdCraft, P.disableAutoCraft = true, true, true
@@ -28569,13 +30454,13 @@ __modules["features/progress_test"] = function(use)
                     -- Without a durable start time a restart could repeat a check early.
                     P.targetProbeRequired, P.targetCheckStartedAt = false, nil
                     P.targetNextProbeAt = P.activeClock + TARGET_PROBE_PERIOD
-                    resumeTarget("не сохранилось время Luck-замера: " .. tostring(err) .. "; 30M продолжается, повтор не раньше 10 минут")
+                    resumeTarget("не сохранилось время Luck-замера: " .. tostring(err) .. "; яйца продолжаются, повтор не раньше 10 минут")
                     return false
                 end
             end
             P.holdHatch, P.holdCraft, P.disableAutoCraft = true, true, true
             P.holdUpgrades, P.holdSkillTree = true, true
-            P.goodWindows = 0
+            P.goodWindows, P.luckRateSum = 0, nil
             P.sampleCoins, P.sampleAt, P.sampleTeam = nil, nil, nil
             P.settleTeam = nil
             P.targetWindowStart, P.targetPrevCoins, P.targetWindowCoins = nil, nil, 0
@@ -28587,20 +30472,20 @@ __modules["features/progress_test"] = function(use)
             if reason then log(reason) end
         end
         resumeTarget = function(reason)
-            -- The egg remains fixed after 300M/s. Only the second marker forbids rebirths.
-            if not P.eggFixed then blocked("нет постоянного маркера фазы 30M"); return end
+            -- A legacy marker keeps the Luck stage; egg choice continues progressing.
+            if not P.eggFixed then blocked("нет постоянного маркера фазы 300 млн/с"); return end
             P.holdHatch, P.holdCraft, P.disableAutoCraft = true, true, true
             P.holdUpgrades, P.holdSkillTree = true, true
             P.farmStorageFull, P.farmThresholdReached = false, false
             local ok, selected = pcall(setMode, "Luck")
             if not ok or not selected then blocked("не удалось выбрать команду Luck"); return end
-            phase("save", P.rebirthLocked and "жду 30M x3; ребёрты окончательно остановлены"
-                or "жду 30M x3; ребёрты продолжаются до 900 млн/с")
+            phase("save", P.royalFinal and "финал: только Royal x3, оба кликера включены"
+                or "готовлю лучшие доступные яйца x3; ребёрты продолжаются до устойчивого Royal")
             if reason then log(reason) end
         end
         local function beginUpgradeWindow(reason)
             if P.eggFixed or P.rebirthLocked then
-                resumeTarget("фаза 30M уже закреплена: дешёвые яйца, крафт и покупки не возобновляются")
+                resumeTarget("фаза 300 млн/с уже закреплена: крафт и покупки не возобновляются")
                 return
             end
             -- Прокачка, покупки и наблюдение дохода идут параллельно: ребёрт больше не ждёт
@@ -28630,8 +30515,11 @@ __modules["features/progress_test"] = function(use)
                 local ok, err = pcall(function()
                     local remote = Env.remote("AutoClickService", "AutoClickRequested")
                     Env.elevate()
-                    if Life.alive and not P.holdTap and not P.rebirthLocked and not P.stopRequested
-                        and not pausedForTrade() and Ui.on("AutoClicker") then
+                    local enabled = Ui.on("AutoClicker")
+                    local toggle = Ui.Toggles and Ui.Toggles.AutoClicker
+                    if enabled and Life.alive and Ui.__progressTest == P and not P.worldChanging
+                        and not P.holdTap and not P.rebirthLocked and not P.stopRequested
+                        and not pausedForTrade() and toggle and toggle.Value == true then
                         remote:FireServer({ Enabled = true })
                     end
                 end)
@@ -28644,19 +30532,29 @@ __modules["features/progress_test"] = function(use)
             return not hatchApiReady or Ui.on("AutoHatch")
         end
         local function userStopped()
-            return P.stopRequested or (not P.rebirthLocked and not Ui.on("AutoTap")) or not hatchControlEnabled()
+            return P.stopRequested or not Ui.on("AutoTap") or not hatchControlEnabled()
         end
         local function modeRequestSeen(mode)
-            if mode == "Luck" and P.rebirthLocked and P.finalPriorLuckAttemptKnown then
-                return Ui.on("AutoEquipBest")
+            if mode == "Luck" and P.royalFinal and P.finalPriorLuckAttemptKnown then
+                return true -- keep the verified team; no further EquipBest requests in the final
             end
             return Ui.on("AutoEquipBest") and P.lastEquipMode == mode
                 and type(P.lastEquipAt) == "number" and P.lastEquipAt >= (P.equipMinimumAt or 0)
         end
+        local function rebirthContextReady()
+            -- Ui.on and Env.data may yield. Inspect the live identity, world and toggles last.
+            local tapOn, hatchOn = Ui.on("AutoTap"), hatchControlEnabled()
+            local snapshot = Env.data()
+            local toggles = Ui.Toggles
+            return Life.alive and Ui.__progressTest == P and not P.stopRequested and not P.worldChanging
+                and not pausedForTrade() and W.isCurrent(P,snapshot) and tapOn and hatchOn
+                and type(toggles)=="table" and toggles.AutoTap and toggles.AutoTap.Value==true
+                and (not hatchApiReady or toggles.AutoHatch and toggles.AutoHatch.Value==true)
+        end
         local function canRebirth(prepared)
+            local ready = rebirthContextReady()
             local farm = P.phase == "rebirth" and not P.eggFixed and not P.farmThresholdReached
-            return Life.alive and Ui.__progressTest == P and not P.stopRequested and not pausedForTrade()
-                and Ui.on("AutoTap") and hatchControlEnabled() and not P.rebirthLocked and farm
+            return ready and not P.rebirthLocked and farm
                 and P.holdHatch and P.holdCraft and P.holdUpgrades and P.holdSkillTree
                 and P.pending == prepared and not P.previousHatchPending and not P.previousRebirthPending
                 and not P.previousCraftPending and not P.hatchUncertain and not P.craftUncertain
@@ -28685,10 +30583,10 @@ __modules["features/progress_test"] = function(use)
                 for _, v in ipairs(intervals) do sum += v end
                 actual = string.format("%.2f с (среднее %d промежутков)", sum / #intervals, #intervals)
             end
-            log(string.format("фаза=%s | ребёрты=%s | монеты=%s | доход=%s/с | нужно>=%.0f/с | яйцо=%s | тройных=%s | фактический интервал=%s | %s",
+            log(string.format("фаза=%s | ребёрты=%s | монеты=%s | доход=%s/с | цель=%s | яйцо=%s | тройных=%s | фактический интервал=%s | %s",
                 tostring(P.phase), tostring(rebirths or "нет данных"), tostring(coins or "нет данных"),
-                P.rebirthLocked and "замеры выключены" or (P.income and string.format("%.0f", P.income) or "измеряю"),
-                P.eggFixed and STOP_REBIRTH_INCOME or REQUIRED_INCOME,
+                P.royalFinal and "замеры выключены" or (P.income and string.format("%.0f", P.income) or "измеряю"),
+                P.eggFixed and "Royal x3" or tostring(REQUIRED_INCOME),
                 tostring(P.eggGoal or "ищу"), tostring(P.confirmedBatches or 0), actual, tostring(P.note)))
             log("доход команд: Clicks=" .. incomeText("Clicks") .. " | Luck=" .. incomeText("Luck"))
             log("яиц на прокачке: партий=" .. tostring(P.farmBatches or 0) .. " | крафт: "
@@ -28703,7 +30601,7 @@ __modules["features/progress_test"] = function(use)
                 log(string.format("последний подтверждённый пакет: кнопка=%s, заявлено x%s, реально +%s, цена=%s",
                     tostring(r.index), tostring(r.amount), tostring(r.actual), tostring(r.price)))
             end
-            local gems = data and type(data.Currencies) == "table" and data.Currencies.Gems
+            local gems = W.gems(data)
             local function switch(name)
                 local toggle = Ui.Toggles and Ui.Toggles[name]
                 return toggle and tostring(toggle.Value == true) or "нет"
@@ -28731,11 +30629,14 @@ __modules["features/progress_test"] = function(use)
                 if finalLock == nil then
                     blocked(finalErr)
                 elseif finalLock and not P.eggFixed then
-                    blocked("найден запрет ребёртов 900 млн/с, но маркер 30M отсутствует")
+                    blocked("найден финал Royal, но маркер фазы Luck отсутствует")
                 else
-                    P.rebirthLocked = finalLock == true
-                    P.targetProbeRequired = false -- schedule the isolated check, never infer 900M from 30M
-                    if P.eggFixed and not P.rebirthLocked then
+                    P.royalFinal = finalLock == true
+                    P.lockedRebirths = finalLockRebirths
+                    P.rebirthLocked = false
+                    P.targetProbeRequired = false
+                    if P.royalFinal then P.targetNextProbeAt = math.huge end
+                    if P.eggFixed and not P.royalFinal then
                         local delay = 0
                         local okExists, exists = pcall(files.isfile, probePath)
                         if not okExists or not exists then delay = TARGET_PROBE_PERIOD
@@ -28769,42 +30670,24 @@ __modules["features/progress_test"] = function(use)
                         local persisted, err = writePending(before)
                         if not persisted then blocked("не удалось сохранить старый запрос ребёрта: " .. tostring(err)) end
                     end
-                    if P.rebirthLocked then
-                        log("найден отдельный маркер 900 млн/с: новые ребёрты запрещены")
+                    if P.royalFinal then
+                        log("найден отдельный маркер финала Royal: ребёрты запрещены, кликеры остаются включены")
                     elseif P.eggFixed then
-                        log("найден маркер 30M: старый маркер не подтверждает 900 млн/с; чистый Luck-замер по расписанию")
+                        log("найден маркер 300 млн/с этого мира: Luck, ребёрты продолжаются")
                     end
                 end
             end
         end
-        if P.rebirthLocked then
-            -- A final lock was only written after a prior Luck request and a clean check.
-            -- Do not require a fresh request before resuming eggs after a full restart.
-            P.finalPriorLuckAttemptKnown = true
-            local readOk, raw = pcall(function()
-                if not files.isfile(equipPath) then return nil end
-                return files.readfile(equipPath)
-            end)
-            Env.elevate()
-            local digits = readOk and type(raw) == "string" and raw:match("^TS30_FINAL_EQUIP_V1:(%d+)$") or nil
-            local equipStamp = number(digits)
-            if not equipStamp or equipStamp < 1 or equipStamp > MAX_SAFE_INTEGER
-                or (finalLockStamp and equipStamp < finalLockStamp) then equipStamp = nil end
-            local ambiguous = not readOk or (raw ~= nil and equipStamp == nil)
-            -- A pending/corrupt record may be newer than the lock; never fall back to
-            -- the old lock's timestamp when an attempt could have been interrupted.
-            local anchor = not ambiguous and (equipStamp or finalLockStamp) or nil
-            local wall, delay = wallTime(), 600
-            if anchor and wall and wall >= anchor then delay = math.max(0, 600 - (wall - anchor)) end
-            if not anchor then
-                -- Legacy or interrupted attempt: wait a full interval from this restart;
-                -- eggs and verified-team cleanup still work independently.
-                local saved, err = finishFinalEquipAttempt()
-                if not saved then log("не сохранился интервал Luck-команды: " .. tostring(err)) end
+        if P.royalFinal then P.finalPriorLuckAttemptKnown = true end
+        if P.royalFinal and not P.previousRebirthPending and P.phase ~= "blocked" then
+            P.holdTap = false
+            pcall(Ui.set, "AutoEquipBest", false)
+            if not P.stopRequested and not pausedForTrade() then
+                pcall(Ui.set, "AutoTap", true)
+                pcall(Ui.set, "AutoClicker", true)
+                pcall(function() if Ui.syncNativeClicker then Ui.syncNativeClicker() end end)
             end
-            P.finalEquipNotBefore = os.clock() + delay
-            disableFarmClicks()
-        elseif P.previousRebirthPending and not P.eggFixed then
+        elseif P.previousRebirthPending and (not P.eggFixed or P.royalFinal) then
             P.holdTap = true
             stopNativeClicker()
         elseif P.phase == "blocked" then
@@ -28826,8 +30709,8 @@ __modules["features/progress_test"] = function(use)
                 blocked("не удалось установить режим команды " .. initialMode)
             else
                 -- A same-client reload keeps the last successful Luck request and its cooldown.
-                local history = type(genv.__TS30EquipHistory) == "table" and genv.__TS30EquipHistory[userKey] or nil
-                if P.rebirthLocked and type(history) == "table" and history.mode == "Luck"
+                local history = type(genv.__TS30EquipHistory) == "table" and genv.__TS30EquipHistory[memKey] or nil
+                if P.royalFinal and type(history) == "table" and history.mode == "Luck"
                     and type(history.at) == "number" and os.clock() >= history.at and os.clock() - history.at < 600 then
                     P.finalEquipLastAt = history.at
                     P.finalEquipNotBefore = math.max(P.finalEquipNotBefore or 0, history.at + 600)
@@ -28847,36 +30730,15 @@ __modules["features/progress_test"] = function(use)
         P.holdUpgrades = true
         P.gemReady = P.phase ~= "blocked" and not P.stopRequested
 
-        Life.spawn("progress:resolve", function()
-            local ok, remote = pcall(Env.remote, "RebirthService", "RebirthRequested")
-            if ok and remote then P.remote = remote else P.remoteError = tostring(remote) end
-        end)
-
-        local function findTarget(data)
-            if not hatchApiReady then return false, "модуль яйца 30M не загрузился" end
-            local egg, why, price = hatch.progressTarget(data)
-            if not egg then return false, why end
-            if P.eggGoal and P.eggGoal ~= egg then
-                return false, "ключ 30M изменился во время теста"
-            end
-            if price ~= BATCH_PRICE then return false, "цена x3 не равна 900000000" end
-            P.eggGoal = egg
-            if why == "no_position" and not P.locating and not P.previousHatchPending
-                and P.activeClock >= P.nextLocateAt and not pausedForTrade() then
-                P.nextLocateAt = P.activeClock + 45
-                P.locating = true
-                Life.spawn("progress:locate30m", function()
-                    local ok, arrived = pcall(hatch.progressLocate, egg)
-                    P.locating = false
-                    if ok and arrived then
-                        log("модель 30M обнаружена; позиция получена из игры")
-                    else
-                        log("позиция 30M пока не видна; попробую снова у Spawn")
-                    end
-                end)
-            end
-            return true, why
+        if world == "TimeRift" then
+            P.remote = true -- a native UI control is located afresh; no invented remote payload
+        else
+            Life.spawn("progress:resolve", function()
+                local ok, remote = pcall(Env.remote, "RebirthService", "RebirthRequested")
+                if ok and remote then P.remote = remote else P.remoteError = tostring(remote) end
+            end)
         end
+
         local function confirmed(rebirths, coins)
             local request = P.pending
             if not request or not rebirths or rebirths <= request.before then return false end
@@ -28886,7 +30748,7 @@ __modules["features/progress_test"] = function(use)
                     P.rebirthDisabled = true
                     if not P.targetPendingWarned then
                         P.targetPendingWarned = true
-                        log("ребёрт подтвердился, но маркер не сохранился: " .. tostring(err) .. "; новые ребёрты остановлены, 30M продолжается")
+                        log("ребёрт подтвердился, но маркер не сохранился: " .. tostring(err) .. "; новые ребёрты остановлены, яйца продолжаются")
                     end
                     return false
                 end
@@ -28928,7 +30790,7 @@ __modules["features/progress_test"] = function(use)
                 P.holdUpgrades, P.holdSkillTree = true, true
                 P.targetPendingWarned = false
                 if P.rebirthLocked then P.lockedRebirths = rebirths end
-                log("ребёрт подтверждён; 30M продолжает открываться, следующий запрос не раньше 120 с")
+                log("ребёрт подтверждён; яйца продолжаются, следующий запрос не раньше 120 с")
             else
                 if P.farmThresholdReached then
                     P.holdHatch, P.holdCraft, P.disableAutoCraft = true, true, true
@@ -28941,28 +30803,31 @@ __modules["features/progress_test"] = function(use)
             end
             return true
         end
-        local function actionsOutstanding()
+        local function actionsOutstanding(ignoreCleaning)
             return P.pending or P.previousRebirthPending or P.previousHatchPending or P.previousCraftPending
                 or P.previousIslandPending or P.islandInFlight or P.islandTravelInFlight
                 or P.islandUncertain or P.islandTravelUncertain or P.locating
                 or Ui.hatchInFlight or Ui.hatchMoving or Ui.travelling or P.craftBusy or P.craftInFlight
-                or P.cleaning or P.upgradeInFlight or P.skillInFlight or P.clickerRefreshPending
+                or (not ignoreCleaning and P.cleaning) or P.upgradeInFlight or P.skillInFlight or P.clickerRefreshPending
                 or P.craftUncertain or P.hatchUncertain or P.upgradeUncertain or P.skillUncertain
         end
-        local function fixEgg30(rebirths)
+        local function startLuckStage(rebirths)
+            local snapshot = Env.data()
+            if not Life.alive or Ui.__progressTest ~= P or P.stopRequested or P.worldChanging
+                or pausedForTrade() or not W.isCurrent(P,snapshot) or W.rebirths(snapshot) ~= rebirths then return false end
             if actionsOutstanding() then
-                uncertain("нельзя закрепить 30M: отправленные действия ещё не завершены")
+                uncertain("нельзя закрепить 300 млн/с: отправленные действия ещё не завершены")
                 return false
             end
-            P.eggFixed = true -- before any yielding write: never fall back to cheaper eggs
-            locks[userKey] = true -- a same-client reload during the write must fail closed
+            P.eggFixed = true -- lock the stage before any yielding write; egg floor is independent
+            locks[memKey] = true -- a same-client reload during the write must fail closed
             P.targetPrevRebirths = rebirths
             P.holdHatch, P.holdCraft, P.disableAutoCraft = true, true, true
             P.holdUpgrades, P.holdSkillTree = true, true
             P.farmStorageFull, P.farmThresholdReached = false, false
             local saved, err = saveLock()
             if not saved then
-                blocked("не удалось надёжно сохранить выбор 30M: " .. tostring(err))
+                blocked("не удалось надёжно сохранить фазу 300 млн/с: " .. tostring(err))
                 return false
             end
             -- The guards already block these on eggFixed even if toggles yield here.
@@ -28971,41 +30836,88 @@ __modules["features/progress_test"] = function(use)
             pcall(Ui.set, "AutoCraft", false)
             P.income = nil -- Clicks income is not a Luck measurement
             local ok, selected = pcall(setMode, "Luck")
-            if not ok or not selected then blocked("30M сохранено, но не удалось выбрать Luck"); return false end
-            local last = number(lastSends[userKey])
+            if not ok or not selected then blocked("фаза 300 млн/с сохранена, но не удалось выбрать Luck"); return false end
+            local last = number(lastSends[memKey])
             if last then P.nextSendAt = math.max(P.nextSendAt or 0, last + TARGET_REBIRTH_GAP) end
             P.targetProbeRequired = true
-            log("три чистых окна Clicks подтвердили 300 млн/с: 30M закреплено; ребёрты пока НЕ отключены")
+            log("три чистых окна Clicks подтвердили 300 млн/с: режим Luck; ребёрты пока НЕ отключены")
             beginSettle("первый чистый замер Luck; следующие проверки не чаще раза в 10 минут")
             return true
         end
-        local function lockRebirth(rebirths)
-            if not P.eggFixed or P.probeMode ~= "Luck" or actionsOutstanding() then
-                uncertain("нельзя подтвердить 900 млн/с: режим или отправленные действия изменились")
+        P.resetRoyal = function(why)
+            if P.royalPolicy and not P.royalFinal then Royal.reset(P.royalPolicy, why) end
+        end
+        P.observeRoyal = function(egg, count, spent, sendAt)
+            if world ~= "TimeRift" or P.royalFinal or P.finalizing then return end
+            local d = Env.data()
+            local rb, coins = W.rebirths(d), W.coins(d)
+            local team = teamSignature(d)
+            local mode = Ui.Options and Ui.Options.EquipMode and Ui.Options.EquipMode.Value
+            local busy = not W.isCurrent(P,d) or actionsOutstanding(true) or P.worldChanging or P.stopRequested
+                or P.phase ~= "hatch" or not P.eggFixed or P.targetProbeRequired
+                or P.lastEquipMode ~= "Luck" or not Ui.on("AutoTap") or not Ui.on("AutoClicker")
+            local beforeWindows = P.royalPolicy.windows
+            local ready, why = Royal.observe(P.royalPolicy, { egg=egg, count=count, spent=spent,
+                now=os.clock(), sendAt=sendAt, coins=coins, rb=rb, team=team, mode=mode, uncertain=busy })
+            if P.royalPolicy.windows ~= beforeWindows then log(tostring(why)) end
+            if ready then
+                -- Freeze new hatches and rebirths only for the short, durable final transition.
+                P.finalizing, P.holdHatch = true, true
+                P.finalRb, P.finalTeam, P.finalPrice = rb, team, spent
+                P.note = "Royal x3: проверяю отсутствие незавершённых запросов перед финалом"
+                log(P.note)
+            end
+        end
+        local function finishRoyal(rebirths, coins, data)
+            if not P.finalizing or not P.eggFixed or world ~= "TimeRift" then return false end
+            local fresh = Env.data()
+            if not Life.alive or Ui.__progressTest ~= P or P.stopRequested or P.worldChanging
+                or pausedForTrade() or not W.isCurrent(P,fresh) then
+                P.finalizing = false
+                -- A transiently missing replica is not a permanent hatch pause. A genuinely
+                -- different world remains held until the router installs its controller.
+                if Life.alive and Ui.__progressTest == P and not P.stopRequested and not P.worldChanging
+                    and not pausedForTrade() and P.phase == "hatch" and not P.targetProbeRequired
+                    and not P.hatchUncertain and not P.craftUncertain
+                    and (not W.world(fresh) or W.isCurrent(P,fresh)) then P.holdHatch = false end
+                Royal.reset(P.royalPolicy, "сменился мир или контроллер до фиксации финала")
                 return false
             end
-            P.rebirthLocked = true -- block all senders before a potentially yielding write
-            finalLocks[userKey] = true -- same-client reload must fail closed even during the write
-            P.finalPriorLuckAttemptKnown = true
-            P.lockedRebirths = rebirths
-            P.targetProbeRequired, P.targetCheckStartedAt = false, nil
-            P.finalEquipLastAt = P.lastEquipMode == "Luck" and P.lastEquipAt or nil
-            P.finalEquipNotBefore = os.clock() + 600
+            rebirths, coins, data = W.rebirths(fresh), W.coins(fresh), fresh
+            local toggles = Ui.Toggles
+            if P.phase ~= "hatch" or P.holdTap or type(toggles) ~= "table"
+                or not toggles.AutoTap or toggles.AutoTap.Value ~= true
+                or not toggles.AutoClicker or toggles.AutoClicker.Value ~= true
+                or rebirths ~= P.finalRb or teamSignature(data) ~= P.finalTeam or not coins
+                or not P.finalPrice or coins < P.finalPrice * 3 then
+                P.finalizing, P.holdHatch = false, false
+                Royal.reset(P.royalPolicy, "перед финалом изменились команда, ребёрты или запас монет")
+                log("условия Royal изменились; продолжаю обычную прогрессию")
+                return false
+            end
+            if actionsOutstanding() then return false end
+            P.royalFinal = true -- stop rebirths; keep finalizing=true while the lock write can yield
+            finalLocks[memKey] = true
+            P.lockedRebirths, P.finalPriorLuckAttemptKnown = rebirths, true
+            P.targetProbeRequired, P.targetCheckStartedAt, P.targetNextProbeAt = false, nil, math.huge
             P.holdHatch, P.holdCraft, P.disableAutoCraft = true, true, true
             P.holdUpgrades, P.holdSkillTree = true, true
-            disableFarmClicks()
-            P.income, P.incomeByMode = nil, {} -- no more income estimation after the final lock
+            P.holdTap = false -- BOTH clickers remain enabled
+            pcall(Ui.set, "AutoEquipBest", false)
+            pcall(Ui.set, "AutoUpgrade", false)
+            pcall(Ui.set, "AutoSkillTree", false)
+            pcall(Ui.set, "AutoCraft", false)
             local saved, err = saveFinalLock()
-            if not saved then
-                blocked("не удалось сохранить отдельный запрет ребёртов 900 млн/с: " .. tostring(err))
-                return false
+            P.finalizing = false
+            if not saved then blocked("не удалось сохранить финал Royal: " .. tostring(err)); return false end
+            local finalData = Env.data()
+            if not Life.alive or Ui.__progressTest ~= P or P.stopRequested or P.worldChanging
+                or not W.isCurrent(P,finalData) then
+                if Life.alive and Ui.__progressTest == P and not P.stopRequested then P.royalResumePending = true end
+                return true
             end
-            local equipSaved, equipErr = finishFinalEquipAttempt()
-            -- A slow file write cannot shorten the first final-stage interval.
-            P.finalEquipNotBefore = math.max(P.finalEquipNotBefore or 0, os.clock() + 600)
-            if not equipSaved then log("не сохранился интервал Luck-команды: " .. tostring(equipErr)) end
-            log("три чистых окна Luck подтвердили 900 млн монет/с: ребёрты, клики и дальнейшие замеры отключены")
-            resumeTarget("продолжаю 30M x3, чистку, Hold и Luck раз в 10 минут")
+            log("Royal x3 устойчиво открывался с положительным запасом; ребёрты и остальная прокачка отключены, оба кликера остаются включены")
+            resumeTarget("финал Royal x3; чистка и Hold остаются активными")
             return true
         end
 
@@ -29021,13 +30933,13 @@ __modules["features/progress_test"] = function(use)
             if P.eggFixed then
                 P.targetPrevRebirths = rebirths
                 P.nextSendAt = math.max(P.nextSendAt or 0, now + TARGET_REBIRTH_GAP)
-                lastSends[userKey] = math.max(number(lastSends[userKey]) or 0, now)
+                lastSends[memKey] = math.max(number(lastSends[memKey]) or 0, now)
                 if P.targetProbeRequired or P.targetCheckStartedAt then
                     P.targetProbeRequired, P.targetCheckStartedAt = false, nil
                     P.targetNextProbeAt = math.max(P.targetNextProbeAt or 0, P.activeClock + TARGET_PROBE_PERIOD)
                     resumeTarget("счётчик ребёртов изменился во время замера; следующий не раньше 10 минут")
                 else
-                    log("счётчик ребёртов изменился вне ожидаемого запроса; 30M продолжается, следующий ребёрт не раньше 120 с")
+                    log("счётчик ребёртов изменился вне ожидаемого запроса; яйца продолжаются, следующий ребёрт не раньше 120 с")
                 end
                 return
             end
@@ -29036,7 +30948,7 @@ __modules["features/progress_test"] = function(use)
             P.farmResetGraceUntil = now + 5 -- баланс может реплицироваться вслед за счётчиком
             P.nextSendAt = math.max(P.nextSendAt or 0, now + REBIRTH_GAP)
             -- Сохраняем защитный интервал и при перезагрузке скрипта в том же клиенте.
-            lastSends[userKey] = math.max(number(lastSends[userKey]) or 0, now)
+            lastSends[memKey] = math.max(number(lastSends[memKey]) or 0, now)
             P.farmThresholdReached = false
             P.goodWindows, P.income, P.modeReadySince = 0, nil, nil
             P.sampleCoins, P.sampleAt, P.measureRebirths = nil, nil, nil
@@ -29150,12 +31062,12 @@ __modules["features/progress_test"] = function(use)
         -- Target-stage rebirths are independent of eggs/cleanup. Only a scheduled direct
         -- income check pauses both. A possibly sent but unconfirmed rebirth is never repeated.
         local function targetCanRebirth(prepared)
+            local ready = rebirthContextReady()
             local phase = P.phase
             local activeNow = P.activeClock + math.max(0, os.clock() - (P.lastTick or os.clock()))
             local targetWork = phase == "save" or phase == "hatch" or phase == "storage_wait"
                 or phase == "target_wait" or phase == "locked_wait"
-            return Life.alive and Ui.__progressTest == P and P.eggFixed and not P.rebirthLocked
-                and not P.stopRequested and not pausedForTrade() and Ui.on("AutoTap") and hatchControlEnabled()
+            return ready and P.eggFixed and not P.rebirthLocked and not P.royalFinal and not P.finalizing
                 and targetWork and not P.targetProbeRequired and not P.rebirthDisabled
                 and activeNow < (P.targetNextProbeAt or 0)
                 and P.pending == prepared and not P.previousRebirthPending and not P.previousHatchPending
@@ -29165,10 +31077,23 @@ __modules["features/progress_test"] = function(use)
                 and not P.upgradeInFlight and not P.skillInFlight and not P.islandInFlight
                 and not P.islandTravelInFlight and os.clock() >= (P.nextSendAt or 0)
         end
+        local function maybeOpenRiftRebirth()
+            if world ~= "TimeRift" or os.clock() < (P.nextRiftMenuAt or 0) then return end
+            P.nextRiftMenuAt = os.clock() + 15
+            local opened, why = Native.openRebirthMenu(function()
+                return Life.alive and Ui.__progressTest == P and not P.stopRequested and not P.worldChanging
+                    and not P.royalFinal and not P.finalizing and W.isCurrent(P, Env.data())
+            end)
+            if not opened and not P.riftMenuWarned then
+                P.riftMenuWarned = true
+                log("Rift-ребёрт: игровой контрол не определён (" .. tostring(why) .. "); яйца и клики продолжаются")
+            end
+        end
         local function tryTargetRebirth(data, rebirths, coins)
             if not targetCanRebirth(nil) or not P.remote then return end
             local index, amount, price, why = tap.progressPack(data, math.huge)
             if not index then
+                if world == "TimeRift" then maybeOpenRiftRebirth() end
                 if why ~= "unaffordable" and not P.targetPackWarned then
                     P.targetPackWarned = true; log("цена ребёрта пока недоступна: " .. tostring(why))
                 end
@@ -29189,8 +31114,11 @@ __modules["features/progress_test"] = function(use)
             local function valid()
                 local fresh, currentRb, currentCoins = readValues()
                 local i, a, p = tap.progressPack(fresh, math.huge)
-                return targetCanRebirth(prepared) and currentRb == rebirths and currentCoins and currentCoins >= price
-                    and i == index and a == amount and p == price, currentCoins
+                -- Selection can yield: the originally captured count/wallet is not sufficient.
+                local _, finalRb, finalCoins = readValues()
+                return targetCanRebirth(prepared) and currentRb == rebirths and finalRb == rebirths
+                    and currentCoins and finalCoins and finalCoins >= price
+                    and i == index and a == amount and p == price, finalCoins
             end
             local validBefore = valid()
             if not validBefore then
@@ -29205,15 +31133,36 @@ __modules["features/progress_test"] = function(use)
                 local stillValid, currentCoins = valid()
                 if not stillValid then return end
                 prepared.coins, prepared.sentAt = currentCoins, P.activeClock + math.max(0, os.clock() - (P.lastTick or os.clock()))
-                local sentAt = os.clock()
-                P.nextSendAt, lastSends[userKey] = sentAt + TARGET_REBIRTH_GAP, sentAt
-                attempted = true
-                P.remote:FireServer(payload)
+                if world == "TimeRift" then
+                    local item = P.riftPackCandidate
+                    if not item or not item.button then return end
+                    local didAttempt, called, nativeErr = Native.fireButton(item.button, function()
+                        local yes, current = valid()
+                        local latest = P.riftPackCandidate
+                        if not yes or not latest or latest.button ~= item.button then return false end
+                        prepared.coins = current
+                        prepared.sentAt = P.activeClock + math.max(0, os.clock() - (P.lastTick or os.clock()))
+                        local sentAt = os.clock()
+                        P.nextSendAt, lastSends[memKey] = sentAt + TARGET_REBIRTH_GAP, sentAt
+                        return true
+                    end)
+                    attempted = didAttempt
+                    if not didAttempt then P.nextSendAt = os.clock() + 10; P.nativeRebirthReason = nativeErr end
+                    if didAttempt and not called then error(nativeErr) end
+                else
+                    local sentAt = os.clock()
+                    P.nextSendAt, lastSends[memKey] = sentAt + TARGET_REBIRTH_GAP, sentAt
+                    attempted = true
+                    P.remote:FireServer(payload)
+                end
             end)
             if not attempted then
                 local cleared, clearErr = clearPending()
                 if cleared then P.pending = nil else P.rebirthDisabled = true; log("не удалось отменить маркер ребёрта: " .. tostring(clearErr)) end
-                if not ok then log("ошибка до отправки ребёрта: " .. tostring(sendErr)) end
+                if not ok then log("ошибка до отправки ребёрта: " .. tostring(sendErr))
+                elseif world == "TimeRift" and P.nativeRebirthReason then
+                    log("Rift-ребёрт не вызван: " .. tostring(P.nativeRebirthReason)); P.nativeRebirthReason = nil
+                end
             elseif not ok then
                 log("ответ на ребёрт неясен: " .. tostring(sendErr) .. "; новые ребёрты приостановлены, яйца продолжаются")
                 P.targetPendingWarned = true
@@ -29221,7 +31170,20 @@ __modules["features/progress_test"] = function(use)
         end
 
         local function step()
-            if P.phase == "stopped" then return end
+            if Ui.__progressTest ~= P or P.phase == "stopped" then return end
+            if P.worldChanging then
+                local snapshot = Env.data()
+                local rb = W.rebirthsFor(snapshot, world)
+                local coins = W.coinsFor(snapshot, world)
+                if P.pending and rb and rb > (P.pending.before or math.huge) then confirmed(rb, coins) end
+                if P.previousRebirthPending and rb and rb > (P.previousRebirthPending.before or math.huge) then
+                    local cleared, err = clearPending()
+                    if cleared then P.previousRebirthPending = nil
+                    else P.rebirthDisabled = true; log("подтверждение старого ребёрта не сохранилось: " .. tostring(err)) end
+                end
+                return
+            end
+            if not W.isCurrent(P, Env.data()) then return end
             local now = os.clock()
             local delta = math.max(0, now - (P.lastTick or now))
             P.lastTick = now
@@ -29233,6 +31195,11 @@ __modules["features/progress_test"] = function(use)
                 P.holdHatch = true
                 phase("stopped", "остановлено пользователем")
                 log("тест остановлен; уже отправленный серверу запрос отозвать нельзя")
+                return
+            end
+            if P.royalResumePending and P.royalFinal then
+                P.royalResumePending = nil
+                resumeTarget("финал Royal: данные восстановлены; оба кликера включены")
                 return
             end
             P.activeClock += delta
@@ -29250,7 +31217,7 @@ __modules["features/progress_test"] = function(use)
                             P.targetProbeRequired, P.targetCheckStartedAt = false, nil
                             P.targetNextProbeAt = math.max(P.targetNextProbeAt or 0, P.activeClock + TARGET_PROBE_PERIOD)
                         end
-                        resumeTarget("пауза завершена: 30M и Luck сохранены; следующий замер по расписанию")
+                        resumeTarget("пауза завершена: Luck сохранён; яйца и острова продолжаются, следующий замер по расписанию")
                     else beginUpgradeWindow("пауза завершена: продолжаю быстрые ребёрты") end
                 end
             end
@@ -29289,23 +31256,31 @@ __modules["features/progress_test"] = function(use)
                         if P.clickerStoppedForSafety and not P.rebirthLocked and not P.stopRequested and not pausedForTrade() then
                             pcall(Ui.set, "AutoClicker", true); P.clickerStoppedForSafety = false
                         end
+                        if P.royalFinal then
+                            if rebirths~=P.lockedRebirths then
+                                blocked("после финала изменился счётчик ребёртов; повтор запрещён")
+                                P.holdTap=true; stopNativeClicker(); return
+                            end
+                            if P.phase=="uncertain" then resumeTarget("предыдущий ребёрт подтверждён без изменения финального счётчика") end
+                        end
                         if P.eggFixed then
                             P.targetPrevRebirths = rebirths
-                            log("ребёрт предыдущей копии подтверждён; 30M продолжается")
+                            log("ребёрт предыдущей копии подтверждён; яйца продолжаются")
                         else
                             beginUpgradeWindow("ребёрт предыдущей копии подтвердился; продолжаю прокачку")
                         end
                     end
-                elseif not P.eggFixed then
+                elseif not P.eggFixed or P.royalFinal then
                     if P.phase ~= "uncertain" then uncertain("у предыдущей копии был неподтверждённый ребёрт") end
                     return
                 elseif not P.previousPendingWarned then
                     P.previousPendingWarned = true
-                    log("ребёрт прошлой копии не подтверждён: новый не отправляю; 30M продолжает открываться")
+                    log("ребёрт прошлой копии не подтверждён: новый не отправляю; яйца продолжаются")
                 end
             end
             if P.previousHatchPending then
-                if P.phase ~= "blocked" then blocked("у предыдущей копии оставался запрос яйца; нужен свежий вход") end
+                if P.phase ~= "blocked" then blocked("яйцо предыдущей копии или журнал не подтверждены: "
+                    .. tostring(P.hatchJournalIssue or "проверка необходима") .. "; маркер автоматически не удаляю") end
                 return
             end
             if P.previousCraftPending or P.craftUncertain then
@@ -29313,7 +31288,8 @@ __modules["features/progress_test"] = function(use)
                 return
             end
             if P.previousIslandPending or P.islandUncertain or P.islandTravelUncertain then
-                blocked("покупка острова или переход остались без надёжного подтверждения; нужен свежий вход и диагностика")
+                if world=="TimeRift" and not P.previousIslandPending then P.blockedByRiftIsland=true end
+                blocked("покупка острова или переход не подтверждены; повтор запрещён")
                 return
             end
             if P.pending then
@@ -29321,32 +31297,32 @@ __modules["features/progress_test"] = function(use)
                 if not P.eggFixed then
                     if wasConfirmed then return end
                     if P.phase ~= "uncertain" and P.activeClock - P.pending.sentAt >= REPLY_TIMEOUT then
-                        uncertain("ребёрт не подтвердился по Statistics.Rebirths")
+                        uncertain("ребёрт не подтвердился по счётчику текущего мира")
                     end
                     return
                 elseif not wasConfirmed and P.pending and not P.targetPendingWarned
                     and P.activeClock - P.pending.sentAt >= REPLY_TIMEOUT then
                     P.targetPendingWarned = true
-                    log("ребёрт не подтвердился: новые ребёрты не отправляю; 30M продолжает открываться")
+                    log("ребёрт не подтвердился: новые ребёрты не отправляю; яйца продолжаются")
                 end
             end
             if P.phase == "blocked" or P.phase == "uncertain" or P.phase == "hatch_uncertain" then return end
             if not data or rebirths == nil or coins == nil then
                 P.goodWindows = 0
                 P.sampleCoins, P.sampleAt = nil, nil
-                P.note = "ожидаю корректные Currencies.Coins и Statistics.Rebirths"
+                P.note = "ожидаю корректные валюту и счётчик ребёртов текущего мира"
                 return
             end
-            if P.rebirthLocked then
+            if P.royalFinal then
                 if P.lockedRebirths == nil then P.lockedRebirths = rebirths end
                 if rebirths ~= P.lockedRebirths then
-                    blocked("счётчик ребёртов изменился после запрета на 900 млн/с: "
+                    blocked("счётчик ребёртов изменился после фиксации Royal: "
                         .. tostring(P.lockedRebirths) .. " -> " .. tostring(rebirths) .. "; источник неизвестен")
                     return
                 end
             elseif P.eggFixed then
                 if P.targetPrevRebirths ~= nil and rebirths ~= P.targetPrevRebirths then
-                    resyncFarm(rebirths, coins, P.targetPrevRebirths, "на этапе 30M")
+                    resyncFarm(rebirths, coins, P.targetPrevRebirths, "на этапе Luck")
                     return
                 end
                 P.targetPrevRebirths = rebirths
@@ -29366,10 +31342,10 @@ __modules["features/progress_test"] = function(use)
             end
             if P.phase == "check" then
                 if P.eggFixed then
-                    if P.rebirthLocked then
-                        resumeTarget("сохранён и 30M, и окончательный запрет ребёртов")
+                    if P.royalFinal then
+                        resumeTarget("сохранён финал Royal; оба кликера включены")
                     else
-                        resumeTarget("сохранён 30M; чистый Luck-замер по 10-минутному расписанию")
+                        resumeTarget("сохранена фаза 300 млн/с; чистый Luck-замер по расписанию")
                     end
                 else
                     beginUpgradeWindow("прокачка: яйца до 20% текущего баланса, крафт 100%, гемовые улучшения")
@@ -29378,7 +31354,7 @@ __modules["features/progress_test"] = function(use)
             end
             local targetWork = P.phase == "save" or P.phase == "hatch" or P.phase == "storage_wait"
                 or P.phase == "target_wait" or P.phase == "locked_wait"
-            if P.eggFixed and not P.rebirthLocked and targetWork then
+            if P.eggFixed and not P.rebirthLocked and not P.royalFinal and not P.finalizing and targetWork then
                 -- Do not begin a clean check while an earlier rebirth may still spend coins.
                 if P.activeClock >= (P.targetNextProbeAt or 0) and not P.pending and not P.previousRebirthPending then
                     P.targetProbeRequired = true
@@ -29393,37 +31369,16 @@ __modules["features/progress_test"] = function(use)
                 tryTargetRebirth(data, rebirths, coins)
             end
 
-            -- Target availability never prevents the still-allowed rebirth/probe scheduler above.
-            local targetState = nil
-            if P.eggFixed and (P.phase == "save" or P.phase == "hatch" or P.phase == "target_wait") then
-                local okTarget
-                if P.serverDeniedUntil and os.clock() < P.serverDeniedUntil then
-                    okTarget = false
-                    targetState = "отказ сервера " .. tostring(P.serverDeniedReason or "неизвестен") .. "; жду повтор"
-                else
-                    P.serverDeniedUntil, P.serverDeniedReason = nil, nil
-                    okTarget, targetState = findTarget(data)
-                end
-                if not okTarget or targetState ~= "ready" then
-                    P.goodWindows = 0
-                    P.sampleCoins, P.sampleAt = nil, nil
-                    P.holdHatch = true
-                    P.holdUpgrades, P.holdSkillTree = true, true -- после перехода покупки не возобновляются
-                    local reason = targetState == "no_position" and "ожидаю модель и координаты 30M" or tostring(targetState)
-                    local note = "30M не подтверждено: " .. reason
-                    if P.phase ~= "target_wait" then
-                        phase("target_wait", note)
-                        log(P.note .. (P.rebirthLocked and "; другое яйцо не выбираю, ребёрты остановлены"
-                            or "; другое яйцо не выбираю, проверка ребёртов продолжается"))
-                    elseif P.note ~= note then
-                        P.note = note
-                        log(P.note .. (P.rebirthLocked and "; ребёрты остановлены" or "; ребёрты ещё разрешены"))
-                    end
-                    return
-                elseif P.phase == "target_wait" then
-                    resumeTarget("30M найдено; жду 900 млн без дополнительного резерва")
-                    return
-                end
+            if P.finalizing then
+                finishRoyal(rebirths, coins, data)
+                return
+            end
+
+            -- Dynamic egg availability is decided by the hatch worker. It must not block
+            -- rebirth checks, island purchases, or Luck scheduling in the controller.
+            if P.phase == "target_wait" then
+                resumeTarget("восстанавливаю динамический выбор яиц")
+                return
             end
 
             if P.phase == "settle" then
@@ -29451,7 +31406,7 @@ __modules["features/progress_test"] = function(use)
                     local sig = teamSignature(data)
                     if not sig then
                         P.modeReadySince, P.settleTeam = nil, nil
-                        P.note = "жду полную реплику команды после запроса Luck для проверки 900 млн/с"
+                        P.note = "жду полную реплику команды после запроса Luck"
                         return
                     end
                     if P.settleTeam ~= sig then
@@ -29496,27 +31451,32 @@ __modules["features/progress_test"] = function(use)
                 end
                 P.income = math.max(0, rate - precision)
                 rememberIncome(mode, P.income, "без ребёртов и расходов")
-                local threshold = mode == "Luck" and STOP_REBIRTH_INCOME or REQUIRED_INCOME
-                -- Both decisions use income per second, not the wallet or the batch price.
-                local boundaryTolerance = math.max(precision, threshold * 1e-9)
-                if rate + boundaryTolerance >= threshold and precision < threshold * 0.05 then
+                if mode == "Luck" then
                     P.goodWindows += 1
-                    P.note = string.format("%s: доход подтверждается %d/%d окон", mode, P.goodWindows, REQUIRED_WINDOWS)
+                    P.luckRateSum = (P.luckRateSum or 0) + P.income
+                    P.note = string.format("Luck: чистый замер %d/%d", P.goodWindows, REQUIRED_WINDOWS)
                     if P.goodWindows >= REQUIRED_WINDOWS then
-                        if mode == "Luck" then
-                            if not lockRebirth(rebirths) then return end
-                        else
-                            if not fixEgg30(rebirths) then return end
-                        end
+                        P.income = P.luckRateSum / P.goodWindows
+                        rememberIncome("Luck", P.income, "без ребёртов и расходов")
+                        P.luckRateSum = nil
+                        P.targetProbeRequired, P.targetCheckStartedAt = false, nil
+                        P.goodWindows = 0
+                        resumeTarget(string.format("чистый Luck %.0f/с; финал только по реальному непрерывному Royal x3", P.income))
                     end
-                elseif precision >= threshold * 0.05 then
-                    blocked("баланс слишком велик для точного замера прироста числом клиента")
-                elseif mode == "Luck" then
-                    P.targetProbeRequired, P.targetCheckStartedAt = false, nil
-                    P.goodWindows = 0
-                    resumeTarget(string.format("Luck %.0f/с ниже 900 млн/с; продолжаю 30M и ребёрты", P.income))
                 else
-                    beginUpgradeWindow("доход Clicks ниже 300 млн/с; продолжаю прокачку")
+                    local threshold = REQUIRED_INCOME
+                    local tolerance = math.max(precision, threshold * 1e-9)
+                    if rate + tolerance >= threshold and precision < threshold * 0.05 then
+                        P.goodWindows += 1
+                        P.note = string.format("Clicks: доход подтверждается %d/%d окон", P.goodWindows, REQUIRED_WINDOWS)
+                        if P.goodWindows >= REQUIRED_WINDOWS then
+                            if not startLuckStage(rebirths) then return end
+                        end
+                    elseif precision >= threshold * 0.05 then
+                        blocked("баланс слишком велик для точного замера прироста числом клиента")
+                    else
+                        beginUpgradeWindow("доход Clicks ниже 300 млн/с; продолжаю прокачку")
+                    end
                 end
                 return
             end
@@ -29543,7 +31503,7 @@ __modules["features/progress_test"] = function(use)
                     -- Положительные дельты между быстрыми сбросами могут быть искажены.
                     -- Постоянный запрет ставим только после трёх прямых окон без ребёртов
                     -- в фазах settle/measure; при недостаточном доходе прокачка возобновится.
-                    beginSettle("проверяю доход Clicks без ребёртов и расходов перед переходом к 30M")
+                    beginSettle("проверяю доход Clicks без ребёртов и расходов перед переходом к Luck")
                     return
                 end
                 -- Hatch spend can conceal every preliminary 10-second window. Periodically
@@ -29572,7 +31532,10 @@ __modules["features/progress_test"] = function(use)
                 if not index then
                     P.holdHatch, P.holdCraft, P.disableAutoCraft = false, false, false
                     P.holdUpgrades, P.holdSkillTree = false, false
-                    if why ~= "unaffordable" then blocked("цена ребёрта недоступна: " .. tostring(why)); return end
+                    if world == "TimeRift" then
+                        maybeOpenRiftRebirth()
+                        if not P.riftPackWarned then P.riftPackWarned = true; log("Rift-ребёрт ожидает игровую кнопку: " .. tostring(why)) end
+                    elseif why ~= "unaffordable" then blocked("цена ребёрта недоступна: " .. tostring(why)); return end
                     if P.activeClock >= (P.nextClickerRefresh or 0) then
                         P.nextClickerRefresh = P.activeClock + CLICKER_REFRESH_SECONDS
                         refreshNativeClicker()
@@ -29626,19 +31589,44 @@ __modules["features/progress_test"] = function(use)
                     end
                     prepared.coins = coins4
                     prepared.sentAt = P.activeClock + math.max(0, os.clock() - (P.lastTick or os.clock()))
-                    -- A transport failure after this point cannot prove the request was unsent.
-                    local sentAt = os.clock()
-                    P.nextSendAt = sentAt + REBIRTH_GAP
-                    lastSends[userKey] = sentAt
-                    attempted = true
-                    P.remote:FireServer(payload)
+                    -- No guessed Rift payload: trigger the selected game button itself.
+                    if world == "TimeRift" then
+                        local item = P.riftPackCandidate
+                        if not item or not item.button then return end
+                        local didAttempt, called, nativeErr = Native.fireButton(item.button, function()
+                            local snapshot, rbNow = readValues()
+                            local iNow, aNow, pNow = tap.progressPack(snapshot, math.huge)
+                            local _, rbFinal, cFinal = readValues()
+                            local latest = P.riftPackCandidate
+                            if not canRebirth(prepared) or rbNow ~= rebirths or rbFinal ~= rebirths
+                                or iNow ~= index or aNow ~= amount or pNow ~= price or not cFinal or cFinal < price
+                                or not latest or latest.button ~= item.button then return false end
+                            prepared.coins = cFinal
+                            prepared.sentAt = P.activeClock + math.max(0, os.clock() - (P.lastTick or os.clock()))
+                            local sentAt = os.clock()
+                            P.nextSendAt, lastSends[memKey] = sentAt + REBIRTH_GAP, sentAt
+                            return true
+                        end)
+                        attempted = didAttempt
+                        if not didAttempt then P.nextSendAt = os.clock() + 10; P.nativeRebirthReason = nativeErr end
+                        if didAttempt and not called then error(nativeErr) end
+                    else
+                        local sentAt = os.clock()
+                        P.nextSendAt = sentAt + REBIRTH_GAP
+                        lastSends[memKey] = sentAt
+                        attempted = true
+                        P.remote:FireServer(payload)
+                    end
                 end)
                 if not attempted then
                     -- The request was definitely not invoked; erase only that prepared marker.
                     local cleared, clearErr = clearPending()
                     if cleared then P.pending = nil
                     else uncertain("не удалось отменить неподтверждённую подготовку: " .. tostring(clearErr)); return end
-                    if not ok then blocked("ошибка перед отправкой ребёрта: " .. tostring(err)) end
+                    if not ok then blocked("ошибка перед отправкой ребёрта: " .. tostring(err))
+                    elseif world == "TimeRift" and P.nativeRebirthReason then
+                        log("Rift-ребёрт не вызван: " .. tostring(P.nativeRebirthReason)); P.nativeRebirthReason = nil
+                    end
                 elseif not ok then
                     uncertain("ошибка отправки ребёрта: " .. tostring(err))
                 end
@@ -29654,17 +31642,17 @@ __modules["features/progress_test"] = function(use)
                     for _ in pairs(owned) do count += 1 end
                     if limit - count >= (P.storageNeeded or 3) then
                         P.storageNeeded = nil
-                        resumeTarget("в рюкзаке появились места; продолжаю 30M x3")
+                        resumeTarget("в рюкзаке появились места; продолжаю лучшие доступные яйца x3")
                     end
                 end
                 return
             end
             if P.phase == "locked_wait" then
-                resumeTarget("ожидаю 30M x3; прокачка после сохранённого lock не возобновляется")
+                resumeTarget("возобновляю лучшие доступные яйца x3; сохранённые пороги действуют")
                 return
             end
             if P.phase == "save" then
-                if not P.eggFixed then blocked("не закреплён выбор 30M в фазе накопления"); return end
+                if not P.eggFixed then blocked("не закреплена фаза 300 млн/с"); return end
                 P.holdCraft, P.disableAutoCraft = true, true
                 P.holdUpgrades, P.holdSkillTree = true, true
                 local opt = Ui.Options and Ui.Options.EquipMode
@@ -29677,31 +31665,19 @@ __modules["features/progress_test"] = function(use)
                     P.note = "жду запрос команды Luck"
                     return
                 end
-                if targetState ~= "ready" or P.locating or Ui.travelling
-                    or P.craftBusy or P.craftInFlight or Ui.hatchInFlight then return end
-                if coins < BATCH_PRICE or (P.coinRefusedSnapshot ~= nil and coins == P.coinRefusedSnapshot) then
-                    P.holdHatch = true
-                    P.note = "жду 900 млн на одну тройку: " .. tostring(math.floor(coins)) .. " / " .. tostring(BATCH_PRICE)
-                    return
-                end
-                P.coinRefusedSnapshot = nil
+                if P.locating or Ui.travelling or P.craftBusy or P.craftInFlight or Ui.hatchInFlight then return end
                 P.holdHatch = false
-                phase("hatch", "только 30M x3; доступен весь баланс")
-                log("30M x3: открываю на доступный баланс; дополнительный резерв не требуется")
+                phase("hatch", "выбираю лучшее доступное яйцо x3; доступен весь баланс")
+                log("прогрессия: выбираю самое дорогое доступное яйцо x3 без снижения сохранённой цены")
                 return
             end
             if P.phase == "hatch" then
-                if not P.eggFixed then blocked("ошибка фиксации 30M в фазе яиц"); return end
+                if not P.eggFixed then blocked("не закреплена фаза 300 млн/с при открытии яиц"); return end
                 P.holdCraft, P.disableAutoCraft = true, true
                 P.holdUpgrades, P.holdSkillTree = true, true
                 local opt = Ui.Options and Ui.Options.EquipMode
                 if not opt or opt.Value ~= "Luck" or not modeRequestSeen("Luck") then
                     resumeTarget("восстанавливаю команду Luck; крафт и покупки запрещены")
-                    return
-                end
-                if coins < BATCH_PRICE and not Ui.hatchInFlight then
-                    P.holdHatch = true
-                    phase("save", "жду заработка на следующую тройку 30M")
                     return
                 end
                 return
@@ -29715,7 +31691,7 @@ __modules["features/progress_test"] = function(use)
                 P.rebirthDisabled = true
                 if not P.controllerErrorWarned then
                     P.controllerErrorWarned = true
-                    log("ошибка при ожидающем ребёрте: " .. tostring(err) .. "; новые ребёрты остановлены, 30M продолжает открываться")
+                    log("ошибка при ожидающем ребёрте: " .. tostring(err) .. "; новые ребёрты остановлены, яйца продолжаются")
                 end
             elseif P.pending then
                 uncertain("ошибка при ожидающем ребёрте: " .. tostring(err))
@@ -29737,24 +31713,20 @@ __modules["features/progress_test"] = function(use)
             P.holdTap, P.holdHatch, P.holdCraft, P.disableAutoCraft = true, true, true, true
             Ui.stopAll()
             stopNativeClicker()
-            print("[TAPSIM] 30M TEST | остановлено; уже отправленный запрос отменить нельзя")
+            print("[TAPSIM] ПРОГРЕССИЯ | остановлено; уже отправленный запрос отменить нельзя")
         end
         Life.onCleanup(function()
             genv.ts30TestState = nil
             genv.ts30TestStop = nil
         end)
-        log("v13: до 300 млн/с Clicks, яйца до 20% текущих монет, уровень цены не понижается, крафт только 100%")
-        log("ребёрт: максимальный доступный пакет, до 300 млн/с не чаще 20 с, затем не чаще 120 с; покупки только за гемы")
-        log("300 млн монет/с по Clicks: только 30M x3 за 900 млн, Luck, без крафта и покупок; ребёрты продолжаются")
-        log("проверка 900 млн монет/с: первый чистый Luck-замер и далее не чаще раза в 10 минут; на время замера яйца и ребёрты на паузе")
-        log("вне замера 30M не ждёт ребёрта или чистку; при гонке сервер может отказать из-за баланса")
-        log("после подтверждения 900 млн/с ребёрты, оба кликера и измерения дохода выключены; 30M x3, чистка, Hold и Luck раз в 10 минут")
-        log("старый маркер 30M не доказывает 900 млн/с; Luck-доход проверяется по расписанию")
-        log("во время прокачки пытаюсь открыть следующий остров по игровому конфигу; после 300 млн/с новые острова не покупаю")
-        log("исходная чистка: не-секреты вне команды, включая Godly; с них может сниматься лок")
-        log("рыбалка, приманки, зелья, зачарования и трейды не запускаются; старое игровое автоудаление может сохраняться")
-        log("при неожиданном изменении счётчика во время прокачки повторно сверяю данные и возобновляю работу")
-        if not hatchApiReady then log("модуль яйца не загрузился: прокачка продолжится без яиц, для 30M будет ожидание") end
+        log("v14: мир=" .. world .. "; до 300 млн/с Clicks, яйца до 20%, крафт только 100%")
+        log("ребёрт: максимальный найденный пакет, интервалы 20/120 с; покупки только за гемы текущего мира")
+        log("после 300 млн/с: Luck, доступные яйца x3; чистый замер каждые 10 минут с паузой трат")
+        log("финал: только после устойчивого Royal x3 по реальным ответам и балансу; оба кликера остаются включены")
+        log("без накопительной паузы на порталы; чистка не ждёт яйцо, ребёрт не ждёт яйцо")
+        log("чистка может удалять не-секретов вне команды, включая Godly; секреты защищены")
+        log("рыбалка, приманки, зелья, зачарования и трейды не запускаются")
+        if not hatchApiReady then log("модуль яйца не загрузился: прогрессия продолжится без открытий") end
         if type(features["features/craft"]) ~= "table" then
             log("модуль крафта не загрузился: прокачка продолжится без крафта")
         end
@@ -29780,6 +31752,7 @@ do
 	local Env = use("core/env")
 	local Life = use("shared/life")
 	local Ui = use("core/ui")
+	local W = use("features/world_data")
 	local HttpService = game:GetService("HttpService")
 
 	-- ==== настройки вебхука ==================================================
@@ -29836,13 +31809,13 @@ do
 
 	-- ========================================================================
 
-	-- 1) Фарм, контролируемые ребёрты и покупки улучшений за гемы; затем яйца 30M.
+	-- 1) Фарм, контролируемые ребёрты и гемовые улучшения; прогрессия яиц и островов.
 	-- Без рыбалки, зелий, зачарования и трейда. Крафт 100% только до lock; исходная чистка в обеих фазах.
 	local FARM_ON = {
 		-- яйца
 		AutoHatch = true,
 		HatchTeleport = true,
-		-- команда: Clicks при прокачке; Luck после сохранённого перехода к 30M
+		-- команда: Clicks до 300 млн/с; Luck после подтверждённого порога
 		AutoEquipBest = true,
 		-- крафт: золотые и алмазные (радугу не делаем — она отнимает время у яиц)
 		AutoCraft = true, -- действительный шанс 100% проверяется перед каждым Craft/Start
@@ -29895,7 +31868,7 @@ do
 	pcall(Ui.set, "AutoReveal", true)
 	if Ui.on("AutoReveal") then logEvent("hold", "Hold to Reveal включён; обработчики яиц не глушатся")
 	else logEvent("warn", "Hold to Reveal не включился: модуль или тумблер не загрузился") end
-	logEvent("farm", "прокачка: доступные яйца до 20% текущего баланса на партию; после порога — только 30M x3")
+	logEvent("farm", "прогрессия яиц: до 300 млн/с до 20% баланса; затем лучшее доступное x3; острова открываются при наличии монет")
 	pcall(function()
 		local picks = Ui.Options and Ui.Options.UpgradePicks
 		local values = picks and picks.Values
@@ -29911,14 +31884,14 @@ do
 		local slider = Ui.Options and Ui.Options.EquipEvery
 		if slider and slider.Value ~= 2 then slider:SetValue(2) end
 	end)
-	-- Контроллер 30M: исходный GitHub не меняется.
+	-- Контроллер прогрессии: исходный GitHub не меняется.
 	local okProgress, progressError = pcall(function()
-		use("features/progress_test").start(logEvent)
+		use("features/world_router").start(logEvent)
 	end)
 	if not okProgress then
 		local state = Ui.__progressTest
 		if state then state.holdHatch = true; state.holdUpgrades = true; state.phase = "blocked" end
-		logEvent("warn", "[30M TEST] контроллер не загрузился; яйца и ребёрты остановлены: " .. tostring(progressError))
+		logEvent("warn", "[ПРОГРЕССИЯ] контроллер не загрузился; яйца и ребёрты остановлены: " .. tostring(progressError))
 	end
 
 	-- 1.5) КОМАНДА: режим задаёт контроллер фазы: Clicks до lock, затем Luck.
@@ -30588,41 +32561,31 @@ do
 	end)
 
 	-- 7) Логи: считаем ответы на яйца и раз в LOG_EVERY секунд шлём отчёт на сервер
-	Life.spawn("log:hatch", function()
-		local ok, remote = pcall(function()
-			return Env.remote("EggService", "EggHatchResult")
-		end)
-		if ok and remote then
-			Life.connect(remote.OnClientEvent, function(payload)
-				LOG.hatches += 1
-				if type(payload) == "table" then
-					-- реальные яйца: сервер сам говорит, сколько вылупилось (Rolls),
-					-- независимо от того, что потом съест авто-удаление
-					local rolls = tonumber(payload.Rolls)
-					if rolls and rolls > 0 then
-						LOG.rolls += rolls
-						local now = os.clock()
-						LOG.window[#LOG.window + 1] = { at = now, rolls = rolls }
-						local cutoff = now - ROLL_WINDOW
-						while LOG.window[1] and LOG.window[1].at < cutoff do
-							table.remove(LOG.window, 1)
-						end
-					end
-					if payload.Egg ~= nil then
-						LOG.lastEgg = tostring(payload.Egg)
-					end
-					if payload.Error then
-						local kind = tostring(payload.Error)
-						errors[kind] = (errors[kind] or 0) + 1
-						LOG.error = kind
-						if (errors[kind] % 10) == 1 then
-							logEvent("error", string.format("%s (всего %d)", kind, errors[kind]))
-						end
-					end
-				end
-			end, "log:hatch:count")
-		end
-	end)
+	Ui.__recordHatchResult = function(payload, verdict, confirmedRolls)
+        LOG.hatches += 1
+        if type(payload)~="table" then return end
+        if verdict=="success" then
+            local rolls=tonumber(confirmedRolls)
+            if rolls and rolls>0 then
+                LOG.rolls += rolls
+                LOG.eggs = LOG.rolls
+                local now=os.clock()
+                LOG.window[#LOG.window+1]={at=now,rolls=rolls}
+                local cutoff=now-ROLL_WINDOW
+                while LOG.window[1] and LOG.window[1].at<cutoff do table.remove(LOG.window,1) end
+            end
+            if payload.Egg~=nil then LOG.lastEgg=tostring(payload.Egg) end
+        elseif verdict=="refused" then
+            local kind=tostring(payload.Error or payload.Reason or "Rejected")
+            errors[kind]=(errors[kind] or 0)+1
+            LOG.error=kind
+            if (errors[kind]%10)==1 then logEvent("error",string.format("%s (всего %d)",kind,errors[kind])) end
+        elseif verdict=="unknown" then
+            errors["неподтверждённое яйцо"]=(errors["неподтверждённое яйцо"] or 0)+1
+            LOG.error="неподтверждённое яйцо"
+        end
+    end
+    Life.onCleanup(function() Ui.__recordHatchResult=nil end)
 
 	-- Что из рюкзака реально стоит денег — списком на сайт. Панель показывает не только
 	-- сумму в токенах, но и какие именно петы её дают, поэтому топ уходит в отчёте.
@@ -30711,10 +32674,13 @@ do
 						secrets = LOG.secrets,
 						tokens_value = value,
 						-- pets: сколько уцелело в рюкзаке после авто-удаления (в v14 это поле звалось eggs)
-						coins = currency("Coins"),
-						gems = currency("Gems"),
+						world = W.world(data) or "unknown",
+						coins_currency = W.coinKey(data) or "unknown",
+						gems_currency = W.gemKey(data) or "unknown",
+						coins = W.coins(data) or 0,
+						gems = W.gems(data) or 0,
 						tokens = currency("Tokens") + currency("PaidTokens"),
-						rebirths = tonumber(type(stats) == "table" and stats.Rebirths) or 0,
+						rebirths = W.rebirths(data) or 0,
 						storage_used = used,
 						storage_limit = limit or 0,
 						best = collectBest(owned),
@@ -30751,7 +32717,7 @@ do
 	-- Godly тоже удаляем; если годли (или любой не-секрет) залочен — сначала снимаем лок,
 	-- иначе сервер удаление не принимает.
 	local CLEAN = {
-		enabled = true, -- исходная чистка: на прокачке и в фазе 30M
+		enabled = true, -- исходная чистка: на всех этапах прогрессии
 		startAt = 0.90,     -- с какой доли хранилища начинаем чистку
 		targetAt = 0.80,    -- до какой доли чистим за один заход
 		batch = 50,         -- сколько id в одном запросе
@@ -30983,12 +32949,14 @@ do
 	end
 	local function cleanAllowed()
 		local P = Ui.__progressTest
+		local snapshot = Env.data()
 		local phase = P and P.phase
 		local lockedPhase = P and (P.eggFixed or P.rebirthLocked) and (phase == "save" or phase == "hatch" or phase == "storage_wait"
 			or phase == "target_wait" or phase == "locked_wait")
 		local farmPhase = P and not P.eggFixed and not P.rebirthLocked and phase == "rebirth" and not P.farmThresholdReached
 			and not P.holdHatch and not P.holdCraft and not P.pending
-		return Life.alive and P and P.cleaning and (lockedPhase or farmPhase) and not P.stopRequested
+		return Life.alive and P and Ui.__progressTest == P and P.cleaning and (lockedPhase or farmPhase) and not P.stopRequested
+            and not P.worldChanging and not P.finalizing and W.isCurrent(P,snapshot)
 			and not (P.pending and not (P.eggFixed or P.rebirthLocked))
 			and not (P.eggFixed and not P.rebirthLocked and P.targetProbeRequired)
 			and not P.hatchUncertain and not P.craftUncertain and not P.craftBusy and not P.craftInFlight
@@ -31324,7 +33292,8 @@ do
 		local farmPhase = P and not P.eggFixed and not P.rebirthLocked and phase == "rebirth" and not P.farmThresholdReached
 			and not P.holdHatch and not P.holdCraft and not P.pending
 		if not CLEAN.enabled or not P or not (lockedPhase or farmPhase) or P.stopRequested or P.cleaning
-			or (P.pending and not (P.eggFixed or P.rebirthLocked))
+            or P.worldChanging or P.finalizing or not W.isCurrent(P,Env.data())
+				or (P.pending and not (P.eggFixed or P.rebirthLocked))
 			or (P.eggFixed and not P.rebirthLocked and P.targetProbeRequired)
 			or P.hatchUncertain or P.craftUncertain or P.craftBusy or P.craftInFlight
 			or P.previousHatchPending or (P.previousRebirthPending and not (P.eggFixed or P.rebirthLocked)) or P.previousCraftPending
@@ -31340,20 +33309,20 @@ do
 				return P.equipReady == true and cleanAllowed() and opt and opt.Value == desired
 					and ((P.eggFixed or P.rebirthLocked) and "Luck" or "Clicks") == desired and Ui.on("AutoEquipBest")
 			end
-			if not canEquipForClean() or type(Ui.tryEquipBest) ~= "function" then return end
-			local sent, why = Ui.tryEquipBest(desired, true)
-			if not sent then
-				local finalPrior = P.rebirthLocked and P.finalPriorLuckAttemptKnown and desired == "Luck"
-				if why ~= "cooldown" and not (finalPrior and why == "not-saved") then return end
-				if P.lastEquipMode ~= desired and not finalPrior then return end
-			end
-			-- No other EquipBest sender can enter while cleaning. A previous request may still
-			-- replicate: let this worker (not hatch) see a stable and fully identified team.
-			local last = math.max(tonumber(P.lastEquipAt) or -math.huge, tonumber(P.finalEquipLastAt) or -math.huge)
-			if last == -math.huge then last = os.clock() end
-			local remaining = 2 - (os.clock() - last)
-			if remaining > 0 then Life.wait(remaining) end
-			if not canEquipForClean() then return end
+            if not P.royalFinal then
+                if not canEquipForClean() or type(Ui.tryEquipBest) ~= "function" then return end
+                local sent, why = Ui.tryEquipBest(desired, true)
+                if not sent then
+                    if why ~= "cooldown" then return end
+                    if P.lastEquipMode ~= desired then return end
+                end
+                local last=math.max(tonumber(P.lastEquipAt) or -math.huge,tonumber(P.finalEquipLastAt) or -math.huge)
+                if last==-math.huge then last=os.clock() end
+                local remaining=2-(os.clock()-last)
+                if remaining>0 then Life.wait(remaining) end
+                if not canEquipForClean() then return end
+            elseif not cleanAllowed() then return end
+            -- Final Royal: no EquipBest or upgrade calls, only a stable, fully recognised team.
 			local before = cleanTeamSnapshot()
 			if not before then
 				CLEAN.note = "команда распознана не полностью — чистка на паузе"
@@ -31419,7 +33388,7 @@ do
 			player and player.Name or "?",
 			gained, math.floor(span), rate, windowRate(), eggsNow, LOG.hatches,
 			LOG.secrets, LOG.secretsCaught,
-			short(currency("Coins")), short(currency("Gems")), short(currency("Tokens") + currency("PaidTokens")),
+			short(W.coins(data) or 0), short(W.gems(data) or 0), short(currency("Tokens") + currency("PaidTokens")),
 			storage, limit,
 			string.format("%s %.1fч", droughtEgg or "-", drought / 3600),
 			tostring(eggNow or LOG.lastEgg or "?"),
@@ -31429,7 +33398,7 @@ do
 		))
 	end)
 
-	print("[TAPSIM] 30M v13 | Clicks и яйца до 20%; после 300 млн/с 30M x3 + Luck и ребёрты; после 900 млн/с ребёрты стоп")
+	print("[TAPSIM] прогрессия v14 | Main → TimeRift → Royal x3; оба кликера остаются включены")
 	print(string.format("[TAPSIM] старт | аккаунт %s | панель и логи включены",
 		Env.LocalPlayer and Env.LocalPlayer.Name or "?"))
 
@@ -31556,11 +33525,10 @@ do
 
 		local player = Env.LocalPlayer
 		userRow.Text = "👤 Username: " .. (player and player.Name or "…")
-		coinsRow.Text = "💰 Coins: " .. short(currency("Coins"))
-		gemsRow.Text = "💎 Gems: " .. short(currency("Gems"))
+		coinsRow.Text = "💰 " .. tostring(W.coinKey(data) or "Coins?") .. ": " .. short(W.coins(data) or 0)
+		gemsRow.Text = "💎 " .. tostring(W.gemKey(data) or "Gems?") .. ": " .. short(W.gems(data) or 0)
 		tokensRow.Text = "🎫 Tokens: " .. short(currency("Tokens") + currency("PaidTokens"))
-		local stats = data and data.Statistics
-		rebirthsRow.Text = "🌟 Rebirths: " .. short(tonumber(type(stats) == "table" and stats.Rebirths) or 0)
+		rebirthsRow.Text = "🌟 " .. tostring(W.rebirthKey(data) or "Rebirths?") .. ": " .. short(W.rebirths(data) or 0)
 
 		local drought = 0
 		local eggs = data and data.Eggs
