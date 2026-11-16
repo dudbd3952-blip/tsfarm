@@ -2548,7 +2548,41 @@ __modules["features/portal_savings"] = function(use)
 local Env, Life, Ui = use("core/env"), use("shared/life"), use("core/ui")
 local W, Eggs = use("features/world_data"), use("features/egg_recovery")
 local S = {}
-local WINDOW, DRAIN_LIMIT, PROBE_LIMIT, RETRY, MAX_SAVE = 10, 35, 65, 120, 600
+local G=(function()
+local G={}
+local function finite(n)return type(n)=="number"and n==n and n>=0 and n<math.huge end
+function G.new(now,balance)return {at=now,lastAt=now,last=balance,positive=0,negative=0,samples=0,drops=0}end
+function G.step(s,now,balance)
+ if not finite(now)or not finite(balance)then return false end
+ if now<s.lastAt then return false end
+ local delta=balance-s.last
+ if delta>0 then s.positive+=delta elseif delta<0 then s.negative-=delta;s.drops+=1 end
+ s.last=balance;s.lastAt=now;s.samples+=1
+ return true
+end
+function G.window(s,now,anchor)
+ local elapsed=now-anchor.at
+ if elapsed<=0 then return nil end
+ return {rate=math.max(0,s.positive-anchor.positive)/elapsed,seconds=elapsed,
+  grossPositive=math.max(0,s.positive-anchor.positive),ignoredNegative=math.max(0,s.negative-anchor.negative),
+  drops=s.drops-anchor.drops,samples=s.samples-anchor.samples,kind="sum_positive_observed_deltas_not_guaranteed_production"}
+end
+function G.anchor(s,now)return {at=now,positive=s.positive,negative=s.negative,drops=s.drops,samples=s.samples}end
+return G
+
+end)()
+-- Observe the replica, never infer completion of an operation from this flow.
+function S.observe(P,data,now)
+ if type(P)~="table" or not Life.alive or Ui.__progressTest~=P or P.stopRequested or Ui.__globalStop
+  or P.worldChanging or not W.isCurrent(P,data) then return end
+ local coins=W.coins(data);if type(coins)~="number"then return end
+ local f=P.portalPositiveFlow
+ if not f or f.world~=P.worldName or now<f.lastAt then
+  f=G.new(now,coins);f.world=P.worldName;P.portalPositiveFlow=f
+ else G.step(f,now,coins)end
+end
+
+local WINDOW, DRAIN_LIMIT, PROBE_LIMIT, RETRY, MAX_SAVE = 10, 35, 65, 120, 3600
 local function log(P, text)
     if type(P) == "table" and type(P.log) == "function" then pcall(P.log, "портал: " .. text)
     else print("[TAPSIM] портал: " .. text) end
@@ -2563,7 +2597,7 @@ local function measuringPhase(P)
 end
 local function running(P, data, owner)
     if type(P) ~= "table" or not Life.alive or Ui.__progressTest ~= P or P.stopRequested
-        or Ui.__globalStop or P.worldChanging or not W.isCurrent(P, data) or P.holdTap or P.royalFinal
+        or Ui.__globalStop or P.worldChanging or not W.isCurrent(P, data) or P.royalFinal
         or P.finalizing or P.rebirthLocked or (Env.genv and Ui.__handoverPaused) then return false end
     local t = Ui.Toggles
     return type(t) == "table" and t.AutoTap and t.AutoTap.Value == true
@@ -2751,9 +2785,7 @@ local function mode(P)
     local expected = "Clicks"
     local opt = Ui.Options and Ui.Options.EquipMode
     local click = Ui.Toggles and Ui.Toggles.AutoClicker
-    if not opt or opt.Value ~= expected or not click or click.Value ~= true
-        or P.equipReady ~= true or P.lastEquipMode ~= expected or type(P.lastEquipAt) ~= "number"
-        or P.lastEquipAt < (tonumber(P.equipMinimumAt) or 0) then return nil end
+    if not opt or opt.Value ~= expected or not click or click.Value ~= true then return nil end
     return expected
 end
 -- A team signature here only invalidates an ETA when the observed team changes. Unlike the
@@ -2847,29 +2879,17 @@ function S.update(P, data, item, portalReady, canStart, owner, allowUnlocated)
         if s then release(P, "стадия изменилась; отдельная пауза снята", 0) end
         return
     end
-    if hazards(P, owner) or not S.eggAllowsIsland(P) then
-        local reason=hazardText(P,owner)
-        if s then release(P, "чистый замер отменён: "..reason.."; запросы сохранены", RETRY)
-        elseif candidateOK(item) then noteNoProbe(P,reason,now) end
-        return
-    end
-    if not affordable and deferredRebirth(P) then
-        local reason="результат отправленного ребёрта неизвестен; замер отложен, независимые яйца разрешены прежними защитами"
-        if s then release(P,reason.."; запрос сохранён и не повторяется",RETRY)
-        elseif candidateOK(item) then noteNoProbe(P,reason,now) end
-        return
-    end
-    if P.detachedMainRebirth and not affordable then
-        local reason="отправленный Main-ребёрт прошлого мира не подтверждён; позднее влияние на баланс не исключено"
-        if s then release(P,"отдельный замер отменён: "..reason,RETRY)
-        elseif candidateOK(item) then noteNoProbe(P,reason,now) end
-        return
-    end
+    -- Unknown old outcomes do NOT veto observation. Reservations stop NEW
+    -- expenses; existing request ownership and actual purchase guards are untouched.
+    S.observe(P,data,now)
     P.portalBlockReason=nil
     if not coins or not rebirths or not candidateOK(item) then
         P.portalModeWaitUntil,P.portalModeWaitKey,P.portalModeWaitDeadline=nil,nil,nil
         if s then release(P, "следующий остров или его цена больше не подтверждены", RETRY) end
         return
+    end
+    if Ui.__royalRoutePolicy==true and canStart and canEstimate then
+        P.royalRouteTarget={world=P.worldName,name=item.name,price=item.price,at=now,owner=owner,fromIsland=P.islandEggVerified}
     end
     if owner=="island" and activePhase(P) and canStart and canEstimate then
         P.portalChecked=true -- current candidate/price/currency checked, NOT physical location or purchase
@@ -2882,8 +2902,7 @@ function S.update(P, data, item, portalReady, canStart, owner, allowUnlocated)
         if not canStart or (not activePhase(P) and not (affordable and measuringPhase(P))) then return end
         -- A dispatched (or still-preparing) rebirth is not cancelled or credited.
         -- Reserve first, stop new sends, then drained() waits for its exact outcome.
-        if not affordable and (S.cleanProbeDue(P, now) or P.previousRebirthPending
-            or P.ambiguousRiftRebirth) then return end
+        -- No result/event/attribution requirement for a flow measurement.
         if affordable and not portalReady and now < (P.portalRetryAt or 0) then return end
         if coins < item.price and canEstimate and now >= (P.portalRetryAt or 0) and not mode(P) then
             local waitKey=owner.."|"..P.worldName.."|"..item.name.."|"..tostring(item.price).."|Clicks"
@@ -2920,9 +2939,7 @@ function S.update(P, data, item, portalReady, canStart, owner, allowUnlocated)
     -- Once readiness was observed in time, the short ready window may finish just afterwards;
     -- it covers the actual portal/purchase check, not additional accumulation.
     if s.state ~= "ready" and s.saveUntil and now > s.saveUntil then
-        if not waitForProbeBlocker(P,s,now,true) then
-            release(P, "нужная сумма не была замечена в течение 10 минут; продолжу обычную стадию", RETRY)
-        end
+        release(P, "нужная сумма не замечена за час; продолжаю прокачку и позже переоценю", RETRY)
         return
     end
     if coins >= s.price then
@@ -2936,9 +2953,7 @@ function S.update(P, data, item, portalReady, canStart, owner, allowUnlocated)
         return
     end
     if s.saveUntil and now >= s.saveUntil then
-        if not waitForProbeBlocker(P,s,now,true) then
-            release(P, "за 10 минут нужная сумма не накопилась; продолжу обычную стадию", RETRY)
-        end
+        release(P, "за час нужная сумма не накопилась; продолжаю прокачку и позже переоценю", RETRY)
         return
     end
     if not canEstimate then
@@ -2946,80 +2961,36 @@ function S.update(P, data, item, portalReady, canStart, owner, allowUnlocated)
         return
     end
     if s.state == "ready" then s.priority=nil; toProbe(s, now, s.saveUntil ~= nil) end
-    if s.state == "probe" then
-        if s.lastSeenRb ~= nil and rebirths ~= s.lastSeenRb then
-            s.counterChanges = (s.counterChanges or 0) + 1
-            s.lastCounterChange = tostring(s.lastSeenRb) .. "->" .. tostring(rebirths)
-        end
-        s.lastSeenRb = rebirths
-    end
-    if s.state == "probe" and now >= (s.drainUntil or 0) then
-        if not waitForProbeBlocker(P,s,now,false) then
-            release(P, "не удалось получить короткий замер; отдельная пауза снята; последнее ожидание="
-                .. tostring(s.lastWait or "неизвестно") .. "; изменений счётчика=" .. tostring(s.counterChanges or 0)
-                .. (s.lastCounterChange and (", последнее=" .. s.lastCounterChange) or "")
-                .. "; сбросов начатого замера=" .. tostring(s.resets or 0), RETRY)
-        end
+    local wanted=mode(P)
+    if not wanted then
+        release(P,"для замера нужны Clicks и включённый кликер; данные результатов операций не требуются",RETRY)
         return
     end
-    local wanted = mode(P)
-    -- Existing workers mark a bounded watch after an egg/island/world send or
-    -- result. The server may replicate its wallet debit AFTER the result, even
-    -- while clicks hide a small debit in a positive net delta. Also watch after
-    -- an exact old egg uncertainty clears: its late reply may arrive after the
-    -- ordinary watch already expired. This is a heuristic, not proof of timing.
-    local eggOutstanding = P.previousHatchPending or P.hatchUncertain or Ui.hatchInFlight or Ui.eggRecoveryInFlight
-    if eggOutstanding then
-        s.waitedEgg, s.eggSettlingUntil = true, nil
-    elseif s.waitedEgg then
-        s.waitedEgg, s.eggSettlingUntil = false, now + 15
-    end
-    local run=type(Env.runState)=="table" and Env.runState or nil
-    local gg=run and type(run.goldenGuard)=="table" and run.goldenGuard or nil
-    local spendWatch = math.max(W.finite(P.farmSpendWatchUntil) or 0,
-        W.finite(gg and gg.lateWatchUntil) or 0, W.finite(run and run.goldenHandoverWatchUntil) or 0)
-    local reasons=drainReasons(P)
-    if not wanted then reasons[#reasons+1]="команда Clicks или кликер не готовы" end
-    if now < (tonumber(P.farmResetGraceUntil) or 0) then reasons[#reasons+1]="стабилизация реплики после ребёрта" end
-    if (spendWatch and now < spendWatch) or (s.eggSettlingUntil and now < s.eggSettlingUntil) then
-        reasons[#reasons+1]="ожидаю возможное позднее списание прошлой операции"
-    end
-    if #reasons>0 then
-        noteWait(P,s,table.concat(reasons, "; "),now)
-        s.sampleAt, s.quietAt = nil, nil
+    local f=P.portalPositiveFlow
+    if not f then return end
+    local team=teamKey(data)
+    if not s.flowAnchor or s.flowWorld~=P.worldName then
+        s.flowWorld=P.worldName;s.flowAnchor=G.anchor(f,now)
+        log(P,"начат10с замер суммы положительных изменений; старые результаты операций не ожидаются, падения баланса не вычитаются")
         return
     end
-    -- Allow replica updates from already-finished requests to settle before the baseline.
-    if not s.quietAt then s.quietAt = now; s.sampleAt = nil; s.lastWait = "две секунды стабилизации"; return end
-    if now - s.quietAt < 2 then return end
-    local team = teamKey(data)
-    if not s.sampleAt then
-        s.lastWait = "десятисекундный замер после известных операций"
-        resetSample(s, now, coins, rebirths, wanted, team); return
-    end
-    local tolerance = math.max(coins, s.lastCoins or 0, s.sampleCoins or 0) * 2e-15
-    if rebirths ~= s.sampleRebirths or wanted ~= s.mode or team ~= s.team or coins + tolerance < (s.lastCoins or coins) then
-        local reasons = {}
-        if rebirths ~= s.sampleRebirths then reasons[#reasons+1] = "ребёрты" end
-        if wanted ~= s.mode then reasons[#reasons+1] = "режим" end
-        if team ~= s.team then reasons[#reasons+1] = "команда" end
-        if coins + tolerance < (s.lastCoins or coins) then reasons[#reasons+1] = "снижение баланса" end
-        s.lastWait = "сброс замера: " .. table.concat(reasons, ",")
-        s.resets += 1
-        if s.resets > 2 then release(P, "баланс, команда или ребёрты меняются; замер недостоверен", RETRY); return end
-        toProbe(s, now, s.saveUntil ~= nil)
-        return
-    end
-    s.lastCoins = coins
-    local seconds = now - s.sampleAt
-    if seconds < WINDOW then return end
-    local rate = math.max(0, (coins - s.sampleCoins - tolerance) / seconds)
-    s.lastRate, s.lastRateAt = rate, now
+    if now-s.flowAnchor.at<WINDOW then return end
+    local measurement=G.window(f,now,s.flowAnchor)
+    if not measurement then return end
+    local rate=measurement.rate
+    s.flowAnchor=G.anchor(f,now)
+    s.lastRate,s.lastRateAt=rate,now
+    P.portalFlowMeasurement=measurement;P.portalFlowMeasurement.at=now
+    P.incomeByMode=P.incomeByMode or {}
+    P.incomeByMode.Clicks={value=rate,at=now,kind="gross positive observed flow; drops ignored"}
+    P.income=rate
+    log(P,string.format("замер завершён: +%.0f за%.1fс = %.0f/с; падений=%d, проигнорировано %.0f; это валовый приток, не гарантия чистого заработка",
+        measurement.grossPositive,measurement.seconds,rate,measurement.drops,measurement.ignoredNegative))
     if s.state == "probe" then
         local eta = rate > 0 and (s.price - coins) / rate or math.huge
         s.lastEta = eta < math.huge and math.max(0,eta) or nil
         local deadline = s.saveUntil or (now + MAX_SAVE)
-        -- A first clean ETA of at most ten minutes is accepted. After saving starts,
+        -- A first observed ETA of at most one hour is accepted. After saving starts,
         -- a probe/reset preserves the same deadline rather than granting another period.
         local timeLeft = math.max(0, deadline - now)
         if eta > timeLeft + math.max(0.001, timeLeft * 1e-9) or eta ~= eta then
@@ -3031,7 +3002,6 @@ function S.update(P, data, item, portalReady, canStart, owner, allowUnlocated)
         end
         s.state, s.saveUntil, s.slowWindows = "saving", deadline, 0
         s.nextRateLog = now + 60
-        resetSample(s, now, coins, rebirths, wanted, team)
         local qualifier = "; это наблюдаемый прирост, а не гарантия отсутствия более поздних списаний"
         if P.worldTravelUncertain then qualifier ..= "; вход в мир ещё не подтверждён" end
         if team == "unavailable" then qualifier ..= "; состав команды в реплике не определён" end
@@ -3049,9 +3019,8 @@ function S.update(P, data, item, portalReady, canStart, owner, allowUnlocated)
         s.nextRateLog = now + 60
     end
     if eta > remainingTime + 20 then s.slowWindows = (s.slowWindows or 0) + 1 else s.slowWindows = 0 end
-    resetSample(s, now, coins, rebirths, wanted, team)
     if s.slowWindows >= 2 then
-        release(P, "доход упал: срок больше 10 минут; отдельная пауза снята", RETRY)
+        release(P, "доход упал: не укладывается в остаток часового накопления; отдельная пауза снята", RETRY)
     end
 end
 function S.startupGate(P)
@@ -3129,7 +3098,7 @@ if type(Life.loop)=="function" then
             end
         elseif s.state=="saving" and s.saveUntil and now>=s.saveUntil then
             if not waitForProbeBlocker(P,s,now,true) then
-                release(P,"покупка не подтверждена в пределах 10 минут; отдельная пауза снята",RETRY)
+                release(P,"покупка не подтверждена в пределах часа; отдельная пауза снята",RETRY)
             end
         end
     end)
@@ -4298,6 +4267,236 @@ local function invalidateFocus(P, data, guard)
     end
 end
 
+-- ROYAL-ROUTE-10: finite intermediate-egg experiments, not an endless hatch loop.
+-- No pet/inventory matching is used to acknowledge Golden. Only observed wallet
+-- windows with a fixed rebirth count may compare the effect of a whole series.
+local routePlans = {}
+local function routeLive(P,data)
+    return Ui.__royalRoutePolicy==true and type(P)=="table" and Life.alive and Ui.__progressTest==P
+        and not Ui.__globalStop and not Ui.__handoverPaused and not P.stopRequested
+        and not P.worldChanging and W.isCurrent(P,data)
+end
+local function routeGoal(current,P)
+    if P.royalFinal or P.finalizing or P.eggFixed or P.rebirthLocked or P.royalReachedEgg then return true end
+    local royal=type(eggCatalog)=="table" and eggCatalog.Royal
+    return current.world=="TimeRift" and type(royal)=="table" and royal.world=="TimeRift" and royal.island~=nil
+        and resolve(current.islands,royal.island)==current.verifiedName
+end
+local function routePhase(P,q,stage,now)
+    q.stage,q.at,q.sample,q.lastTick=stage,now,nil,now
+    if stage=="burst" then
+        q.sent,q.successes,q.used,q.cap,q.lastToken=0,0,0,nil,nil
+        q.lastCost,q.quoteUnit=nil,nil
+    end
+
+end
+local function routeState(P,data,current)
+    if not routeLive(P,data) then return nil end
+    current=current or context(P,data)
+    if not current or not routeLive(P,data) then return nil end
+    P.royalRouteAtGoal=routeGoal(current,P)
+    if P.royalRouteAtGoal then P.royalRoute=nil;return nil end
+    local q=routePlans[current.world]
+    if q and q.island~=current.verifiedName then q=nil;routePlans[current.world]=nil end
+    -- The first confirmed egg keeps the existing 120s / <=600s saving policy.
+    if not q and current.trial.lastSuccessAt~=nil then
+        q={world=current.world,island=current.verifiedName,weak=0,farmFor=120}
+        routePlans[current.world]=q;routePhase(P,q,"burst",os.clock())
+        q.successes=1 -- the first accepted egg is already part of this experiment
+    end
+    P.royalRoute=q
+    return q
+end
+local function routeRate(P,now)
+    local s=type(P.incomeByMode)=="table" and P.incomeByMode.Clicks
+    local rate=type(s)=="table" and W.finite(s.value)
+    local at=type(s)=="table" and W.finite(s.at)
+    if rate and rate>0 and at and now>=at and now-at<=30 then return rate end
+end
+local function routeNear(P,data,now)
+    local t=P.royalRouteTarget
+    local rate=routeRate(P,now);local coins=W.coins(data)
+    if type(t)~="table" or t.world~=P.worldName or t.fromIsland==nil or t.fromIsland~=P.islandEggVerified or not W.finite(t.price) or t.price<=0
+        or not W.finite(t.at) or now<t.at or now-t.at>5 or not coins then return false end
+    return coins>=t.price or (rate~=nil and (t.price-coins)/rate<=3600)
+end
+-- This mutates only local experiment state. It cannot cancel a sent request.
+function F.routeTick(P,data,team)
+    local q=routeState(P,data)
+    if not q then return end
+    local now=os.clock()
+    if now<(q.lastTick or now) then q.at=now;q.sample=nil end
+    local dt=math.max(0,now-(q.lastTick or now));q.lastTick=now
+    -- Portal work has independent priority and does not consume an experiment.
+    if P.portalSaving or P.portalModeWaitUntil and now<P.portalModeWaitUntil
+        or P.worldPortalCheckUntil and now<P.worldPortalCheckUntil or Ui.travelling then
+        q.at=q.at+dt;q.sample=nil;return
+    end
+    if q.stage=="farm" then
+        if now-q.at>=q.farmFor then routePhase(P,q,"baseline",now) end
+        return
+    end
+    if q.stage=="burst" then
+        if not q.quoteUnit and savingQuote then
+            local ok,price=pcall(savingQuote,P,data)
+            if not routeLive(P,data) or P.royalRoute~=q or P.islandEggVerified~=q.island
+                or P.worldName~=q.world or P.portalSaving then return end
+            now=os.clock()
+            price=ok and W.finite(price) or nil
+            if price and price>0 then q.quoteUnit=price end
+        end
+        if q.successes>=6 or q.sent>=6 or now-q.at>=60 or (q.cap and q.used>=q.cap) then
+            routePhase(P,q,"evaluate",now)
+        end
+        return
+    end
+    local timeout=now-q.at>=45
+    local rb,coins=W.rebirths(data),W.coins(data)
+    local safe=team~=nil and rb~=nil and coins~=nil and not P.pending and not P.previousRebirthPending
+        and not P.previousOtherWorldRebirthPending and not P.ambiguousRiftRebirth
+        and not P.previousHatchPending and not P.hatchUncertain and not Ui.hatchInFlight
+        and not P.previousCraftPending and not P.craftUncertain and not P.craftBusy and not P.craftInFlight
+        and not P.upgradeInFlight and not P.skillInFlight and not P.cleaning
+        and not P.cleanUncertain and not P.equipUncertain and not P.upgradeUncertain and not P.skillUncertain
+        and not P.previousIslandPending and not P.islandUncertain and not P.islandTravelUncertain
+        and now>=(P.farmSpendWatchUntil or 0) and now>=(P.farmResetGraceUntil or 0)
+        and Ui.Options and Ui.Options.EquipMode and Ui.Options.EquipMode.Value=="Clicks"
+    local measured
+    if not safe then q.sample=nil
+    else
+        local s=q.sample
+        if not s or s.rb~=rb or s.team~=team or coins<s.lastCoins then
+            q.sample={at=now,coins=coins,lastCoins=coins,rb=rb,team=team}
+        else
+            s.lastCoins=coins
+            if now-s.at>=10 then
+                measured=math.max(0,(coins-s.coins)/(now-s.at))
+                q.sample=nil
+                if measured>0 then
+                    P.incomeByMode=P.incomeByMode or {}
+                    P.incomeByMode.Clicks={value=measured,at=now,kind="route-clean observed"}
+                end
+            end
+        end
+    end
+    if measured==nil and not timeout then return end
+    if q.stage=="baseline" then
+        q.baseRate,q.baseRb=measured,rb
+        routePhase(P,q,"burst",now)
+    else
+        local comparable=measured~=nil and q.baseRate~=nil and q.baseRate>0 and q.baseRb==rb
+        q.gain=comparable and (measured/q.baseRate-1) or nil
+        local target=P.royalRouteTarget
+        q.payback=comparable and measured>q.baseRate and q.used/(measured-q.baseRate) or nil
+        local horizon=type(target)=="table" and target.world==P.worldName and target.fromIsland==P.islandEggVerified and now>=target.at
+            and now-target.at<=5 and measured and measured>0 and math.max(0,(target.price-coins)/measured) or nil
+        q.result=q.gain and (q.gain>=0.05 and "gain" or "weak") or "unknown"
+        if q.result=="gain" and horizon and q.payback and q.payback>horizon then q.result="weak" end
+        if q.result=="gain" then q.weak=0
+        else q.weak=math.min(3,(q.weak or 0)+1) end
+        q.farmFor=math.min(600,120*2^q.weak)
+        q.baseRate,q.baseRb=nil,nil
+        routePhase(P,q,"farm",now)
+        if type(P.log)=="function" then
+            P.log("путь к Royal: серия завершена; усиление="
+                ..(q.gain and string.format("%.1f%% при том же счётчике rebirth",q.gain*100) or "не измерено; прибыль не приписываю")
+                ..(q.payback and string.format("; наблюдаемая окупаемость бюджета серии %.0f с",q.payback) or "")
+                .."; Golden/EquipBest разрешены, следующая серия не раньше "..tostring(q.farmFor).." с")
+        end
+    end
+end
+function F.routeEggAllowed(P,data,egg)
+    if Ui.__royalRoutePolicy~=true then return true end
+    if not routeLive(P,data) then return false end
+    routeState(P,data)
+    return not P.royalRouteAtGoal or egg=="Royal"
+end
+function F.routeHatchAllowed(P,data,cost,unit,egg)
+    if Ui.__royalRoutePolicy~=true then return true end
+    if not routeLive(P,data) then return false,"путь к Royal: контекст изменился" end
+    local q=routeState(P,data)
+    if P.royalRouteAtGoal and egg~=nil and egg~="" and egg~="Royal" then
+        return false,"путь к Royal: на этом острове коплю только на Royal Egg"
+    end
+    if P.royalRouteAtGoal or P.royalFinal or P.finalizing or P.eggFixed or P.rebirthLocked or P.royalReachedEgg then return true end
+    if routeNear(P,data,os.clock()) then return false,"путь к Royal: портал близко, новую серию яиц не начинаю" end
+    if not q then return true end
+    if q.stage~="burst" then return false,"путь к Royal: "..q.stage..", промежуточные яйца на паузе" end
+    if q.sent>=6 or q.successes>=6 or os.clock()-q.at>=60 then return false,"путь к Royal: лимит серии" end
+    if cost~=nil then
+        cost=W.finite(cost);unit=W.finite(unit)
+        if not cost or cost<=0 or not unit or unit<=0 then return false,"путь к Royal: нет цены" end
+        if not q.quoteUnit then return false,"путь к Royal: жду цену бюджета серии" end
+        local cap=q.cap
+        if not cap then
+            local coins=W.coins(data);if not coins then return false,"нет баланса" end
+            local rate=routeRate(P,os.clock())
+            cap=math.max(q.quoteUnit,math.min(coins*0.25,rate and rate*30 or coins*0.25))
+        end
+        if cost>(cap-q.used) then return false,"путь к Royal: бюджет серии исчерпан" end
+    end
+    return true
+end
+function F.routeRecordSend(P,token,cost,unit,data)
+    if Ui.__royalRoutePolicy~=true then return true end
+    if not routeLive(P,data) then return false end
+    local q=P.royalRoute
+    if not q then return true end
+    if q.world~=P.worldName or q.island~=P.islandEggVerified or q.stage~="burst" then return false end
+    if q.lastToken==token or q.successes>=6 or os.clock()-q.at>=60 then return false end
+    cost,unit=W.finite(cost),W.finite(unit)
+    -- All potentially yielding access/price checks finished in the final coroutine.
+    if not q.quoteUnit then return false end
+    if not q.cap then
+        local coins=W.coins(data);local rate=routeRate(P,os.clock())
+        if not coins or not unit or unit<=0 then return false end
+        q.cap=math.max(q.quoteUnit,math.min(coins*0.25,rate and rate*30 or coins*0.25))
+    end
+    if not cost or cost<=0 or q.used+cost>q.cap or q.sent>=6 then return false end
+    q.used+=cost;q.sent+=1;q.lastToken=token;q.lastCost=cost
+    return true
+end
+function F.routeSuccess(P,world,island,token)
+    local q=type(P)=="table" and P.royalRoute
+    if q and q.world==world and q.island==island and q.lastToken==token and token~=nil
+        and q.lastSuccessToken~=token then
+        q.lastSuccessToken=token;q.successes+=1
+    end
+end
+function F.routeRebirthHold(P,data,current)
+    if Ui.__royalRoutePolicy~=true then return nil end
+    local q=routeState(P,data,current)
+    if not q then return nil end
+    if q.stage=="farm" then return false end
+    -- A burst never monopolizes rebirth for longer than 60s; measurement stages
+    -- are bounded at 45s. Sent operations retain their own independent guards.
+    return true,"путь к Royal: "..q.stage.."; Golden/EquipBest и приоритет портала сохранены"
+end
+function F.routeReport(P,data)
+    if Ui.__royalRoutePolicy~=true then return end
+    local q=P.royalRoute;local now=os.clock();local coins=W.coins(data)
+    local t=P.royalRouteTarget;local rate=routeRate(P,now)
+    local eta="не определён"
+    if type(t)=="table" and t.world==P.worldName and t.fromIsland==P.islandEggVerified and now>=t.at and now-t.at<=5 and coins then
+        if coins>=t.price then eta="готово"
+        elseif rate then eta=string.format("%.0f с БЕЗ новых расходов",(t.price-coins)/rate) end
+    end
+    local net="ещё нет интервала"
+    local prev=P.royalRouteWallet
+    if coins and prev and prev.world==P.worldName and now>prev.at then
+        local v=(coins-prev.coins)/(now-prev.at)
+        net=string.format("%+.0f/с (включая расходы и сбросы)",v)
+    end
+    if coins then P.royalRouteWallet={coins=coins,at=now,world=P.worldName} end
+    if type(P.log)=="function" then
+        P.log("цель Royal Egg → Royal x3; режим="..tostring(q and q.stage or "первое яйцо / Royal")
+            ..(q and ("; отправок серии="..tostring(q.sent or 0).."/6; бюджет="..tostring(q.used or 0).."/"..tostring(q.cap or "жду цену")) or "")
+            .."; следующий переход="..tostring(t and t.name or "не подтверждён")
+            .."; чистое накопление="..eta.."; изменение кошелька="..net
+            .."; срок Royal по будущим островам не прогнозирую")
+    end
+end
+
 function F.allows(P, data, eggIsland)
     local current, why = context(P, data)
     if not current then invalidateFocus(P, data); return false, why end
@@ -4358,6 +4557,12 @@ function F.rebirthHold(P, data)
         return true, "остров яиц не определён: " .. tostring(why)
     end
     local trial, island = current.trial, current.verifiedName
+    local routeHold,routeReason=F.routeRebirthHold(P,data,current)
+    if routeHold~=nil then
+        trial.status,trial.budgetDecisionAt=routeHold and "route_pause" or "route_farm",os.clock()
+        P.islandEggHoldReason=routeReason
+        return routeHold,routeReason
+    end
     -- A success grants another ordinary-farm interval, not a permanent exemption.
     if trial.lastSuccessAt and trial.elapsed < FIRST_EGG_TRIAL_SECONDS then
         trial.status, P.islandEggHoldReason = "complete", nil
@@ -4401,6 +4606,11 @@ function F.rebirthSendReady(P, now)
     local elapsedClock, running = sampleClock(P, now, true)
     if not running then return false end
     trial.elapsed = math.max(0, elapsedClock - trial.startedAt)
+    if trial.status == "route_farm" then
+        local q=P.royalRoute
+        return Ui.__royalRoutePolicy==true and q~=nil and q.world==P.worldName
+            and q.island==P.islandEggVerified and q.stage=="farm" and now>=q.at and now-q.at<q.farmFor
+    end
     if trial.status == "complete" then return trial.lastSuccessAt ~= nil and trial.elapsed < FIRST_EGG_TRIAL_SECONDS end
     if trial.status == "no_egg" then return true end
     if trial.status == "budget_farm" then
@@ -4429,6 +4639,7 @@ function F.confirmSuccess(P, world, island, token)
     if type(trial)=="table" and trial.world==world and trial.island==name
         and P.islandEggVerified==name then
         if token ~= nil and trial.lastSuccessToken == token then return true end
+        F.routeSuccess(P,world,name,token)
         local clock = P.islandEggClock
         local elapsedClock = sampleClock(P, os.clock(), type(clock)=="table" and clock.worldValid==true)
         trial.startedAt, trial.lastSuccessAt = elapsedClock, elapsedClock
@@ -5287,7 +5498,7 @@ function Router.start(emit)
         log("активна отдельная прогрессия TimeRift: RiftCoins, RiftGems и RiftRebirths; Main больше не фармится")
         return true
     end
-    log("сборка V16-LIVE-EGG-ETA-8: прямой возврат к живому World2Portal, результат только по реплике")
+    log("сборка V16-LIVE-FLOW-12: прямой возврат к живому World2Portal, результат только по реплике")
     local stageName,stageAt="ожидание",os.clock()
     local function stage(name) stageName,stageAt=name,os.clock() end
     -- World-2 purchase is distinct from the already-journaled physical portal touch.
@@ -11624,14 +11835,18 @@ local function hatchCount(data, egg)
     if P then
         if P.phase == "rebirth" and not targetMode(P) and not P.farmThresholdReached then
             local slots = progressFreeSlots(data)
+            local unit=progressBatchPrice(data,egg,1)
+            local function fits(price)
+                return price and price<=coins and IslandEggFocus.routeHatchAllowed(P,data,price,unit,egg)
+            end
             if egg ~= "Royal" and slots >= 8 and canOcto(data) then
                 local eight = progressBatchPrice(data, egg, 8)
-                if eight and eight <= coins then return 8 end
+                if fits(eight) then return 8 end
             end
             local three = slots >= 3 and progressBatchPrice(data, egg, 3) or nil
-            if three and three <= coins then return 3 end
+            if fits(three) then return 3 end
             local one = slots >= 1 and progressBatchPrice(data, egg, 1) or nil
-            if one and one <= coins then return 1 end
+            if fits(one) then return 1 end
             return nil
         end
         if P.phase == "hatch" and targetMode(P) then
@@ -12103,7 +12318,8 @@ IslandEggFocus.setSavingQuote(function(P,data)
     local lowest,name
     for _,egg in ipairs(eggsByPrice(data)) do
         local def=EGGS[egg]
-        if def and def.price>=(P.farmEggFloor or 0) and W.coinPricing(def.raw) then
+        if def and def.price>=(P.farmEggFloor or 0) and W.coinPricing(def.raw)
+            and IslandEggFocus.routeEggAllowed(P,data,egg) then
             local price=progressBatchPrice(data,egg,1)
             if price and price>0 and (not lowest or price<lowest) then lowest,name=price,egg end
         end
@@ -12652,6 +12868,8 @@ local function hatchDenied(P, egg, count)
     if P.stopRequested then return "нажата остановка" end
     if P.worldChanging or not W.isCurrent(P, snapshot) then return "смена мира / нет подтверждения текущего мира" end
     if P.finalizing then return "закрепляю Royal x3" end
+    local routeAllowed,routeReason=IslandEggFocus.routeHatchAllowed(P,snapshot,nil,nil,egg)
+    if not routeAllowed then return routeReason end
     if not P.royalFinal and type(P.portalPriorityDue)=="function" then
         local checked,due=pcall(P.portalPriorityDue,P,snapshot)
         if not checked or Ui.__progressTest~=P or due then return "следующий доступный остров имеет приоритет" end
@@ -12960,7 +13178,10 @@ local function hatch(egg, count, worker)
         local latest=Env.data()
         local def=EGGS[egg]
         local valid=def and IslandEggFocus.allows(P,latest,def.island)
-        return valid==true and Life.alive and Ui.__progressTest==P and not Ui.__globalStop
+        local unit=def and progressBatchPrice(latest,egg,1)
+        slot.routeUnit=unit
+        local routeAllowed=IslandEggFocus.routeHatchAllowed(P,latest,expected,unit,egg)
+        return valid==true and routeAllowed==true and Life.alive and Ui.__progressTest==P and not Ui.__globalStop
             and not P.stopRequested and not P.worldChanging and W.isCurrent(P,latest)
             and P.portalEpoch==hatchEpoch and not slot.cancelled and waiting==slot and P.portalHatchSlot==slot
             and not P.portalSaving and not Ui.travelling
@@ -12972,6 +13193,9 @@ local function hatch(egg, count, worker)
         return cancelPrepared("последняя проверка острова уступила поток")
     end
     if not checked or focusAllowed~=true then return cancelPrepared("остров яйца изменился перед отправкой") end
+    if not IslandEggFocus.routeRecordSend(P,token,expected,slot.routeUnit,finalData) then
+        return cancelPrepared("бюджет серии изменился перед отправкой")
+    end
     slot.island=EGGS[egg].island
     pendingEggFloor[token]={egg=egg,price=slot.basePrice,world=slot.world,island=slot.island}
     slot.sent, slot.sentAt = true, os.clock()
@@ -22297,6 +22521,7 @@ stopOtherFarm("__RIFT_ROYAL_FARM","stopRiftRoyalFarm","RIFT-ROYAL")
 local Life = use("shared/life")
 local Ui = use("core/ui")
 
+Ui.__royalRoutePolicy = true -- intermediate spending exists only to reach Royal Egg
 -- Защита с самого начала, ДО запуска модулей и автозагрузки старых настроек.
 -- Тест запускать на свежем входе в игру, не во время открытого трейда.
 Ui.__progressTest = {
@@ -36188,6 +36413,125 @@ end
 -- Контроллер прогрессии: Clicks и лучшие доступные яйца без порогов дохода.
 -- Ребёрт не чаще раза в 20 секунд до подтверждённого финала Royal x3.
 -- Следующая партия отправляется после подтверждённого ответа; скорость сервера не предполагается.
+__modules["features/adaptive_rebirth"] = function(use)
+local C=(function()
+local C={}
+function C.number(n)return type(n)=="number" and n==n and n>=0 and n<math.huge and n or nil end
+function C.median(a)local t=table.clone(a);table.sort(t);local n=#t;if n==0 then return nil end;return n%2==1 and t[(n+1)/2]or(t[n/2]+t[n/2+1])/2 end
+-- A wallet is wiped at dispatch: steady-cycle time is price/rate, NOT merely
+-- the deficit divided by rate. Balance is used only for the next dispatch ETA.
+function C.choose(options,balance,rate,gap,maxWait)
+ if not C.number(balance) or not C.number(rate) or rate<=0 or not C.number(gap) or gap<20 then return nil,"no_rate"end
+ maxWait=maxWait or 600
+ local rows={};local bestScore=0;local affordable
+ for _,o in ipairs(options or {})do
+  local amount,price,index=C.number(o.amount),C.number(o.price),C.number(o.index)
+  if not amount or amount<1 or not price or price<=0 or not index or index<1 then return nil,"invalid_quotes"end
+  local eta=math.max(0,price-balance)/rate
+  local cycle=math.max(gap,price/rate);local score=amount/cycle
+  if price<=balance and(not affordable or amount>affordable.amount)then affordable=o end
+  if eta<=maxWait then rows[#rows+1]={index=index,amount=amount,price=price,eta=eta,cycle=cycle,score=score};bestScore=math.max(bestScore,score)end
+ end
+ if not affordable then return nil,"no_affordable"end
+ local target
+ for _,o in ipairs(rows)do
+  -- Within 3% of best, prefer the earliest purchase, not the largest wait.
+  if o.score>=bestScore*.97 and (not target or o.eta<target.eta or o.eta==target.eta and o.amount<target.amount)then target=o end
+ end
+ if not target then return nil,"no_horizon"end
+ local currentScore=affordable.amount/math.max(gap,affordable.price/rate)
+ -- Existing surplus is not discarded just to satisfy a model. If the target
+ -- is already reachable, dispatch the maximum currently affordable packet.
+ local hold=target.amount>affordable.amount and target.eta>0 and target.score>currentScore*1.05
+ return {hold=hold,target=target,current=affordable,currentScore=currentScore,rate=rate,
+  improvement=target.score/math.max(currentScore,1e-30)-1,model="wallet_wipe_cycle_price_over_rate_not_global_optimum"}
+end
+return C
+
+end)()
+local Env,Ui,W,Life=use("core/env"),use("core/ui"),use("features/world_data"),use("shared/life")
+local A={}
+local function team(data)
+ local eq=data.Pets and data.Pets.Equipped
+ if type(eq)~="table"then return nil end
+ local t={}
+ for k,v in pairs(eq)do
+  local id=type(v)=="table"and(v.Id or v.PetId or v.PetID)or(v==true and k or v)
+  if type(id)~="number"and type(id)~="string"then return nil end
+  t[#t+1]=tostring(id)
+ end
+ if #t==0 then return nil end;table.sort(t);return table.concat(t,"|")
+end
+function A.observe(P,data,now)
+ if P.worldName~="TimeRift"or not W.isCurrent(P,data)then return end
+ local coins,rb=W.coins(data),W.rebirths(data);local sig=team(data)
+ local s=P.adaptiveIncome
+ if not s or s.rb~=rb or s.team~=sig then s={rb=rb,team=sig,rates={}};P.adaptiveIncome=s end
+ if not coins or not rb or not sig or P.pending or P.previousRebirthPending or P.previousHatchPending
+  or P.craftInFlight or P.craftBusy or P.cleaning or Ui.hatchInFlight or Ui.hatchMoving or Ui.travelling
+  or P.upgradeInFlight or P.skillInFlight or P.worldChanging or P.stopRequested
+  or now<(P.farmSpendWatchUntil or 0)or now<(P.farmResetGraceUntil or 0)then s.window=nil;return end
+ local w=s.window
+ if not w or coins<w.last or now<w.at then s.window={at=now,coins=coins,last=coins};return end
+ w.last=coins
+ if now-w.at>=5 then
+  local rate=(coins-w.coins)/(now-w.at);s.window={at=now,coins=coins,last=coins}
+  if rate>0 then
+   s.rates[#s.rates+1]=rate;if #s.rates>5 then table.remove(s.rates,1)end
+   if #s.rates>=2 then
+    local med=C.median(s.rates);local lo,hi=math.huge,0
+    for _,n in ipairs(s.rates)do lo=math.min(lo,n);hi=math.max(hi,n)end
+    s.spread=(hi-lo)/med
+    if s.spread<=.25 then s.rate=med;s.at=now end
+   end
+  end
+ end
+end
+local function rate(P,now)
+ local s=P.adaptiveIncome
+ if s and s.rate and s.at and now>=s.at and now-s.at<=20 then return s.rate,"observed quiet windows"end
+ local v=P.incomeByMode and P.incomeByMode.Clicks
+ if v and C.number(v.value)and v.value>0 and C.number(v.at)and now>=v.at and now-v.at<=20 then
+  return v.value,"production Clicks estimate"
+ end
+end
+function A.plan(P,data,now)
+ if P.worldName~="TimeRift"or not W.isCurrent(P,data)or Ui.__progressTest~=P then return false end
+ local item=P.riftPackCandidate
+ if not item or item.rebirths~=W.rebirths(data)then P.adaptiveRebirth=nil;return false end
+ local r,source=rate(P,now)
+ if not r then P.adaptiveRebirth=nil;return false end
+ local horizon=600;local q=P.royalRoute
+ if q and q.stage=="farm"then horizon=math.max(0,math.min(horizon,q.at+q.farmFor-now-2))end
+ local choice,why=C.choose(item.options,W.coins(data),r,20,horizon)
+ if not choice then P.adaptiveRebirth=nil;P.adaptiveRebirthReason=why;return false end
+ choice.at=now;choice.rb=item.rebirths;choice.level=item.buttonsLevel;choice.world=P.worldName;choice.rateSource=source
+ P.adaptiveRebirth=choice
+ if now>=(P.nextAdaptiveRebirthLog or 0)then
+  P.nextAdaptiveRebirthLog=now+15
+  if type(P.log)=="function"then P.log(string.format("адаптивный rebirth: сейчас максимум +%s; модельная цель +%s, ожидание %.1fс; цикл %.1fс, %.2f rebirth/с; %s",
+   tostring(choice.current.amount),tostring(choice.target.amount),choice.target.eta,choice.target.cycle,choice.target.score,
+   choice.hold and "коплю; яйца/портал сохраняют свои приоритеты"or"отправлю максимальный доступный после всех проверок"))end
+ end
+ return choice.hold
+end
+-- Non-yielding final boundary: never authorize a stale wait plan after a
+-- price/level/replica change. Transaction ownership remains with production.
+function A.ready(P,data,now)
+ if P.worldName~="TimeRift"then return true end
+ if Ui.__progressTest~=P or not Life.alive or Ui.__globalStop or P.stopRequested or P.worldChanging or not W.isCurrent(P,data)then return false end
+ local p=P.adaptiveRebirth;if not p then return true end
+ local q=P.riftPackCandidate
+ if now<p.at or now-p.at>3 or not q or q.rebirths~=p.rb or W.rebirths(data)~=p.rb or q.buttonsLevel~=p.level then return false end
+ if not p.hold then return true end
+ for _,o in ipairs(q.options or {})do
+  if o.index==p.target.index and o.amount==p.target.amount then return W.coins(data)>=o.price and q.amount>=o.amount end
+ end
+ return false
+end
+return A
+
+end
 __modules["features/progress_test"] = function(use)
     local Env = use("core/env")
     local Life = use("shared/life")
@@ -36199,6 +36543,7 @@ __modules["features/progress_test"] = function(use)
     local Journal = use("features/operation_journal")
     local EggRecovery = use("features/egg_recovery")
     local IslandEggFocus = use("features/island_egg_focus")
+    local AdaptiveRebirth = use("features/adaptive_rebirth")
 
     local WINDOW = 10 -- informational, no threshold or scheduled pause
     local START_SETTLE = 7
@@ -36378,6 +36723,16 @@ __modules["features/progress_test"] = function(use)
             if P.pending==request then P.pending=nil end
             return true
         end
+        -- Single writer: only this script sends rebirths. Consume an exact replica
+        -- transition once; result events are advisory (no request ID, may duplicate).
+        local function riftReplicaConfirmed(request,rebirths)
+            if type(request)~="table" or request.dispatched~=true or request.replicaConsumed==true
+                or request.world~="TimeRift" then return false end
+            local before,amount,after=number(request.before),number(request.amount),number(rebirths)
+            return before~=nil and amount~=nil and after~=nil
+                and before>=0 and amount>0 and before%1==0 and amount%1==0
+                and before+amount<=MAX_SAFE_INTEGER and after==before+amount
+        end
         local function clearConfirmedPending(request,slot)
             local snapshot=Env.data() -- may yield: recheck the exact owner and world afterward
             if not Life.alive or Ui.__progressTest~=P or P[slot]~=request or P.stopRequested
@@ -36386,11 +36741,10 @@ __modules["features/progress_test"] = function(use)
                     or P.routePendingMainRebirth or P.detachedMainRebirth)) then return nil end
             if worldState.rebirthPending~=request then return false,"ожидание ребёрта изменилось" end
             if world=="TimeRift" then
-                local before,amount=number(request.before),number(request.amount)
-                if not before or not amount or not request.riftEvidence or request.riftConflict
-                    or W.rebirths(snapshot)~=before+amount then return nil end
+                if not riftReplicaConfirmed(request,W.rebirths(snapshot)) then return nil end
             end
             worldState.rebirthPending=nil
+            request.replicaConsumed=true
             return true
         end
 
@@ -36453,7 +36807,7 @@ __modules["features/progress_test"] = function(use)
         P.remoteError = nil
 
         local function log(text)
-            emit("progress", "[ПРОГРЕССИЯ v16 LIVE-EGG-ETA-8 " .. world .. "] " .. tostring(text))
+            emit("progress", "[ПРОГРЕССИЯ v16 LIVE-FLOW-12 " .. world .. "] " .. tostring(text))
         end
         P.log = log
         local function parkRiftRebirth(request)
@@ -36726,6 +37080,7 @@ __modules["features/progress_test"] = function(use)
                 P.royalFinal and "замеры выключены" or (P.income and string.format("%.0f", P.income) or "измеряю"),
                 "Royal x3",
                 tostring(P.eggGoal or "ищу"), tostring(P.confirmedBatches or 0), actual, tostring(P.note)))
+            IslandEggFocus.routeReport(P,Env.data())
             local trial = P.islandEggTrial
             if type(trial) == "table" and (trial.status == "grace" or trial.status == "complete") then
                 log(string.format("цикл яиц %s: %d/120 с обычного фарма без нового Success; ребёрт дополнительно проверяется перед отправкой",
@@ -36750,7 +37105,7 @@ __modules["features/progress_test"] = function(use)
             end
             if P.lastRebirthPack then
                 local r = P.lastRebirthPack
-                log(string.format("последнее совпадение со счётчиком (источник не доказан): кнопка=%s, заявлено x%s, реально +%s, цена=%s",
+                log(string.format("последний подтверждённый ребёрт: кнопка=%s, заявлено x%s, реально +%s, цена=%s",
                     tostring(r.index), tostring(r.amount), tostring(r.actual), tostring(r.price)))
             end
             local gems = W.gems(data)
@@ -36845,8 +37200,8 @@ __modules["features/progress_test"] = function(use)
 
         -- The exact request path was exercised in the user's one-shot probe. Resolve
         -- both RemoteEvents uniquely and connect the result listener before any send.
-        -- RebirthResult has no request ID in the observed game response. Even an exact
-        -- field match plus replica delta is corroboration, not proof of origin.
+        -- RebirthResult has no request ID. Keep event diagnostics, but only the
+        -- exact single-flight replica transition settles the request.
         local function riftOnlyChild(parent,name)
             if not parent then return nil end
             local ok,children=pcall(function() return parent:GetChildren() end)
@@ -36890,7 +37245,7 @@ __modules["features/progress_test"] = function(use)
                     request.riftConflict=true
                     if not request.riftConflictNoted then
                         request.riftConflictNoted=true
-                        log("Rift RebirthResult не совпал или пришло больше одного события; связь неизвестна, повтор запрещён")
+                        log("Rift RebirthResult неоднозначен; жду точный прирост счётчика, до него новый запрос не отправляю")
                     end
                 else
                     request.riftEvidence={index=request.index,amount=request.amount,price=request.price,
@@ -36948,14 +37303,7 @@ __modules["features/progress_test"] = function(use)
             -- This increment could be the delayed old Main request in the new world.
             -- Return a distinct outcome: parked is not a server confirmation.
             if parkRiftRebirth(request) then return "parked" end
-            if world=="TimeRift" and (not request.riftEvidence or request.riftConflict) then
-                if not request.riftEvidenceNoted then
-                    request.riftEvidenceNoted=true
-                    log("реплика RiftRebirths изменилась, но подходящего события нет или оно конфликтует; источник неизвестен, повтор запрещён")
-                end
-                return false
-            end
-            if world == "TimeRift" and (not request.amount or rebirths - request.before ~= request.amount) then
+            if world == "TimeRift" and not riftReplicaConfirmed(request,rebirths) then
                 if not request.mismatchNoted then
                     request.mismatchNoted = true
                     log("RiftRebirths изменился на +" .. tostring(rebirths-request.before)
@@ -36980,9 +37328,11 @@ __modules["features/progress_test"] = function(use)
                 return true
             end
             P.pending = nil
+            P.pendingRebirthNoted = nil
             P.confirmed += 1
             if world=="TimeRift" then
-                log("событие и прирост реплики совпали; продолжаю по этому наблюдению, но без ID источник строго не доказан")
+                log("Rift-ребёрт подтверждён точным приростом счётчика +" .. tostring(request.amount)
+                    .. "; RebirthResult не блокирует подтверждение")
             end
             -- Обновляем базовый снимок при КАЖДОМ своём подтверждении, а не только после timeout.
             P.farmPrevRebirths, P.farmPrevCoins = rebirths, coins
@@ -37031,7 +37381,7 @@ __modules["features/progress_test"] = function(use)
                     P.holdHatch, P.holdCraft, P.disableAutoCraft = false, false, false
                     P.holdUpgrades, P.holdSkillTree = false, false
                 end
-                phase("rebirth", (world=="TimeRift" and "событие и реплика совпали (ID нет)" or "ребёрт подтверждён")
+                phase("rebirth", (world=="TimeRift" and "ребёрт подтверждён точным приростом счётчика" or "ребёрт подтверждён")
                     .. "; следующий не раньше " .. tostring(currentRebirthGap()) .. " секунд после отправки")
             end
             return true
@@ -37372,6 +37722,14 @@ __modules["features/progress_test"] = function(use)
                 if Ui.__progressTest ~= P or P.stopRequested or P.worldChanging or Ui.__globalStop then return end
             end
             local data, rebirths, coins = readValues()
+            if data then
+                PortalSavings.observe(P,data,now)
+                AdaptiveRebirth.observe(P,data,now)
+            end
+            if Ui.__royalRoutePolicy==true and data and now>=(P.nextRoyalRouteTick or 0) then
+                P.nextRoyalRouteTick=now+1
+                IslandEggFocus.routeTick(P,data,teamSignature(data))
+            end
             if P.activeClock >= P.nextReport then
                 P.nextReport = P.activeClock + REPORT_SECONDS
                 status(rebirths, coins)
@@ -37407,14 +37765,7 @@ __modules["features/progress_test"] = function(use)
                 local previous=P.previousRebirthPending
                 local before = number(previous.before)
                 if before and rebirths and rebirths > before then
-                    if world=="TimeRift" and (not previous.riftEvidence or previous.riftConflict) then
-                        if not previous.riftEvidenceNoted then
-                            previous.riftEvidenceNoted=true
-                            log("для старого Rift-ожидания нет подходящего события; источник неизвестен, повтор запрещён")
-                        end
-                        return
-                    end
-                    if world == "TimeRift" and (not previous.amount or rebirths-before ~= previous.amount) then
+                    if world == "TimeRift" and not riftReplicaConfirmed(previous,rebirths) then
                         if not previous.mismatchNoted then
                             previous.mismatchNoted=true
                             log("RiftRebirths изменился на +" .. tostring(rebirths-before)
@@ -37666,6 +38017,11 @@ __modules["features/progress_test"] = function(use)
                     end
                     return
                 end
+                if world=="TimeRift" and AdaptiveRebirth.plan(P,data,os.clock()) then
+                    P.holdHatch, P.holdCraft, P.disableAutoCraft = false, false, false
+                    P.holdUpgrades, P.holdSkillTree = false, false
+                    return
+                end
                 -- Как только ребёрт доступен, перестаём запускать покупки и дожидаемся только
                 -- уже отправленных запросов; 6/30-секундных окон перед ребёртом больше нет.
                 P.holdHatch, P.holdCraft, P.disableAutoCraft = true, true, true
@@ -37731,7 +38087,8 @@ __modules["features/progress_test"] = function(use)
                             local balance,rb=W.coins(last),W.rebirths(last)
                             local request,result=riftCanonicalRemotes()
                             local connectedOk,connected=pcall(function() return P.riftResultConnection.Connected end)
-                            if not canRebirth(prepared,last,true) or worldState.rebirthPending~=prepared
+                            if not AdaptiveRebirth.ready(P,last,os.clock())
+                                or not canRebirth(prepared,last,true) or worldState.rebirthPending~=prepared
                                 or (run.riftRebirthEventSerial or 0)~=prepared.eventSerial
                                 or not P.riftResultReady or not P.riftResultConnection
                                 or not connectedOk or connected~=true
@@ -37766,6 +38123,8 @@ __modules["features/progress_test"] = function(use)
                         end
                         P.nextSendAt,lastSends[memKey],run.lastRebirthSendAt=sentAt+currentRebirthGap(),sentAt,sentAt
                         attempted,prepared.dispatched=true,true -- reserve BEFORE the call may re-enter or throw
+                        P.note="Rift-ребёрт отправлен: жду прирост счётчика +"..tostring(amount)
+                        P.pendingRebirthNoted=nil
                         P.remote:FireServer({Index=index,World="TimeRift"})
                         log("Rift-ребёрт: вызван RebirthRequested Index="..tostring(index)..", +"..tostring(amount)
                             ..", цена по игровой формуле="..tostring(price).."; сам вызов не доказывает успех")
@@ -37947,13 +38306,13 @@ __modules["features/progress_test"] = function(use)
             genv.ts30TestState = nil
             genv.ts30TestStop = nil
         end)
-        log("сборка V16-LIVE-EGG-ETA-8: Clicks, ребёрты 20 с, Golden 100%; Ghost Ship исключён")
+        log("сборка V16-LIVE-FLOW-12: Clicks, ребёрты 20 с, Golden 100%; Ghost Ship исключён")
         log("v16: мир=" .. world .. "; всегда Clicks; доступные яйца и максимальная партия без порога дохода")
-        log("ребёрт не чаще раза в 20 с до финала Royal; максимальный найденный пакет, неподтверждённый запрос не повторяю")
+        log("ребёрт >=20с: TimeRift сравнивает все открытые пакеты по цене/доходу; при равной эффективности выбирает короткое ожидание; отправка только максимального доступного")
         log("яйца — только на наиболее продвинутом подтверждённом острове; старые острова не использую")
-        log("цикл яиц: после 120 с фарма коплю без ребёртов только при ETA яйца до 10 минут; пауза максимум 10 минут; иначе прокачка; каждый Success запускает новый цикл")
+        log(Ui.__royalRoutePolicy and "цель Royal Egg: первое яйцо по правилу 120 с / ETA до 10 минут; затем ограниченные серии, Golden/EquipBest, оценка и прокачка; на острове Royal — только Royal" or "цикл яиц: 120 с / ETA до 10 минут")
         log("финал: два ответа Royal x3 с сообщённым числом роллов и ростом баланса — эвристика, не гарантия будущей устойчивости; оба кликера остаются включены")
-        log("порталы: при оценке до 10 минут временно коплю без яиц и ребёртов; клики остаются включены; иначе обычный фарм")
+        log("порталы: при оценке до часа временно коплю без яиц и ребёртов; клики остаются включены; иначе обычный фарм")
         log("чистка защищает секретов и команду, но может удалять прочих, включая Godly; сохранённые игровые настройки автоудаления яиц могут действовать")
         log("рыбалка, приманки, зелья, зачарования и трейды не запускаются")
         if not hatchApiReady then log("модуль яйца не загрузился: без каталога первые открытия и новые ребёрты могут ждать проверки") end
@@ -38127,7 +38486,7 @@ do
 	pcall(Ui.set, "AutoReveal", true)
 	if Ui.on("AutoReveal") then logEvent("hold", "Hold to Reveal включён; обработчики яиц не глушатся")
 	else logEvent("warn", "Hold to Reveal не включился: модуль или тумблер не загрузился") end
-	logEvent("farm", "сборка V16-LIVE-EGG-ETA-8: локальные файлы отключены; сайт и Discord включены, цены встроенные")
+	logEvent("farm", "сборка V16-LIVE-FLOW-12: локальные файлы отключены; сайт и Discord включены, цены встроенные")
 	logEvent("farm", "лучшее доступное яйцо: максимальная доступная партия; достигнутый уровень не понижаю; острова приоритетны")
 	pcall(function()
 		local picks = Ui.Options and Ui.Options.UpgradePicks
