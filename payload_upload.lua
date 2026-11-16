@@ -573,7 +573,66 @@ local function attr(o,n)
     return nil
 end
 local function gui() local p=Env.LocalPlayer; return p and p:FindFirstChild("PlayerGui") end
+
+local function makeDiscoveryIndex()
+    local state
+    local function clear()
+        if state then
+            for _,c in ipairs(state.connections) do pcall(function() c:Disconnect() end) end
+        end
+        state=nil
+    end
+    local function get(root,cap)
+        if not root then return nil end
+        if state and state.root~=root then clear() end
+        if not state then
+            local nextState={root=root,dirty=true,version=0,connections={}}
+            local function invalidate() nextState.dirty=true;nextState.version+=1 end
+            local ok=pcall(function()
+                nextState.connections[1]=root.DescendantAdded:Connect(invalidate)
+                nextState.connections[2]=root.DescendantRemoving:Connect(invalidate)
+            end)
+            if not ok then
+                for _,c in ipairs(nextState.connections) do pcall(function() c:Disconnect() end) end
+                return nil
+            end
+            state=nextState
+        end
+        local st=state
+        -- Periodic rebuild is an extra precaution against missed executor events.
+        if not st.dirty and os.clock()<(st.untilAt or 0) then return st.nodes,true end
+        local version=st.version
+        local q,head,out={root},1,{}
+        while head<=#q and head<=cap do
+            local node=q[head];head+=1;out[#out+1]=node
+            local ok,kids=pcall(function() return node:GetChildren() end)
+            if not ok or type(kids)~="table" then return out,false end
+            for _,child in ipairs(kids) do q[#q+1]=child end
+        end
+        if head<=#q or version~=st.version then return out,false end
+        st.nodes,st.dirty,st.untilAt=out,false,os.clock()+5
+        return out,true
+    end
+    return get,clear
+end
+
+local freshDiscoveryDepth=0
+local function withFreshDiscovery(fn,...)
+    freshDiscoveryDepth+=1
+    local result=table.pack(pcall(fn,...))
+    freshDiscoveryDepth-=1
+    return table.unpack(result,1,result.n)
+end
+local guiIndex,clearGuiIndex=makeDiscoveryIndex()
+do
+    local ok,life=pcall(use,"shared/life")
+    if ok and type(life)=="table" and type(life.onCleanup)=="function" then life.onCleanup(clearGuiIndex) end
+end
 local function boundedDesc(root,cap)
+    if cap>=40000 and freshDiscoveryDepth==0 then
+        local nodes,done=guiIndex(root,cap)
+        if nodes then return nodes,done end
+    end
     if not root then return {},false end
     local q,head,out={root},1,{}
     while head<=#q and head<=cap do
@@ -1156,10 +1215,12 @@ function N.fireButton(button,guard,strictSingleHandler,beforeInvoke)
     local connections=first(getconnections,Env.genv and Env.genv.getconnections)
     local fire=first(firesignal,Env.genv and Env.genv.firesignal)
     if not connections then return false,false,"executor не предоставляет getconnections" end
+    local inspected={}
     for _,name in ipairs({"Activated","MouseButton1Click"}) do
         local okSignal,signal=pcall(function() return button[name] end)
         local ok,list=false,nil
         if okSignal and signal then ok,list=pcall(connections,signal) end
+        inspected[#inspected+1]=name.."="..tostring(ok and type(list)=="table" and #list or "ошибка чтения")
         if ok and type(list)=="table" and #list>0 then
             local liveRift=strictSingleHandler=="time-rift-live"
             local singleRebirth=strictSingleHandler=="rift-rebirth-single"
@@ -1195,13 +1256,13 @@ function N.fireButton(button,guard,strictSingleHandler,beforeInvoke)
                 end
             end
             if type(guard)=="function" then
-                local checked,allowed=pcall(guard,signal,name,chosenCount,chosen,actionFn,effectFn)
+                local checked,allowed=withFreshDiscovery(guard,signal,name,chosenCount,chosen,actionFn,effectFn)
                 if not checked or not allowed then return false,false,"условия изменились" end
             end
             if not visible(button,root) or locked(button) then return false,false,"кнопка больше недоступна" end
             local function finalCheck()
                 if type(beforeInvoke)=="function" then
-                    local committed,allowed=pcall(beforeInvoke,signal,name,chosenCount,chosen,actionFn,effectFn)
+                    local committed,allowed=withFreshDiscovery(beforeInvoke,signal,name,chosenCount,chosen,actionFn,effectFn)
                     if not committed or allowed~=true then return false,"условия изменились перед вызовом" end
                 end
                 if not visible(button,root) or locked(button) then return false,"кнопка больше недоступна" end
@@ -1244,7 +1305,7 @@ function N.fireButton(button,guard,strictSingleHandler,beforeInvoke)
                 if singleIsland and type(beforeInvoke)=="function" then
                     -- Handler discovery itself can re-enter game/executor code. Check
                     -- target, wallet, window AND these exact functions one last time.
-                    local committed,allowed=pcall(beforeInvoke,signal,name,chosenCount,chosen,actionFn,effectFn)
+                    local committed,allowed=withFreshDiscovery(beforeInvoke,signal,name,chosenCount,chosen,actionFn,effectFn)
                     if not committed or allowed~=true then return false,"условия изменились после проверки обработчика" end
                 end
                 return true
@@ -1275,7 +1336,7 @@ function N.fireButton(button,guard,strictSingleHandler,beforeInvoke)
             return true,called,called and nil or tostring(err)
         end
     end
-    return false,false,"обработчик игровой кнопки не найден"
+    return false,false,"обработчик игровой кнопки не найден ("..table.concat(inspected,", ")..")"
 end
 
 function N.openRebirthMenu(guard)
@@ -2568,7 +2629,8 @@ local function drainReasons(P)
     add(Ui.portalUiMouse, "отпускаю кнопку окна крафта")
     if Ui.travelling then
         local owner=type(Ui.travelling)=="string" and Ui.travelling
-            or (Ui.travelling==P.portalCraftSlot and "Golden") or "неизвестный владелец"
+            or (Ui.travelling==P.portalCraftSlot and "Golden")
+            or (Ui.travelling==P.portalMoveSlot and "переход к яйцу") or "неизвестный владелец"
         add(true, "занято перемещение: "..tostring(owner))
     end
     return out
@@ -2751,7 +2813,10 @@ function S.update(P, data, item, portalReady, canStart, owner, allowUnlocated)
     local now = os.clock()
     if type(P) ~= "table" then return end
     owner = owner or "island"
-    local canEstimate = portalReady == true or (owner == "island" and allowUnlocated == true)
+    local canEstimate = portalReady == true or (allowUnlocated == true and
+        (owner == "island" or (owner == "world" and W.world(data)=="Main" and W.heavenOpen(data)
+            and type(item)=="table" and item.name=="Time Rift" and item.knownWorldQuote==true
+            and item.price==21000000000000000000)))
     local s = P.portalSaving
     if s and (s.owner or "island") ~= owner then return end
     if not running(P, data, owner) then
@@ -3225,7 +3290,52 @@ local function nextIsland(data,P)
     end
     return nil,"следующий остров не найден или уже открыт"
 end
-local function findPortal(item)
+
+local function makeDiscoveryIndex()
+    local state
+    local function clear()
+        if state then
+            for _,c in ipairs(state.connections) do pcall(function() c:Disconnect() end) end
+        end
+        state=nil
+    end
+    local function get(root,cap)
+        if not root then return nil end
+        if state and state.root~=root then clear() end
+        if not state then
+            local nextState={root=root,dirty=true,version=0,connections={}}
+            local function invalidate() nextState.dirty=true;nextState.version+=1 end
+            local ok=pcall(function()
+                nextState.connections[1]=root.DescendantAdded:Connect(invalidate)
+                nextState.connections[2]=root.DescendantRemoving:Connect(invalidate)
+            end)
+            if not ok then
+                for _,c in ipairs(nextState.connections) do pcall(function() c:Disconnect() end) end
+                return nil
+            end
+            state=nextState
+        end
+        local st=state
+        -- Periodic rebuild is an extra precaution against missed executor events.
+        if not st.dirty and os.clock()<(st.untilAt or 0) then return st.nodes,true end
+        local version=st.version
+        local q,head,out={root},1,{}
+        while head<=#q and head<=cap do
+            local node=q[head];head+=1;out[#out+1]=node
+            local ok,kids=pcall(function() return node:GetChildren() end)
+            if not ok or type(kids)~="table" then return out,false end
+            for _,child in ipairs(kids) do q[#q+1]=child end
+        end
+        if head<=#q or version~=st.version then return out,false end
+        st.nodes,st.dirty,st.untilAt=out,false,os.clock()+5
+        return out,true
+    end
+    return get,clear
+end
+
+local worldIndex,clearWorldIndex=makeDiscoveryIndex()
+Life.onCleanup(clearWorldIndex)
+local function findPortal(item,forceFresh)
     -- The next-gate tree and the platform/decoration tree can both contain a
     -- model named after the same island. Never select by traversal order.
     local top=children(workspace)
@@ -3241,7 +3351,10 @@ local function findPortal(item)
     for _,node in ipairs(direct) do
         if node.Name=="NextPortals" then nextRoot,nextRoots=node,nextRoots+1 end
     end
-    local q,head,matches={root},1,{}
+    local indexed,indexComplete
+    if not forceFresh then indexed,indexComplete=worldIndex(root,20000) end
+    if indexed and not indexComplete then return nil,"неполный индекс World2" end
+    local q,head,matches=indexed or {root},1,{}
     local want=W.norm(item.name)
     local byName=W.norm(item.def and item.def.PortalName)
     while head<=#q and head<=20000 do
@@ -3264,8 +3377,10 @@ local function findPortal(item)
                 matches[#matches+1]={node=node,platform=platformScope}
             end
         end
-        local list=children(node); if not list then return nil,"неполный обход World2" end
-        for _,c in ipairs(list) do q[#q+1]=c end
+        if not indexed then
+            local list=children(node); if not list then return nil,"неполный обход World2" end
+            for _,c in ipairs(list) do q[#q+1]=c end
+        end
     end
     if head<=#q then return nil,"неполный обход World2" end
     local selected
@@ -3362,16 +3477,12 @@ function R.priorityDue(P,data)
     local item=nextIsland(data,P)
     local balance=W.coins(data)
     if not item or not balance or balance<item.price then return false end
-    if findPortal(item)~=nil then return true end
-    -- When navigation is ambiguous but the *exact* native island question is
-    -- already visible, give its worker a chance before the next egg/rebirth.
-    -- This signal is not handler/purchase proof; an unsent failed attempt has a
-    -- finite cooldown so an unusable dialog alone does not freeze the farm.
-    if os.clock()<(P.portalRetryAt or 0) or type(N.findRiftIslandModal)~="function" then return false end
-    local ok,modal=pcall(N.findRiftIslandModal,data,item.name,item.price,balance)
-    return ok and type(modal)=="table" and Life.alive and Ui.__progressTest==P and not P.stopRequested
-        and not P.worldChanging and W.isCurrent(P,data)
+    -- Scheduling only. The worker performs fresh location/window/handler checks.
+    -- Honor a proven-unsent failure cooldown even when the physical gate exists.
+    if os.clock()<(P.riftActionRetryAt or 0) and P.riftActionRetryName==item.name then return false end
+    return os.clock()>=(P.portalRetryAt or 0)
 end
+
 local function root()
     local c=Env.LocalPlayer and Env.LocalPlayer.Character
     return c and c:FindFirstChild("HumanoidRootPart")
@@ -3438,7 +3549,7 @@ function R.travel(island,guard)
             local liveConfig=loadCfg()
             local liveDef=liveConfig and type(liveConfig.Islands)=="table" and liveConfig.Islands[island]
             if type(liveDef)~="table" or R.resolveIsland(island)~=island then return false end
-            local livePos,_,liveNode=findPortal({name=island,def=liveDef})
+            local livePos,_,liveNode=findPortal({name=island,def=liveDef},true)
             local okDistance,distance=pcall(function() return (livePos-pos).Magnitude end)
             local permitted,permittedValue=pcall(guard)
             local final=current()
@@ -3557,6 +3668,7 @@ local function observeSaving(P,data)
     if busy then return end
     local candidate=nextIsland(data,P)
     local balance=W.coins(data)
+    if candidate and P.riftActionRetryName==candidate.name and os.clock()<(P.riftActionRetryAt or 0) then return end
     local underBudget=candidate and balance and balance<candidate.price
     if fastRiftFundsRetry and os.clock()<nextTry and candidate and balance and balance>=candidate.price then
         nextTry=0; fastRiftFundsRetry=false
@@ -3602,6 +3714,8 @@ local function riftIslandStep()
     observeSaving(P,data)
     data=current()
     if busy or os.clock()<nextTry or not allowed(P,false,true) then return end
+    local retryItem=nextIsland(data,P)
+    if retryItem and P.riftActionRetryName==retryItem.name and os.clock()<(P.riftActionRetryAt or 0) then return end
     fastRiftFundsRetry=false
     if not journal then status("journal","нет журнала покупки острова: "..tostring(journalErr)); nextTry=os.clock()+60; return end
     local clear,why=journal.check()
@@ -3643,7 +3757,7 @@ local function riftIslandStep()
                     local permitted,snapshot=allowed(P,true,false)
                     local liveItem=permitted and snapshot and nextIsland(snapshot,P) or nil
                     if not liveItem or liveItem.name~=item.name or liveItem.price~=item.price then return false end
-                    local livePos,_,liveNode=findPortal(liveItem)
+                    local livePos,_,liveNode=findPortal(liveItem,true)
                     local okDistance,distance=pcall(function() return (livePos-pos).Magnitude end)
                     local final=current()
                     local finalItem=final and nextIsland(final,P)
@@ -3775,8 +3889,18 @@ local function riftIslandStep()
                     local cleared=journal.cancelUnsent(token)
                     P.islandInFlight=false; P.riftIslandPendingName=nil
                     if not cleared then P.islandUncertain=true
-                    else purchaseResult="guard-unsent" end -- no handler was invoked; a clean retry is safe
-                    status("native","игровая кнопка острова не вызвана: "..tostring(fireErr)); return
+                    else
+                        purchaseResult="guard-unsent"
+                        -- No handler was invoked. Back off without creating an unknown send.
+                        P.riftActionRetryName,P.riftActionRetryAt=item.name,os.clock()+30
+                    end
+                    status("native","игровая кнопка острова не вызвана: "..tostring(fireErr))
+                    if os.clock()>=(P.nextRiftIslandDiagAt or 0) and type(N.riftIslandModalDiagnostics)=="function" then
+                        P.nextRiftIslandDiagAt=os.clock()+30
+                        local diagOk,lines=pcall(N.riftIslandModalDiagnostics,current(),item.name)
+                        if diagOk and type(lines)=="table" then for _,line in ipairs(lines) do log("окно острова | "..tostring(line)) end end
+                    end
+                    return
                 end
                 if not called then log("ошибка после возможной отправки: "..tostring(fireErr)) end
                 log("вызван обработчик подтверждения "..item.name.." (окно="..tostring(display)
@@ -3803,6 +3927,7 @@ local function riftIslandStep()
             Life.wait(0.2)
         until os.clock()>=untilGui
         retryMissingButton=item.name
+        P.riftActionRetryName,P.riftActionRetryAt=item.name,os.clock()+30
         local latest=current();local _,problem=findIslandAction(latest,item)
         status("ui:"..item.name,"нет однозначной игровой кнопки "..item.name.." с ценой и RiftCoins: "
             ..tostring(problem).."; клики продолжаются, новые траты ждут доступный остров")
@@ -4220,7 +4345,52 @@ local function isa(o,c) local ok,v=pcall(function() return o and o:IsA(c) end); 
 local function children(o) local ok,v=pcall(function() return o and o:GetChildren() end); return ok and type(v)=="table" and v or nil end
 local function data() local ok,d=pcall(Env.data); return ok and type(d)=="table" and d or nil end
 local function root() local c=Env.LocalPlayer and Env.LocalPlayer.Character; return c and c:FindFirstChild("HumanoidRootPart") end
-local function entrance()
+
+local function makeDiscoveryIndex()
+    local state
+    local function clear()
+        if state then
+            for _,c in ipairs(state.connections) do pcall(function() c:Disconnect() end) end
+        end
+        state=nil
+    end
+    local function get(root,cap)
+        if not root then return nil end
+        if state and state.root~=root then clear() end
+        if not state then
+            local nextState={root=root,dirty=true,version=0,connections={}}
+            local function invalidate() nextState.dirty=true;nextState.version+=1 end
+            local ok=pcall(function()
+                nextState.connections[1]=root.DescendantAdded:Connect(invalidate)
+                nextState.connections[2]=root.DescendantRemoving:Connect(invalidate)
+            end)
+            if not ok then
+                for _,c in ipairs(nextState.connections) do pcall(function() c:Disconnect() end) end
+                return nil
+            end
+            state=nextState
+        end
+        local st=state
+        -- Periodic rebuild is an extra precaution against missed executor events.
+        if not st.dirty and os.clock()<(st.untilAt or 0) then return st.nodes,true end
+        local version=st.version
+        local q,head,out={root},1,{}
+        while head<=#q and head<=cap do
+            local node=q[head];head+=1;out[#out+1]=node
+            local ok,kids=pcall(function() return node:GetChildren() end)
+            if not ok or type(kids)~="table" then return out,false end
+            for _,child in ipairs(kids) do q[#q+1]=child end
+        end
+        if head<=#q or version~=st.version then return out,false end
+        st.nodes,st.dirty,st.untilAt=out,false,os.clock()+5
+        return out,true
+    end
+    return get,clear
+end
+
+local entranceIndex,clearEntranceIndex=makeDiscoveryIndex()
+Life.onCleanup(clearEntranceIndex)
+local function entrance(forceFresh)
     -- The successful earlier session reported a *single instance name* containing a slash:
     -- World2Portal.[Meshes/cool portal_Cylinder.025]. Do not treat that slash as a folder.
     local candidates={}
@@ -4250,7 +4420,10 @@ local function entrance()
     if #candidates>1 then return nil,"несколько Workspace.World2Portal: вход неоднозначен",false end
     local model=candidates[1]
     if isa(model,"BasePart") then return model end
-    local q,head,observed,triggers,parts={model},1,{},{},{}
+    local indexed,indexComplete
+    if not forceFresh then indexed,indexComplete=entranceIndex(model,400) end
+    if indexed and not indexComplete then return nil,"неполный индекс World2Portal",true end
+    local q,head,observed,triggers,parts=indexed or {model},1,{},{},{}
     while head<=#q and head<=400 do
         local node=q[head]; head+=1
         if isa(node,"BasePart") then
@@ -4263,9 +4436,11 @@ local function entrance()
                 triggers[#triggers+1]=node
             end
         end
-        local list=children(node)
-        if not list then return nil,"неполный обход World2Portal",true end
-        for _,c in ipairs(list) do q[#q+1]=c end
+        if not indexed then
+            local list=children(node)
+            if not list then return nil,"неполный обход World2Portal",true end
+            for _,c in ipairs(list) do q[#q+1]=c end
+        end
     end
     if head<=#q then return nil,"обход World2Portal ограничен",true end
     if #observed==1 then return observed[1] end
@@ -4373,8 +4548,11 @@ function Router.start(emit)
     local function confirmedAccess(snapshot)
         return everRift or seenOpen or W.world2Open(snapshot)
     end
+    local RIFT_SHOWN_PRICE=20000000000000000000
+    local RIFT_APPROACH_PRICE=21000000000000000000 -- conservative 20QN GUI rounding ceiling
     local function entryAccess(snapshot)
-        return confirmedAccess(snapshot) or W.heavenOpen(snapshot)
+        local coins=W.coins(snapshot)
+        return confirmedAccess(snapshot) or (W.heavenOpen(snapshot) and coins~=nil and coins>=RIFT_APPROACH_PRICE)
     end
     local PORTAL_DETAIL="Main|TimeRift|portal"
     local PORTAL_PENDING="TSV14_PENDING_V1|"..PORTAL_DETAIL
@@ -4635,7 +4813,7 @@ function Router.start(emit)
         return false,"Main/Spawn не подтверждён после возможного перехода"
     end
     local function searchEntrance(P,allowFarStreaming)
-        local part,why,canStream=entrance()
+        local part,why,canStream=entrance(false)
         if part or not canStream or type(Env.streamAround)~="function" then return part,why,canStream end
         local snapshot=data()
         if not live(P) or Ui.travelling~=OWNER or W.world(snapshot)~="Main" then return nil,"условия поиска портала изменились",false end
@@ -4650,7 +4828,7 @@ function Router.start(emit)
                 Life.wait(0.25)
                 snapshot=data()
                 if live(P) and Ui.travelling==OWNER and W.world(snapshot)=="Main" then
-                    return entrance()
+                    return entrance(true)
                 end
             end
             return nil,"поиск портала отменён при смене условий",false
@@ -4666,7 +4844,7 @@ function Router.start(emit)
         local touch=type(firetouchinterest)=="function" and firetouchinterest
             or (Env.genv and Env.genv.firetouchinterest)
         if type(touch)~="function" or not portalGuard(P,force,recovering)
-            or root()~=hrp or not part or not part.Parent or entrance()~=part then return end
+            or root()~=hrp or not part or not part.Parent or entrance(true)~=part then return end
         -- Touch only the uniquely identified live entrance, never an arbitrary GUI button.
         local ok,err=pcall(touch,hrp,part,0)
         Life.wait(0.05)
@@ -4677,7 +4855,7 @@ function Router.start(emit)
     end
     local function approach(part,P,force,recovering)
         if not portalGuard(P,force,recovering) then return false,"условия изменились",false end
-        local unique=entrance()
+        local unique=entrance(true)
         local hrp=root()
         if unique~=part or not hrp or not part or not part.Parent then return false,"нет персонажа или однозначного живого портала",false end
         local distOk,dist=pcall(function() return (hrp.Position-part.Position).Magnitude end)
@@ -4687,7 +4865,7 @@ function Router.start(emit)
         local attempted=false
         local ok,moved=pcall(function()
             if not portalGuard(P,force,recovering) then return false end
-            local stillUnique=entrance()
+            local stillUnique=entrance(true)
             if stillUnique~=part or not part.Parent or root()~=hrp then return false end
             if recovering then
                 -- A second assignment to the same point may not fire Touch again. Step away
@@ -4704,7 +4882,7 @@ function Router.start(emit)
                 hrp.AssemblyAngularVelocity=Vector3.zero
                 log("отхожу от World2Portal для повторного касания")
                 Life.wait(0.5)
-                if not portalGuard(P,force,recovering) or entrance()~=part or not part.Parent or root()~=hrp then return false end
+                if not portalGuard(P,force,recovering) or entrance(true)~=part or not part.Parent or root()~=hrp then return false end
             end
             hrp.AssemblyLinearVelocity=Vector3.zero
             attempted=true -- assignment can trigger the portal even if a later property errors
@@ -4739,7 +4917,7 @@ function Router.start(emit)
             log("переместился к точке портала из рабочего скрипта; вход ещё не подтверждён")
             Life.wait(0.25)
             if portalGuard(P,true,recovering) and root()==hrp then
-                local part=entrance()
+                local part=entrance(true)
                 if part then touchPortal(P,part,hrp,true,recovering) end
             end
             return true
@@ -5001,7 +5179,7 @@ function Router.start(emit)
         log("активна отдельная прогрессия TimeRift: RiftCoins, RiftGems и RiftRebirths; Main больше не фармится")
         return true
     end
-    log("сборка V16-LIVE-PORTAL-GOLDEN-3: прямой возврат к живому World2Portal, результат только по реплике")
+    log("сборка V16-LIVE-CPU-PORTAL-4: прямой возврат к живому World2Portal, результат только по реплике")
     local stageName,stageAt="ожидание",os.clock()
     local function stage(name) stageName,stageAt=name,os.clock() end
     -- World-2 purchase is distinct from the already-journaled physical portal touch.
@@ -5643,6 +5821,16 @@ function Router.start(emit)
             end
         end
         local open=W.world2Open(d)
+        if not confirmedAccess(d) and W.heavenOpen(d) then
+            local coins=W.coins(d)
+            if coins and coins<RIFT_APPROACH_PRICE then
+                -- No physical approach and no GUI search while under budget.
+                -- Quote only: buyWorld still requires a live native modal.
+                S.update(P,d,{name="Time Rift",price=RIFT_APPROACH_PRICE,knownWorldQuote=true},
+                    false,true,"world",true)
+                return
+            end
+        end
         local wantReturn=entryAccess(d)
         if busy or not wantReturn then
             if not busy and not confirmedAccess(d) then unparkLiveMain(P) end
@@ -6460,7 +6648,7 @@ local function findPoint(name, near)
 end
 local function teleport(cframe,lease)
     local hrp = root()
-    if not hrp or not allowed(nil,lease) then return false end
+    if not hrp or not allowed(nil,lease) or Ui.travelling~=lease or Ui.hatchMoving then return false end
     hrp.AssemblyLinearVelocity = Vector3.zero
     hrp.CFrame = cframe
     return true
@@ -11392,17 +11580,66 @@ local function learn(egg, position)
     end
 end
 
-local function eggModel(egg)
+
+local function makeDiscoveryIndex()
+    local state
+    local function clear()
+        if state then
+            for _,c in ipairs(state.connections) do pcall(function() c:Disconnect() end) end
+        end
+        state=nil
+    end
+    local function get(root,cap)
+        if not root then return nil end
+        if state and state.root~=root then clear() end
+        if not state then
+            local nextState={root=root,dirty=true,version=0,connections={}}
+            local function invalidate() nextState.dirty=true;nextState.version+=1 end
+            local ok=pcall(function()
+                nextState.connections[1]=root.DescendantAdded:Connect(invalidate)
+                nextState.connections[2]=root.DescendantRemoving:Connect(invalidate)
+            end)
+            if not ok then
+                for _,c in ipairs(nextState.connections) do pcall(function() c:Disconnect() end) end
+                return nil
+            end
+            state=nextState
+        end
+        local st=state
+        -- Periodic rebuild is an extra precaution against missed executor events.
+        if not st.dirty and os.clock()<(st.untilAt or 0) then return st.nodes,true end
+        local version=st.version
+        local q,head,out={root},1,{}
+        while head<=#q and head<=cap do
+            local node=q[head];head+=1;out[#out+1]=node
+            local ok,kids=pcall(function() return node:GetChildren() end)
+            if not ok or type(kids)~="table" then return out,false end
+            for _,child in ipairs(kids) do q[#q+1]=child end
+        end
+        if head<=#q or version~=st.version then return out,false end
+        st.nodes,st.dirty,st.untilAt=out,false,os.clock()+5
+        return out,true
+    end
+    return get,clear
+end
+
+local eggIndex,clearEggIndex=makeDiscoveryIndex()
+Life.onCleanup(clearEggIndex)
+local function eggModel(egg,forceFresh)
     local folder = workspace:FindFirstChild("Eggs")
     if not folder then return nil end
     local def = EGGS[egg]
     if not def or def.world ~= "TimeRift" then return folder:FindFirstChild(egg) end
     -- A same-named model is not proof if streaming leaves duplicates: do not choose blindly.
-    local ok, children = pcall(function() return folder:GetChildren() end)
+    local nodes,complete
+    if not forceFresh then nodes,complete=eggIndex(folder,4000) end
+    if nodes and not complete then return nil end
+    local ok, children = true,nodes
+    if not children then ok,children=pcall(function() return folder:GetChildren() end) end
     if not ok or type(children) ~= "table" then return nil end
     local found, count = nil, 0
     for _, child in ipairs(children) do
-        if child.Name == egg then found, count = child, count + 1 end
+        if child.Parent==folder and child.Name == egg then found, count = child, count + 1 end
     end
     return count == 1 and found or nil
 end
@@ -11939,7 +12176,7 @@ local function eggCenter(model)
 end
 
 local function nearEgg(egg)
-    local model, hrp = eggModel(egg), root()
+    local model, hrp = eggModel(egg,true), root()
     local center = model and eggCenter(model)
     return hrp ~= nil and center ~= nil and (hrp.Position - center).Magnitude <= STAND_RANGE
 end
@@ -11990,7 +12227,8 @@ local function moveBlocked(egg)
     local def=EGGS[egg]
     local focusOK=type(P)=="table" and def and IslandEggFocus.allows(P,snapshot,def.island)
     return not focusOK or not Life.alive or not enabled or not toggle or toggle.Value~=true or type(P)~="table" or Ui.__progressTest~=P
-        or P.worldChanging or not W.isCurrent(P,snapshot) or Ui.travelling
+        or P.worldChanging or not W.isCurrent(P,snapshot)
+        or (Ui.travelling and Ui.travelling~=P.portalMoveSlot)
         or (Env.genv and Ui.__handoverPaused)
         or P.holdHatch or P.portalSaving or P.previousOtherWorldRebirthPending
         or islandPriorityBlocked(P,snapshot)
@@ -12026,10 +12264,13 @@ local function goToEgg(egg, expectedP, worker)
         moveSlot.cancelled=true
         if P.portalMoveSlot==moveSlot and not P.islandTravelInFlight and not P.mainEggTravelActive then
             P.portalMoveSlot=nil; Ui.hatchMoving=false
+            if Ui.travelling==moveSlot then Ui.travelling=false end
             if type(retireHatchWorker)=="function" then retireHatchWorker(worker) end
         end
     end
+    if Ui.travelling or Ui.hatchMoving then return false,"paused","перемещение уже занято" end
     P.portalMoveSlot=moveSlot
+    Ui.travelling=moveSlot
     Ui.hatchMoving = true
     setHatchStage("перемещение к " .. tostring(egg))
     local arrived, reason, detail = false, "paused", "перемещение прервано паузой"
@@ -12120,6 +12361,7 @@ local function goToEgg(egg, expectedP, worker)
         end
         local center = eggCenter(model)
         if not center then reason, detail = "no_center", "не удалось определить позицию модели"; return end
+        if nearEgg(egg) then arrived,reason,detail=true,nil,nil; return end
         local spot = standSpot(model, center)
         if interrupted() then return end
         hrp = root()
@@ -12143,6 +12385,7 @@ local function goToEgg(egg, expectedP, worker)
         end
     end)
     if P.portalMoveSlot==moveSlot then P.portalMoveSlot=nil; Ui.hatchMoving=false end
+    if Ui.travelling==moveSlot then Ui.travelling=false end
     Env.elevate()
     if not ok then return false, "trip_error", "ошибка перемещения: " .. tostring(err) end
     return arrived, reason, detail
@@ -36066,7 +36309,7 @@ __modules["features/progress_test"] = function(use)
         P.remoteError = nil
 
         local function log(text)
-            emit("progress", "[ПРОГРЕССИЯ v16 LIVE-PORTAL-GOLDEN-3 " .. world .. "] " .. tostring(text))
+            emit("progress", "[ПРОГРЕССИЯ v16 LIVE-CPU-PORTAL-4 " .. world .. "] " .. tostring(text))
         end
         P.log = log
         local function parkRiftRebirth(request)
@@ -37553,7 +37796,7 @@ __modules["features/progress_test"] = function(use)
             genv.ts30TestState = nil
             genv.ts30TestStop = nil
         end)
-        log("сборка V16-LIVE-PORTAL-GOLDEN-3: Clicks, ребёрты 20 с, Golden 100%; Ghost Ship исключён")
+        log("сборка V16-LIVE-CPU-PORTAL-4: Clicks, ребёрты 20 с, Golden 100%; Ghost Ship исключён")
         log("v16: мир=" .. world .. "; всегда Clicks; доступные яйца и максимальная партия без порога дохода")
         log("ребёрт не чаще раза в 20 с до финала Royal; максимальный найденный пакет, неподтверждённый запрос не повторяю")
         log("яйца — только на наиболее продвинутом подтверждённом острове; старые острова не использую")
@@ -37733,7 +37976,7 @@ do
 	pcall(Ui.set, "AutoReveal", true)
 	if Ui.on("AutoReveal") then logEvent("hold", "Hold to Reveal включён; обработчики яиц не глушатся")
 	else logEvent("warn", "Hold to Reveal не включился: модуль или тумблер не загрузился") end
-	logEvent("farm", "сборка V16-LIVE-PORTAL-GOLDEN-3: локальные файлы отключены; сайт и Discord включены, цены встроенные")
+	logEvent("farm", "сборка V16-LIVE-CPU-PORTAL-4: локальные файлы отключены; сайт и Discord включены, цены встроенные")
 	logEvent("farm", "лучшее доступное яйцо: максимальная доступная партия; достигнутый уровень не понижаю; острова приоритетны")
 	pcall(function()
 		local picks = Ui.Options and Ui.Options.UpgradePicks
