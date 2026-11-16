@@ -4011,6 +4011,60 @@ local F = {}
 local remembered = {}
 local eggCatalog
 local FIRST_EGG_TRIAL_SECONDS = 120
+local EGG_SAVE_LIMIT = 600
+local savingQuote
+function F.setSavingQuote(provider)
+    savingQuote = type(provider)=="function" and provider or nil
+end
+-- The hatch selector supplies a fresh x1 quote using its own access, currency,
+-- price-formula and monotonic-floor checks. This policy never buys an egg.
+local function eggBudget(P,data,current,trial,now)
+    local price,egg
+    local q=trial.budgetQuoteCache
+    -- Scheduling only: avoid repeated stand/catalog work on every controller tick.
+    -- Floor changes, provider replacement or a new island invalidate immediately.
+    if type(q)=="table" and q.provider==savingQuote and q.floor==P.farmEggFloor
+        and now>=q.at and now-q.at<5 then
+        price,egg=q.price,q.egg
+    elseif savingQuote then
+        local ok,a,b=pcall(savingQuote,P,data)
+        if ok then price,egg=W.finite(a),b end
+    end
+    now=os.clock()
+    -- Quote discovery can yield. Do not let its old controller authorize a send.
+    if Ui.__progressTest~=P or not Life.alive or P.stopRequested or P.worldChanging
+        or Ui.__globalStop or Ui.__handoverPaused or not W.isCurrent(P,data)
+        or P.islandEggTrial~=trial or P.islandEggVerified~=current.verifiedName then return nil end
+    if type(q)~="table" or q.provider~=savingQuote or q.floor~=P.farmEggFloor or now<q.at or now-q.at>=5 then
+        trial.budgetQuoteCache={price=price,egg=egg,at=now,provider=savingQuote,floor=P.farmEggFloor}
+    end
+    local coins=W.coins(data)
+    local sample=type(P.incomeByMode)=="table" and P.incomeByMode.Clicks
+    local rate=type(sample)=="table" and W.finite(sample.value)
+    local at=type(sample)=="table" and W.finite(sample.at)
+    local eta
+    if price and price>0 and coins then
+        if coins>=price then eta=0
+        elseif rate and rate>0 and at and now>=at and now-at<=30 then eta=(price-coins)/rate end
+    end
+    trial.eggEta,trial.eggQuote,trial.eggQuoteName=eta,price,egg
+    if trial.saveUntil and now>=trial.saveUntil then
+        trial.saveUntil=nil
+        trial.retryAfter=trial.elapsed+FIRST_EGG_TRIAL_SECONDS
+    end
+    if trial.retryAfter and trial.elapsed<trial.retryAfter then
+        trial.saveUntil=nil
+        return false,"лимит накопления яйца 10 минут истёк; продолжаю прокачку перед новой оценкой"
+    end
+    if not eta or eta>EGG_SAVE_LIMIT then
+        trial.saveUntil=nil
+        return false,eta and "до яйца больше 10 минут; продолжаю прокачку"
+            or "свежая цена/скорость накопления яйца не подтверждены; продолжаю прокачку"
+    end
+    trial.retryAfter=nil
+    trial.saveUntil=trial.saveUntil or (now+EGG_SAVE_LIMIT)
+    return true,"до яйца не больше 10 минут; коплю без новых ребёртов"
+end
 
 -- Count ordinary farm time, not a separate portal reservation or a trade/world
 -- pause. Sampling is conservative across an unobserved transition: it can lose
@@ -4318,8 +4372,16 @@ function F.rebirthHold(P, data)
         trial.status, P.islandEggHoldReason = "grace", nil
         return false
     end
+    local now=os.clock()
+    local hold,budgetReason=eggBudget(P,data,current,trial,now)
+    if hold==nil then return true,"оценка яйца устарела во время проверки" end
+    if not hold then
+        trial.status,trial.budgetDecisionAt="budget_farm",os.clock()
+        P.islandEggHoldReason=nil
+        return false,budgetReason
+    end
     trial.status = "hold"
-    local reason = "за последние 120 с обычного фарма нет подтверждённого Success яйца на " .. island
+    local reason = budgetReason .. ": " .. island
     if not current.confirmed then reason ..= "; подсказка " .. current.name .. " ещё не подтверждена" end
     if has == nil then reason ..= "; перечитываю каталог яиц" end
     P.islandEggHoldReason = reason
@@ -4341,6 +4403,12 @@ function F.rebirthSendReady(P, now)
     trial.elapsed = math.max(0, elapsedClock - trial.startedAt)
     if trial.status == "complete" then return trial.lastSuccessAt ~= nil and trial.elapsed < FIRST_EGG_TRIAL_SECONDS end
     if trial.status == "no_egg" then return true end
+    if trial.status == "budget_farm" then
+        -- No discovery/yields at the final boundary; only a recent decision
+        -- for this exact trial can permit a rebirth after its 120-second grace.
+        local at=W.finite(trial.budgetDecisionAt)
+        return at~=nil and now>=at and now-at<=2 and not trial.saveUntil
+    end
     return trial.status == "grace" and trial.elapsed < FIRST_EGG_TRIAL_SECONDS
 end
 
@@ -4365,6 +4433,8 @@ function F.confirmSuccess(P, world, island, token)
         local elapsedClock = sampleClock(P, os.clock(), type(clock)=="table" and clock.worldValid==true)
         trial.startedAt, trial.lastSuccessAt = elapsedClock, elapsedClock
         trial.elapsed, trial.status, trial.lastSuccessToken = 0, "complete", token
+        trial.saveUntil,trial.retryAfter,trial.budgetDecisionAt=nil,nil,nil
+        trial.eggEta,trial.eggQuote,trial.eggQuoteName=nil,nil,nil
         P.islandEggHoldReason = nil
     end
     return true
@@ -5217,7 +5287,7 @@ function Router.start(emit)
         log("активна отдельная прогрессия TimeRift: RiftCoins, RiftGems и RiftRebirths; Main больше не фармится")
         return true
     end
-    log("сборка V16-LIVE-PORTAL-DEADLOCK-7: прямой возврат к живому World2Portal, результат только по реплике")
+    log("сборка V16-LIVE-EGG-ETA-8: прямой возврат к живому World2Portal, результат только по реплике")
     local stageName,stageAt="ожидание",os.clock()
     local function stage(name) stageName,stageAt=name,os.clock() end
     -- World-2 purchase is distinct from the already-journaled physical portal touch.
@@ -12022,6 +12092,26 @@ local function eggsByPrice(data)
     end)
     return list
 end
+
+-- A scheduling quote, not a hatch authorization. Reuse the selector's live
+-- eligibility and pricing, never a cheaper old-island or below-floor egg.
+IslandEggFocus.setSavingQuote(function(P,data)
+    if Ui.__progressTest~=P or not Life.alive or P.stopRequested or P.worldChanging
+        or not W.isCurrent(P,data) or P.eggFixed or P.rebirthLocked or P.royalFinal
+        or not loadFarmFloor(P) or P.farmEggFloorError or P.farmEggSavePending
+        or progressFreeSlots(data)<1 then return nil end
+    local lowest,name
+    for _,egg in ipairs(eggsByPrice(data)) do
+        local def=EGGS[egg]
+        if def and def.price>=(P.farmEggFloor or 0) and W.coinPricing(def.raw) then
+            local price=progressBatchPrice(data,egg,1)
+            if price and price>0 and (not lowest or price<lowest) then lowest,name=price,egg end
+        end
+    end
+    if Ui.__progressTest~=P or not Life.alive or P.stopRequested or P.worldChanging
+        or not W.isCurrent(P,data) then return nil end
+    return lowest,name
+end)
 
 local function chooseByValue(data)
     local best, bestValue = nil, 0
@@ -36363,7 +36453,7 @@ __modules["features/progress_test"] = function(use)
         P.remoteError = nil
 
         local function log(text)
-            emit("progress", "[ПРОГРЕССИЯ v16 LIVE-PORTAL-DEADLOCK-7 " .. world .. "] " .. tostring(text))
+            emit("progress", "[ПРОГРЕССИЯ v16 LIVE-EGG-ETA-8 " .. world .. "] " .. tostring(text))
         end
         P.log = log
         local function parkRiftRebirth(request)
@@ -36642,6 +36732,13 @@ __modules["features/progress_test"] = function(use)
                     tostring(trial.island), math.floor(math.min(120, math.max(0, trial.elapsed or 0)))))
             elseif P.islandEggHoldReason then
                 log("цикл яиц: " .. tostring(P.islandEggHoldReason))
+            end
+            if type(trial)=="table" and (trial.status=="budget_farm" or trial.status=="hold") then
+                local eta=trial.eggEta and string.format("%.0f с",trial.eggEta) or "не подтверждён"
+                local left=trial.saveUntil and string.format("%.0f с",math.max(0,trial.saveUntil-os.clock())) or "нет"
+                log("бюджет яйца: "..tostring(trial.eggQuoteName or "не выбрано").." | ETA="..eta
+                    .." (предварительная оценка) | режим="..tostring(trial.status).." | остаток паузы="..left
+                    .." | лимит=600 с; портал и защиты отдельно")
             end
             log("доход Clicks=" .. incomeText("Clicks") .. "; для переключения режима порог не используется")
             log("яиц на прокачке: партий=" .. tostring(P.farmBatches or 0) .. " | крафт: "
@@ -37514,7 +37611,7 @@ __modules["features/progress_test"] = function(use)
                     end
                     if type(trial) == "table" and trial.status ~= P.islandEggLastTrialStatus then
                         if trial.status == "grace" then
-                            log("остров яиц " .. trial.island .. ": 120 с обычного фарма с ребёртами без нового Success; затем пауза до подтверждённого открытия; накопление на портал считается отдельно")
+                            log("остров яиц " .. trial.island .. ": 120 с обычного фарма; затем накопление только при ETA яйца до 10 минут, пауза максимум 10 минут; портал отдельно")
                         elseif trial.status == "complete" then
                             log("остров яиц " .. trial.island .. ": открытие подтверждено; начат новый 120-секундный цикл обычного фарма")
                         end
@@ -37850,11 +37947,11 @@ __modules["features/progress_test"] = function(use)
             genv.ts30TestState = nil
             genv.ts30TestStop = nil
         end)
-        log("сборка V16-LIVE-PORTAL-DEADLOCK-7: Clicks, ребёрты 20 с, Golden 100%; Ghost Ship исключён")
+        log("сборка V16-LIVE-EGG-ETA-8: Clicks, ребёрты 20 с, Golden 100%; Ghost Ship исключён")
         log("v16: мир=" .. world .. "; всегда Clicks; доступные яйца и максимальная партия без порога дохода")
         log("ребёрт не чаще раза в 20 с до финала Royal; максимальный найденный пакет, неподтверждённый запрос не повторяю")
         log("яйца — только на наиболее продвинутом подтверждённом острове; старые острова не использую")
-        log("повторяемый цикл яиц: 120 с обычного фарма без нового Success — пауза новых ребёртов до подтверждённого открытия; каждый Success запускает новый цикл; портал и защиты отдельно")
+        log("цикл яиц: после 120 с фарма коплю без ребёртов только при ETA яйца до 10 минут; пауза максимум 10 минут; иначе прокачка; каждый Success запускает новый цикл")
         log("финал: два ответа Royal x3 с сообщённым числом роллов и ростом баланса — эвристика, не гарантия будущей устойчивости; оба кликера остаются включены")
         log("порталы: при оценке до 10 минут временно коплю без яиц и ребёртов; клики остаются включены; иначе обычный фарм")
         log("чистка защищает секретов и команду, но может удалять прочих, включая Godly; сохранённые игровые настройки автоудаления яиц могут действовать")
@@ -38030,7 +38127,7 @@ do
 	pcall(Ui.set, "AutoReveal", true)
 	if Ui.on("AutoReveal") then logEvent("hold", "Hold to Reveal включён; обработчики яиц не глушатся")
 	else logEvent("warn", "Hold to Reveal не включился: модуль или тумблер не загрузился") end
-	logEvent("farm", "сборка V16-LIVE-PORTAL-DEADLOCK-7: локальные файлы отключены; сайт и Discord включены, цены встроенные")
+	logEvent("farm", "сборка V16-LIVE-EGG-ETA-8: локальные файлы отключены; сайт и Discord включены, цены встроенные")
 	logEvent("farm", "лучшее доступное яйцо: максимальная доступная партия; достигнутый уровень не понижаю; острова приоритетны")
 	pcall(function()
 		local picks = Ui.Options and Ui.Options.UpgradePicks
