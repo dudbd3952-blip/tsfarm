@@ -5179,7 +5179,7 @@ function Router.start(emit)
         log("активна отдельная прогрессия TimeRift: RiftCoins, RiftGems и RiftRebirths; Main больше не фармится")
         return true
     end
-    log("сборка V16-LIVE-CPU-PORTAL-4: прямой возврат к живому World2Portal, результат только по реплике")
+    log("сборка V16-LIVE-CPU-IDLE-5: прямой возврат к живому World2Portal, результат только по реплике")
     local stageName,stageAt="ожидание",os.clock()
     local function stage(name) stageName,stageAt=name,os.clock() end
     -- World-2 purchase is distinct from the already-journaled physical portal touch.
@@ -6285,7 +6285,9 @@ __modules["core/ui"] = function(use) -- src/games/tapsim/core/ui.luau
 -- Tap Simulator's window and tabs.
 
 local Ui = use("shared/ui")
-
+-- Slopix controls still provide automation settings. Only its unused display
+-- panels are suppressed; the separate farm statistics GUI remains available.
+Ui.__farmHiddenPanels=true
 return Ui.create({
     library = function() return use("vendor/ui") end,
     icons = use("vendor/icons"),
@@ -7133,16 +7135,17 @@ Life.loop("craft:panel", 1, function()
         local ok, detail=pcall(craftDiagnostics,data,P)
         lastCraftDetail=ok and tostring(detail) or ("диагностика: "..tostring(detail))
     end
-    local lines = {}
-    for _, key in ipairs(ORDER) do
-        local count = guaranteedCount(key, data)
-        lines[#lines + 1] = key .. ": " .. (count and (tostring(count) .. " pets at 100%") or "100% not confirmed")
-    end
     if P and Ui.__progressTest==P then
         P.craftInfo = lastCraftDetail .. " | последнее: " .. lastNote .. " | ответов Success=true=" .. tostring(total)
             .. (goldenGuard().lastResponse and (" | последнее событие Golden Success="
                 .. tostring(goldenGuard().lastResponse.successField) .. "; связь по ID не доказана") or "")
             .. (resultsReady and "" or " | жду ответный канал")
+    end
+    if Ui.__farmHiddenPanels==true then return end
+    local lines = {}
+    for _, key in ipairs(ORDER) do
+        local count = guaranteedCount(key, data)
+        lines[#lines + 1] = key .. ": " .. (count and (tostring(count) .. " pets at 100%") or "100% not confirmed")
     end
     lines[#lines + 1] = tostring(total) .. " Success responses (not proof of Golden) | " .. lastNote
     panel.set(lines, busy and "Crafting..." or "")
@@ -13708,14 +13711,12 @@ end)
 
 
 Life.loop("hatch:panel", 0.5, function()
-    local data = Env.data()
-    if not data then
-        return
-    end
+    -- Keep the bounded rate window even while the unused hub is hidden.
     local cutoff = os.clock() - 60
-    while recent[1] and recent[1] < cutoff do
-        table.remove(recent, 1)
-    end
+    while recent[1] and recent[1] < cutoff do table.remove(recent, 1) end
+    if Ui.__farmHiddenPanels==true then return end
+    local data = Env.data()
+    if not data then return end
     local lines = {}
     if current and EGGS[current] then
         local count = hatchCount(data, current) or 0
@@ -13761,6 +13762,7 @@ local function comma(n)
 end
 
 Life.loop("home:stats", 1, function()
+    if Ui.__farmHiddenPanels==true then return end
     statusLabel:SetText("Doing: " .. tostring(Ui.status or "Idle"))
     local data = Env.data()
     if not data then
@@ -15401,7 +15403,7 @@ group:AddToggle("PerfHideHatching", {
 group:AddDropdown("PerfHidePets", {
     Text = "Pets",
     Values = { KEEP, "Hide other players' pets", "Hide all pets" },
-    Default = "Hide other players' pets",
+    Default = "Hide all pets",
     Tooltip = "Pets following players are a large share of what gets drawn and moved each frame.",
 })
 
@@ -15598,7 +15600,9 @@ Ui.Toggles.PerfGameSettings:OnChanged(schedule)
 Ui.Options.PerfHidePets:OnChanged(schedule)
 Ui.Toggles.PerfHideHatching:OnChanged(refreshVisuals)
 -- A handler the game connects later (after a respawn, a menu opening) is caught on the next pass.
-Life.loop("performance:visuals", 3, refreshVisuals)
+-- Farm mode never mutes the result handlers needed by Hold to Reveal.
+-- Toggle callbacks and cleanup still run; no periodic inactive inspection job.
+if not Ui.__farmHiddenPanels then Life.loop("performance:visuals",3,refreshVisuals) end
 Life.onCleanup(unmuteVisuals)
 
 -- A previous session that never put your settings back: do it now, unless the saved config is
@@ -15816,6 +15820,7 @@ Life.loop("pets:equip", 1, function()
         equipBest()
         Ui.status = "Equipping best pets"
     end
+    if Ui.__farmHiddenPanels==true then return end -- equip work above remains active
     local names = teamSummary()
     if names then
         label:SetText("Equipped: " .. (table.concat(names, ", ")):sub(1, 140))
@@ -22203,6 +22208,14 @@ local Settings = load("features/settings")
 if Settings then
     Settings.finish()
 end
+-- Enforce the requested CPU-saving display preference after any autoload.
+-- The existing SettingsService adapter saves/restores the game setting.
+do
+    local option=Ui.Options and Ui.Options.PerfHidePets
+    if option and option.Value~="Hide all pets" then
+        pcall(function() option:SetValue("Hide all pets") end)
+    end
+end
 
 -- After the autoload, so a saved "Claim offline earnings on load: off" is respected.
 local Rewards = loaded["features/rewards"]
@@ -22955,7 +22968,7 @@ function Ui.create(options)
     Ui.Window = Library:CreateWindow({
         Title = "Slopix Hub",
         Footer = options.footer,
-        AutoShow = true,
+        AutoShow = Ui.__farmHiddenPanels~=true,
         Center = true,
         Resizable = true,
         ShowCustomCursor = false,
@@ -22981,6 +22994,9 @@ end
 
 -- A fixed stack of labels plus a footer, for lists that change size (tasks, timers, chests).
 function Ui.panel(groupbox, rows)
+    if Ui.__farmHiddenPanels==true then
+        return {set=function() end} -- do not build unused label instances
+    end
     local labels = {}
     for index = 1, rows do
         labels[index] = groupbox:AddLabel("", true)
@@ -36309,7 +36325,7 @@ __modules["features/progress_test"] = function(use)
         P.remoteError = nil
 
         local function log(text)
-            emit("progress", "[ПРОГРЕССИЯ v16 LIVE-CPU-PORTAL-4 " .. world .. "] " .. tostring(text))
+            emit("progress", "[ПРОГРЕССИЯ v16 LIVE-CPU-IDLE-5 " .. world .. "] " .. tostring(text))
         end
         P.log = log
         local function parkRiftRebirth(request)
@@ -37796,7 +37812,7 @@ __modules["features/progress_test"] = function(use)
             genv.ts30TestState = nil
             genv.ts30TestStop = nil
         end)
-        log("сборка V16-LIVE-CPU-PORTAL-4: Clicks, ребёрты 20 с, Golden 100%; Ghost Ship исключён")
+        log("сборка V16-LIVE-CPU-IDLE-5: Clicks, ребёрты 20 с, Golden 100%; Ghost Ship исключён")
         log("v16: мир=" .. world .. "; всегда Clicks; доступные яйца и максимальная партия без порога дохода")
         log("ребёрт не чаще раза в 20 с до финала Royal; максимальный найденный пакет, неподтверждённый запрос не повторяю")
         log("яйца — только на наиболее продвинутом подтверждённом острове; старые острова не использую")
@@ -37976,7 +37992,7 @@ do
 	pcall(Ui.set, "AutoReveal", true)
 	if Ui.on("AutoReveal") then logEvent("hold", "Hold to Reveal включён; обработчики яиц не глушатся")
 	else logEvent("warn", "Hold to Reveal не включился: модуль или тумблер не загрузился") end
-	logEvent("farm", "сборка V16-LIVE-CPU-PORTAL-4: локальные файлы отключены; сайт и Discord включены, цены встроенные")
+	logEvent("farm", "сборка V16-LIVE-CPU-IDLE-5: локальные файлы отключены; сайт и Discord включены, цены встроенные")
 	logEvent("farm", "лучшее доступное яйцо: максимальная доступная партия; достигнутый уровень не понижаю; острова приоритетны")
 	pcall(function()
 		local picks = Ui.Options and Ui.Options.UpgradePicks
@@ -38235,40 +38251,56 @@ do
 		Ui.Library.ToggleKeybind = Enum.KeyCode.Unknown
 	end)
 
-	local function killHubGui()
-		local parents = {}
-		pcall(function()
-			if typeof(gethui) == "function" then
-				table.insert(parents, gethui())
-			end
-		end)
-		pcall(function()
-			table.insert(parents, game:GetService("CoreGui"))
-		end)
-		pcall(function()
-			local player = game:GetService("Players").LocalPlayer
-			if player and player:FindFirstChild("PlayerGui") then
-				table.insert(parents, player.PlayerGui)
-			end
-		end)
-		for _, parent in ipairs(parents) do
-			if typeof(parent) == "Instance" then
-				for _, child in ipairs(parent:GetChildren()) do
-					if child:IsA("ScreenGui") and string.find(string.lower(child.Name), "obsidian") then
-						if __NO_GUI then
-							pcall(function()
-								child:Destroy()
-							end)
-						else
-							child.Enabled = false
-						end
-					end
-				end
-			end
-		end
-	end
-	killHubGui()
-	Life.loop("panel:hubkill", 0.5, killHubGui)
+	local function watchHubGui()
+        local parents,seenRoots,seenGuis,connections={},{},{},{}
+        local function keep(connection)
+            if connection then connections[#connections+1]=connection end
+        end
+        local function suppress(child)
+            local ok,ours=pcall(function()
+                return child:IsA("ScreenGui") and string.find(string.lower(child.Name),"obsidian",1,true)~=nil
+            end)
+            if not ok or not ours or seenGuis[child] then return end
+            seenGuis[child]=true
+            local function hide()
+                if not Life.alive then return end
+                pcall(function()
+                    if __NO_GUI then child:Destroy()
+                    elseif child.Enabled then child.Enabled=false end
+                end)
+            end
+            if not __NO_GUI then
+                local got,c=pcall(function() return child:GetPropertyChangedSignal("Enabled"):Connect(hide) end)
+                if got then keep(c) end
+            end
+            hide()
+        end
+        local function addRoot(parent)
+            if typeof(parent)~="Instance" or seenRoots[parent] then return end
+            seenRoots[parent]=true;parents[#parents+1]=parent
+            -- Subscribe before the initial snapshot so a newly added GUI is not missed.
+            local ok,c=pcall(function() return parent.ChildAdded:Connect(suppress) end)
+            if ok then keep(c) end
+            local got,kids=pcall(function() return parent:GetChildren() end)
+            if got and type(kids)=="table" then for _,child in ipairs(kids) do suppress(child) end end
+        end
+        pcall(function() if type(gethui)=="function" then addRoot(gethui()) end end)
+        pcall(function() addRoot(game:GetService("CoreGui")) end)
+        pcall(function()
+            local player=game:GetService("Players").LocalPlayer
+            if not player then return end
+            keep(player.ChildAdded:Connect(function(child)
+                if child:IsA("PlayerGui") then addRoot(child) end
+            end))
+            local playerGui=player:FindFirstChild("PlayerGui")
+            if playerGui then addRoot(playerGui) end
+        end)
+        Life.onCleanup(function()
+            for _,c in ipairs(connections) do pcall(function() c:Disconnect() end) end
+            table.clear(connections);table.clear(seenGuis);table.clear(seenRoots);table.clear(parents)
+        end)
+    end
+    watchHubGui()
 
 	-- Крафт только из мусора: белый список — петы, у которых шанс выпадения >= CRAFT_MIN_CHANCE.
 	-- Всё остальное уходит в "Never craft", поэтому секреты и редкие в машины не попадают.
@@ -39678,8 +39710,9 @@ do
 
 	local petSamples = {}
 
-	Life.loop("panel:stats", 1, function()
-		if not gui.Parent then
+	local function refreshFarmPanel()
+		if not gui.Parent or not gui.Enabled then
+            table.clear(petSamples) -- do not report a hidden interval as a fresh pets/min sample
 			return
 		end
 		local data = Env.data()
@@ -39755,6 +39788,8 @@ do
 		-- цвет: хранилище почти полное — предупредить
 		storageRow.TextColor3 = (limit and petCount / limit > 0.9) and Color3.fromRGB(235, 130, 100)
 			or Color3.fromRGB(240, 240, 245)
-	end)
+    end
+    Life.loop("panel:stats",1,refreshFarmPanel)
+    Life.connect(gui:GetPropertyChangedSignal("Enabled"),refreshFarmPanel,"panel:visibility")
 end
 return Hub
