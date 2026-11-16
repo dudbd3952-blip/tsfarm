@@ -3965,6 +3965,640 @@ end
 return R
 end
 
+__modules["features/auto_compare"] = function(use)
+local Env,Ui,Life,W=use("core/env"),use("core/ui"),use("shared/life"),use("features/world_data")
+local C=(function()
+local C={}
+function C.finite(v)local n=tonumber(v);if n and n==n and n>=0 and n<math.huge then return n end end
+function C.median(a)
+ if #a==0 then return nil end
+ local t=table.clone(a);table.sort(t);local n=#t
+ return n%2==1 and t[(n+1)/2] or (t[n/2]+t[n/2+1])/2
+end
+C.strategies={
+ RB_ONLY={id="RB_ONLY",gap=20,eggShare=0,eggHold=0,label="Только максимальный rebirth >=20с; яйца/Golden/EquipBest выключены"},
+ EGGS_ONLY={id="EGGS_ONLY",gap=20,eggShare=1,eggHold=180,label="Только яйца/Golden/EquipBest; rebirth в активной пробе запрещён"},
+ MIXED={id="MIXED",gap=20,eggShare=.4,eggHold=30,label="Яйца до40% модельного бюджета + максимальный rebirth >=20с; ожидание яйца <=30с"}}
+function C.order(id,cycle)
+ local a={"RB_ONLY","EGGS_ONLY","MIXED"};local out={};local offset=(cycle or 0)%3
+ for i=1,3 do out[i]=a[(i+offset-1)%3+1]end
+ return out
+end
+function C.finish(row)
+ if not row.pre or not row.post or not row.activeSeconds or row.activeSeconds<=0 then row.valid=false;return end
+ row.rbGain=row.endSnapshot.rb-row.startSnapshot.rb
+ row.walletChange=row.endSnapshot.coins-row.startSnapshot.coins
+ if not row.pre.rate or not row.post.rate or row.pre.rate<=0 or row.post.rate<=0 then row.valid=false;row.invalidReason="zero_observed_income";return end
+ row.incomeRatio=row.post.rate/row.pre.rate
+ row.growthPerMinute=math.log(row.incomeRatio)*60/row.activeSeconds
+ row.distinguishable=row.post.low>row.pre.high or row.post.high<row.pre.low
+ row.valid=not row.unattributedCounterChange and not row.pre.counterChanged and not row.post.counterChanged and not row.pre.teamChanged and not row.post.teamChanged and (row.pre.drops or 0)==0 and (row.post.drops or 0)==0 and row.pre.rate>0 and row.post.rate>0 and row.pre.spread<=.25 and row.post.spread<=.25
+ row.eggStrategyExecuted=C.strategies[row.strategy].eggShare==0 or (row.eggs or 0)>=15
+ row.eggOutcome=C.strategies[row.strategy].eggShare==0 and "not_applicable" or ((row.eggs or 0)==0 and "not_executed" or ((row.eggs or 0)<15 and "too_few_eggs" or "executed_15plus"))
+ local target=row.target
+ if target and target.price and target.price>0 then
+  row.preEta=math.max(0,target.price-row.startSnapshot.coins)/row.pre.rate
+  row.postEta=math.max(0,target.price-row.endSnapshot.coins)/row.post.rate
+  row.etaSavingPerSecond=(row.preEta-row.postEta)/math.max(1,row.totalSeconds or row.activeSeconds)
+  -- Conservative interval from observed rate windows, NOT statistical confidence.
+  row.scoreLow=(math.max(0,target.price-row.startSnapshot.coins)/row.pre.high
+   -math.max(0,target.price-row.endSnapshot.coins)/row.post.low)/math.max(1,row.totalSeconds or row.activeSeconds)
+  row.scoreHigh=(math.max(0,target.price-row.startSnapshot.coins)/row.pre.low
+   -math.max(0,target.price-row.endSnapshot.coins)/row.post.high)/math.max(1,row.totalSeconds or row.activeSeconds)
+ end
+end
+function C.rank(rows)
+ local groups={}
+ for _,r in ipairs(rows)do
+  if r.valid and r.eggStrategyExecuted and r.etaSavingPerSecond~=nil and not (r.preEta==0 and r.postEta==0) then
+   local g=groups[r.strategy]or {strategy=r.strategy,scores={},lo={},hi={},validation=0,discovery=0}
+   groups[r.strategy]=g;g.scores[#g.scores+1]=r.etaSavingPerSecond
+   g.lo[#g.lo+1]=r.scoreLow;g.hi[#g.hi+1]=r.scoreHigh
+   if r.validation then g.validation+=1 else g.discovery+=1 end
+  end
+ end
+ local a={}
+ for _,g in pairs(groups)do a[#a+1]={strategy=g.strategy,samples=#g.scores,score=C.median(g.scores),
+  low=C.median(g.lo),high=C.median(g.hi),validation=g.validation,discovery=g.discovery}end
+ table.sort(a,function(x,y)if x.score==y.score then return x.strategy<y.strategy end;return x.score>y.score end)
+ return a
+end
+function C.coverage(rows)
+ local modes={};local count=0
+ for _,r in ipairs(rows)do
+  if r.complete and r.valid and (r.strategy=="RB_ONLY" or (r.eggs or 0)>=15)then modes[r.strategy]=true;count+=1 end
+ end
+ return {eligibleModes=modes,eligibleTrials=count,fullFarmCompared=modes.RB_ONLY==true and modes.EGGS_ONLY==true and modes.MIXED==true,
+ minimumEggsForStrongPetComparison=15,note="Три разных режима. Небольшие серии дают наблюдение, не надёжную оценку выпадений/крафта"}
+end
+function C.verdict(rows)
+ local rank=C.rank(rows)
+ local all=#rows==3
+ for _,rr in ipairs(rows)do if not rr.complete or not rr.valid or not rr.eggStrategyExecuted then all=false end end
+ local out={status="insufficient",ranking=rank,coverage=C.coverage(rows),reason="Нужны три качественные исполненные пробы, включая15+яиц в каждой яичной пробе"}
+ if all and #rank==3 then
+  out.status="inconclusive";out.reason="Диапазоны наблюдений перекрываются; режим не меняю"
+  local a=rank[1];local separate=a.low>0
+  for i=2,#rank do if a.low<=rank[i].high then separate=false end end
+  if separate then out.status="local_candidate";out.strategy=a.strategy;out.reason="Локальный кандидат; для применения требуется повторное подтверждение следующей проверкой"end
+ end
+ return out
+end
+return C
+
+end)()
+local E={};local D
+local Http=game:GetService("HttpService")
+local function snapshot(P,data)
+ data=data or Env.data();assert(W.isCurrent(P,data),"мир изменился/реплика недоступна")
+ local coins,rb=W.coins(data),W.rebirths(data);assert(coins and rb,"нет валюты/счётчика")
+ local pets=data.Pets;assert(type(pets)=="table" and type(pets.Equipped)=="table","нет команды")
+ local ids={};local power=0;local powerKnown=true
+ for k,v in pairs(pets.Equipped)do
+  local id=type(v)=="table" and (v.Id or v.PetId or v.PetID) or (v==true and k or v)
+  if type(id)=="string" or type(id)=="number"then
+   ids[#ids+1]=tostring(id)
+   local p=type(pets.Owned)=="table" and pets.Owned[id]
+   local n=type(p)=="table" and C.finite(p.Power)
+   if n then power+=n else powerKnown=false end
+  else error("неоднозначный Equipped")end
+ end
+ assert(#ids>0,"пустая команда");table.sort(ids)
+ return {at=os.clock(),coins=coins,rb=rb,level=data.Upgrades and data.Upgrades.RiftRebirthButtons,
+  team=table.concat(ids,"|"),rawTeamPower=powerKnown and power or nil,island=P.islandEggVerified}
+end
+local function log(text)
+ print("[AUTO-FARM] "..text)
+ if D and D.label then D.label.Text=text end
+end
+local function row()return D and D.rows[#D.rows]end
+local function expired()return not D or D.finished or os.clock()>=D.deadline end
+function E.active()return not expired() and D.phase=="active" and os.clock()<D.phaseEnd end
+function E.gap()local r=row();return r and C.strategies[r.strategy].gap or 20 end
+function E.cleanAllowed()return D~=nil and not expired() and (D.phase=="warmup" or E.active())end
+function E.craftAllowed()
+ if not D or expired()then return false end
+ if D.phase=="warmup"then return true end
+ local rr=row();local ss=rr and C.strategies[rr.strategy]
+ return ss and ss.eggShare>0 and (E.active() or D.phase=="craft_settle" and os.clock()<D.phaseEnd) or false
+end
+function E.catalog(eggs)E.eggs=eggs end
+function E.eggOnIsland(P,egg)
+ local def=E.eggs and E.eggs[egg]
+ if not def or def.world~="TimeRift" or not P.islandEggVerified then return false end
+ local api=use("features/rift_islands")
+ local a=api.resolveIsland(def.island or "Spawn") or def.island or "Spawn"
+ local b=api.resolveIsland(P.islandEggVerified) or P.islandEggVerified
+ return W.sameName(a,b)
+end
+local function strategy()local r=row();return r and C.strategies[r.strategy]end
+local function budget()
+ local r=row();local s=strategy()
+ return r and s and math.max(0,s.eggShare*(r.startSnapshot.coins+(r.modeledInflow or 0))-(r.eggCommitted or 0)) or 0
+end
+local function goalIsland(P)
+ local royal=E.eggs and E.eggs.Royal
+ return royal and royal.world=="TimeRift" and E.eggOnIsland(P,"Royal")
+end
+function E.eggAllowed(P,data,cost,unit,egg,count)
+ if not E.active() or Ui.__progressTest~=P or not W.isCurrent(P,data)then return false,"эксперимент: сейчас яйца на паузе"end
+ local r,s=row(),strategy()
+ if s.eggShare==0 or (r.eggRollsCommitted or 0)>=20 then return false,"эксперимент: лимит/стратегия без яиц"end
+ if egg and egg~="" and not E.eggOnIsland(P,egg) then return false,"другой остров" end
+ if count and (r.eggRollsCommitted or 0)+count>20 then return false,"лимит20" end
+ if egg and egg~="" and goalIsland(P) and egg~="Royal"then return false,"цель Royal: дешёвые яйца этого острова исключены"end
+ if egg=="Royal" and count and count~=3 then return false,"Royal только x3"end
+ if cost then
+  cost=C.finite(cost);if not cost or cost<=0 or cost>budget()then return false,"эксперимент: бюджет яиц"end
+  if not W.coins(data) or W.coins(data)<cost then return false,"нет реального баланса"end
+ end
+ return true
+end
+function E.reserveEgg(P,data,token,egg,count,cost)
+ if not E.owns(P)then
+  local s=P.autoComparePolicy
+  if s and s.mode=="MIXED"then
+   local yes=E.policyEgg(P,data,cost,nil,egg,count)
+   if yes==false then return false end
+   s.modeTokens=s.modeTokens or {};if s.modeTokens[token]then return false end
+   s.modeTokens[token]=true;s.modeSpent=(s.modeSpent or 0)+cost
+  end
+  return true
+ end
+ local yes=E.eggAllowed(P,data,cost,nil,egg,count)
+ if not yes or D.eggByToken[token] then return false end
+ local r=row();D.lastEggToken=token
+ r.eggCommitted+=cost;r.hatchSends+=1;r.eggRollsCommitted=(r.eggRollsCommitted or 0)+count
+ local slot={token=token,egg=egg,count=count,cost=cost,at=os.clock(),row=#D.rows}
+ D.eggPending=slot;D.eggByToken[token]=slot;r.eggRequests[#r.eggRequests+1]=slot
+ D.eggHoldAt=nil;D.eggProbeCooldown=os.clock()+E.gap()
+ return true
+end
+function E.eggSuccess(P,token)
+ if not D or D.P~=P then return end
+ local slot=D.eggByToken[token];if not slot then return end
+ if slot.accepted then return end
+ slot.accepted=true;local r=D.rows[slot.row];r.eggs+=slot.count;r.eggAcceptedCost+=slot.cost
+end
+function E.goldenSuccess(P)
+ local r=row();if r and D and D.P==P and not D.finished then r.goldenResponses+=1 end
+end
+function E.rebirthHold(P,data)
+ if D and not expired() and D.phase=="normalize" and not D.normalizationSent then
+  -- P.pending is also the controller's UNSENT preparation. canRebirth
+  -- validates P.pending==prepared at each stage; do not reject its own lease.
+  local pending=P.pending
+  local ownUnsent=type(pending)=="table" and pending.dispatched==false
+   and pending.localOwner~=nil and pending.world==P.worldName
+   and pending.before==W.rebirths(data) and C.finite(pending.amount) and pending.amount>0
+   and C.finite(pending.index) and pending.index>0
+  if D.pending or (pending and not ownUnsent) or Ui.hatchInFlight or Ui.hatchMoving or P.portalHatchSlot or P.hatchUncertain
+   or P.previousHatchPending or P.craftInFlight or P.craftBusy or P.cleaning or P.portalCraftSlot then
+   return true,"подготовка: жду завершения независимой операции"
+  end
+  return false
+ end
+ if not E.active()then return true,"эксперимент: "..tostring(D and D.phase or "подготовка")end
+ if D.pending then return true,"эксперимент: уже отправлен rebirth"end
+ if Ui.hatchInFlight or Ui.hatchMoving or P.portalHatchSlot or P.hatchUncertain or P.previousHatchPending
+  or P.craftInFlight or P.craftBusy or P.cleaning then return true,"ожидание независимой операции"end
+ local r,s=row(),strategy();local now=os.clock()
+ if s.id=="EGGS_ONLY"then return true,"только яйца: rebirth запрещён"end
+ if s.eggShare>0 and ((r.eggRollsCommitted or 0)<20) and now>=(D.eggProbeCooldown or 0) then
+  local q=D.quote
+  if not q then
+   if now-r.activeAt<5 then return true,"ожидание live-цены яйца (до5с)"end
+   r.eggPlanningNote="нет доступной live-цены/места; яйца не проверены"
+  elseif now>=q.at and now-q.at<=5 then
+   local coins=W.coins(data);local rate=r.pre and r.pre.rate
+   if coins and rate and rate>0 then
+    local coinEta=math.max(0,q.price-coins)/rate
+    local budgetEta=math.max(0,q.price-budget())/(s.eggShare*rate)
+    local eta=math.max(coinEta,budgetEta)
+    local remaining=math.max(0,D.phaseEnd-now)
+    r.lastEggPlan={projectedBatchesByBudget=math.floor((budget()+s.eggShare*rate*remaining)/q.price),egg=q.egg,price=q.price,coinEta=coinEta,budgetEta=budgetEta,eta=eta,
+     budget=budget(),remaining=remaining,at=now}
+    if budgetEta>remaining then
+     r.eggPlanningNote="бюджет одного яйца недостижим до конца пробы"
+    elseif eta<=s.eggHold and eta+2<=remaining then
+     D.eggHoldAt=D.eggHoldAt or now
+     if now-D.eggHoldAt<s.eggHold then
+      r.eggPlanningNote="накапливаю баланс И бюджет на одно яйцо"
+      return true,r.eggPlanningNote
+     end
+     r.eggPlanningNote="истёк предел ожидания яйца; разрешён rebirth"
+     D.eggHoldAt=nil;D.eggProbeCooldown=now+20
+    else
+     r.eggPlanningNote="яйцо не укладывается в предел ожидания/остаток пробы"
+    end
+   end
+  end
+ end
+ return false
+end
+function E.rebirthReady(P,now)
+ if not D or expired() or Ui.__progressTest~=P or D.pending or D.stop or not Life.alive
+  or Ui.__globalStop or Ui.__handoverPaused or P.stopRequested or P.worldChanging then return false end
+ local normalizing=D.phase=="normalize" and not D.normalizationSent
+ if not normalizing and (not E.active() or row().strategy=="EGGS_ONLY")then return false end
+ return not D.lastRebirthAt or now-D.lastRebirthAt>=E.gap()
+end
+function E.sentRebirth(P,request)
+ assert(E.rebirthReady(P,os.clock()),"experiment final send gate changed")
+ local r=row()
+ local item={at=os.clock(),before=request.before,index=request.index,amount=request.amount,price=request.price,
+  balance=request.coins,row=#D.rows,dispatched=true}
+ local options=P.riftPackCandidate and P.riftPackCandidate.options
+ item.quotes={}
+ for _,o in ipairs(options or {})do item.quotes[#item.quotes+1]={index=o.index,amount=o.amount,price=o.price}end
+ D.pending=item;D.lastRebirthAt=item.at
+ if D.phase=="normalize"then D.normalizationSent=true;item.preparation=true;r.normalizationRequest=item
+ else r.rebirthRequests[#r.rebirthRequests+1]=item end
+end
+function E.quote(P,data)
+ if not E.active() or not D.quoteProvider or os.clock()<(D.nextQuote or 0)then return end
+ D.nextQuote=os.clock()+2
+ local ok,price,egg=pcall(D.quoteProvider,P,data)
+ if not D or D.finished or Ui.__progressTest~=P then return end
+ price=ok and C.finite(price)or nil
+ if price and price>0 then
+  D.quote={price=price,egg=egg,at=os.clock()}
+  local rr,ss=row(),strategy()
+  if rr and rr.pre and ss.eggShare>0 then
+   local remaining=math.max(0,D.phaseEnd-os.clock());local rate=rr.pre.rate
+   rr.lastPriceFeasibility={egg=egg,batchCost=price,remaining=remaining,
+    coinEta=math.max(0,price-(W.coins(data)or 0))/rate,
+    budgetEta=math.max(0,price-budget())/(ss.eggShare*rate),
+    maxAdditionalQuotedBatchesByBudget=math.floor((budget()+ss.eggShare*rate*remaining)/price)}
+   rr.initialPriceFeasibility=rr.initialPriceFeasibility or rr.lastPriceFeasibility
+  end
+ else D.quote=nil end
+end
+function E.setQuoteProvider(fn)E.quoteProvider=fn;if D then D.quoteProvider=fn end end
+local function busy(P)
+ for _,k in ipairs({"pending","previousRebirthPending","previousOtherWorldRebirthPending","previousHatchPending",
+ "previousCraftPending","hatchUncertain","craftUncertain","craftInFlight","craftBusy","portalCraftSlot","portalHatchSlot",
+ "cleaning","upgradeInFlight","skillInFlight","upgradeUncertain","skillUncertain","cleanUncertain","islandUncertain",
+ "islandTravelUncertain","previousIslandPending"})do if P[k] then return k end end
+ for _,k in ipairs({"hatchInFlight","hatchMoving","travelling"})do if Ui[k]then return "Ui."..k end end
+ local gg=Env.runState and Env.runState.goldenGuard
+ if gg and gg.pending then return "goldenGuard.pending"end
+end
+local function measureNote(reason)
+ local r=row();if not r then return end
+ local key=D.phase;local m=r.measureDiagnostics[key]
+ if not m then m={events={},observations=0};r.measureDiagnostics[key]=m end
+ m.observations+=1;m.events[reason]=(m.events[reason]or 0)+1;m.lastReason=reason
+ if D.sample then m.lastRates=table.clone(D.sample.rates)end
+end
+
+local function export()
+ if not D then return end
+ local verdict=C.verdict(D.rows)
+ local unresolved={}
+ for token,slot in pairs(D.eggByToken)do if not slot.accepted then unresolved[#unresolved+1]={token=token,row=slot.row,age=(D.finishedAt or os.clock())-slot.at,egg=slot.egg,count=slot.count}end end
+ local public={version=D.version,account=D.account,userId=D.userId,status=D.status,reason=D.reason,
+  elapsed=(D.finishedAt or os.clock())-D.started,phase=D.phase,stoppedFromPhase=D.previousPhase,preflight=D.preflight,initial=D.initial,strategies=C.strategies,rows=D.rows,
+  plan=D.plan,verdict=verdict,coverage=C.coverage(D.rows),pendingRebirth=D.pending,unconfirmedEggRequests=unresolved,limits={seconds=720,activePerTrial={180,180,180},windows=2,windowSeconds=5},
+  notes={"Это сравнение необратимых последовательных стратегий на одном фиксированном острове, не глобальная оптимизация.",
+  "Метрика: условный ETA ценового ориентира острова/Royal при постоянном доходе; на Spawn возможен ориентир дороже стартбаланса, не доказательство закрытого острова и не срок.",
+  "Бюджет яиц использует стартовый баланс испытания и МОДЕЛЬ поступлений по его исходному доходу; это не защищённый кошелёк.",
+  "Питомцы не откатываются. Фиксированный план RB_ONLY → EGGS_ONLY → MIXED. Перед каждым режимом один максимальный rebirth нормализует кошелёк; подготовка учитывается отдельно и во времени. Пробы не независимы.",
+  "Предел720с включает подготовку, измерения и завершение операций. Активная проба150с может дать меньше15 открытий: это частичная проверка, не полноценное сравнение петов.",
+  "Все покупки настоящие, все доступные цены пересчитываются штатным селектором перед каждым rebirth.",
+  "Golden подтверждается ответом, сопоставление инвентаря не возвращено. Сырые Power не равны доказанному множителю дохода."}}
+ local ok,text=pcall(Http.JSONEncode,Http,public)
+ if ok then D.json=text;if D.box then D.box.Text=text end else log("Ошибка JSON: "..tostring(text))end
+ return ok and text or nil
+end
+local function finish(status,reason)
+ if not D or D.finished then return end
+ D.previousPhase=D.phase;D.finishedAt=os.clock();D.finished=true;D.status=status;D.reason=reason;D.phase="finished"
+ local r=row();if r and not r.complete then r.incompleteReason=reason;r.interruptedPhase=D.previousPhase end
+ local text=export();log("Завершено: "..reason..". Отчёт сохранён в состоянии основной фермы; продолжение по её политике.")
+ if text then
+  print("[FARM EXPERIMENT BEGIN "..D.account.."]")
+  for i=1,#text,2500 do print(text:sub(i,i+2499))end
+  print("[FARM EXPERIMENT END "..D.account.."]")
+ end
+end
+local function phase(name,seconds)
+ D.phase=name;D.phaseAt=os.clock();D.phaseEnd=D.phaseAt+seconds;D.sample=nil
+ log("Испытание "..tostring(#D.rows)..": "..tostring(row()and row().strategy or "разогрев").." | "..name.." | rebirth >="..tostring(E.gap()).."с"..(row() and row().strategy=="EGGS_ONLY" and " (в active rebirth ЗАПРЕЩЁН)" or ""))
+end
+local function nextTrial(snap)
+ D.position+=1
+ if D.position>#D.plan then finish("complete","три режима завершены; сравнение дохода/монет/ETA в отчёте, не глобальный оптимум");return end
+
+ local id=D.plan[D.position]
+ D.rows[#D.rows+1]={strategy=id,validation=false,started=os.clock(),
+  eggs=0,hatchSends=0,eggCommitted=0,eggAcceptedCost=0,goldenResponses=0,
+  measureDiagnostics={},modeledInflow=0,rebirthRequests={},eggRequests={},target=D.target}
+ D.pending=nil;D.quote=nil;D.eggPending=nil;D.eggHoldAt=nil;D.eggProbeCooldown=0
+ D.normalizationSent=false;phase("normalize",45)
+end
+local function measure(snap)
+ local m=D.sample
+ if not m then
+  D.sample={last=snap,window=snap,rates={}};return
+ end
+ local delta=snap.coins-m.last.coins
+ m.positive=(m.positive or 0)+math.max(0,delta)
+ if delta<0 then m.drops=(m.drops or 0)+1;measureNote("ignored_balance_drop")end
+ if snap.rb~=m.last.rb then measureNote("rebirth_changed_during_measurement");m.counterChanged=true end
+ if snap.team~=m.last.team then measureNote("team_changed_during_measurement");m.teamChanged=true end
+ m.last=snap
+
+ if snap.at-m.window.at>=5 then
+  local rate=((m.positive or 0)-(m.windowPositive or 0))/(snap.at-m.window.at)
+  m.windowPositive=m.positive or 0
+  m.rates[#m.rates+1]=rate;m.window=snap;measureNote(rate>0 and "positive_window" or "nonpositive_window")
+  if #m.rates>=2 then
+   local median=C.median(m.rates)
+   if not median or median<=0 then return end
+   local lo,hi=math.huge,0
+   for _,v in ipairs(m.rates)do lo=math.min(lo,v);hi=math.max(hi,v)end
+   if lo<=0 then return end
+   return {drops=m.drops or 0,counterChanged=m.counterChanged,teamChanged=m.teamChanged,rate=median,low=lo,high=hi,spread=(hi-lo)/median,windows=m.rates,rb=snap.rb,team=snap.team}
+  end
+ end
+end
+local function observeCounter(snap)
+ local old=D.lastSnapshot
+ if not old then D.lastSnapshot=snap;return end
+ if snap.rb~=old.rb then
+  local p=D.pending
+  if not p or p.consumed or snap.rb~=p.before+p.amount then
+   local rr=row();if rr then rr.unattributedCounterChange=true;rr.lastUnattributedCounter={before=old.rb,after=snap.rb,at=snap.at}end
+  else
+  p.consumed=true;p.after=snap.rb;p.observedAt=snap.at;p.coinsAfter=snap.coins
+  end
+ end
+ D.lastSnapshot=snap
+ if D.pending and D.pending.consumed and not D.P.pending then D.pending=nil end
+ if D.pending and snap.at-D.pending.at>35 and not D.pending.consumed then
+  finish("stopped","исход отправленного rebirth неизвестен более35с; повторов нет")
+ end
+end
+local function findTarget(P)
+ local api=use("features/rift_islands");local catalog=api.focusCatalog()
+ if type(catalog)~="table" then return nil end
+ local canonical=api.resolveIsland(P.islandEggVerified) or P.islandEggVerified
+ local current=catalog[canonical]
+ -- Spawn is the root, not a purchasable island. Never invent its price or order.
+ local root=not current and W.sameName(P.islandEggVerified,"Spawn")
+ if not current and not root then return nil end
+ local order=current and C.finite(current.Order)
+ if not order and not root then return nil end
+ local best
+ for name,def in pairs(catalog)do
+  local n=C.finite(def.Order);local price=C.finite(def.Price)
+  if n and (root or n>order) and price and price>0 then
+   if not best or n<best.order then best={name=name,price=price,order=n};best.ambiguous=nil
+   elseif n==best.order then best.ambiguous=true end
+  end
+ end
+ -- Root may already afford early islands. Use an explicitly labelled price
+ -- reference ahead of the initial wallet, not a claim that those islands are locked.
+ if root and best and best.price<=(W.coins(Env.data()) or 0) then
+  local reference
+  for name,def in pairs(catalog)do
+   local n=C.finite(def.Order);local price=C.finite(def.Price)
+   if n and price and price>(W.coins(Env.data()) or 0) then
+    if not reference or n<reference.order then reference={name=name,price=price,order=n,rootBalanceReference=true}
+    elseif n==reference.order then reference.ambiguous=true end
+   end
+  end
+  if reference then best=reference end
+ end
+ if goalIsland(P)then
+  local royal=E.eggs.Royal;local price=C.finite(royal.price)
+  if price and price>0 then return {name="Royal x3 (базовая цена конфига)",price=price*3,quoteKind="base_config_not_live_total"}end
+ end
+ if best and best.ambiguous then return nil end
+ if best then best.quoteKind=best.rootBalanceReference and "island_config_above_start_wallet_not_access_claim" or "island_config"end
+ return best
+end
+function E.tick(P,data)
+ if not D or D.finished then return end
+ local now=os.clock()
+ if now>=D.deadline then finish("time_limit","достигнут предел12мин");return end
+ if D.stop or P.stopRequested or Ui.__globalStop or not Life.alive then finish("stopped","остановка пользователем");return end
+ assert(Ui.__progressTest==P,"контроллер заменён")
+ local snap=snapshot(P,data)
+ if D.fixedIsland and snap.island and snap.island~=D.fixedIsland then finish("stopped","остров изменился; сравнение смешивать нельзя");return end
+ observeCounter(snap);if D.finished then return end
+ if P.phase=="blocked" or P.phase=="uncertain"or P.phase=="hatch_uncertain"then
+  finish("stopped","контроллер заблокирован: "..tostring(P.note));return
+ end
+ if D.phase=="warmup"then
+  local pets=data.Pets;local limit=pets and C.finite(pets.StorageLimit)
+  local free
+  if limit and limit>0 and type(pets.Owned)=="table" then
+   local count=0;for _ in pairs(pets.Owned)do count+=1 end
+   free=math.max(0,limit-count)
+  end
+  D.preflight={freeSlots=free,requiredSlots=3,storageKnown=free~=nil}
+  if now>=D.phaseEnd and P.islandEggVerified and P.riftEggScanReady and not busy(P) and free and free>=3 then
+   D.fixedIsland=P.islandEggVerified;D.target=findTarget(P);D.initial=snap
+   if not D.target then finish("stopped","не найдена однозначная цена следующей цели; сравнение ETA невозможно");return end
+   nextTrial(snap)
+  elseif now-D.started>90 then finish("stopped","не удалось подготовить чистый старт/3 места в рюкзаке за90с; защищённых петов не удаляем")end
+  return
+ end
+ local r=row()
+ if D.phase=="normalize"then
+  local n=r.normalizationRequest
+  if n and n.consumed and not busy(P) and now>=(P.farmSpendWatchUntil or 0) and now>=(P.farmResetGraceUntil or 0)then
+   r.normalizationEnd=snap;phase("pre_measure",35)
+  elseif now>=D.phaseEnd then finish("stopped","не удалось подтвердить нормализующий rebirth/завершение списания за45с; не повторяю")end
+ elseif D.phase=="active"then
+  r.modeledInflow+=r.pre.rate*math.max(0,now-(D.lastTick or now))
+  E.quote(P,data)
+  if now>=D.phaseEnd then
+   r.activeSeconds=now-r.activeAt;r.activeEnd=snap
+   phase("craft_settle",8)
+  end
+ elseif D.phase=="craft_settle"then
+  if now>=D.phaseEnd then phase("drain",30)end
+ elseif D.phase=="drain"then
+  if now-D.phaseAt>=2 then
+   phase("post_measure",35)
+  elseif now>=D.phaseEnd then finish("stopped","операции/позднее списание не завершились за30с; ничего не сброшено")end
+ elseif D.phase=="pre_measure"or D.phase=="post_measure"then
+  local busyCause=busy(P)
+  if busyCause then measureNote("observed_despite:"..busyCause)end
+  do
+   local result=measure(snap)
+   if result then
+    if D.phase=="pre_measure"then
+     r.pre=result;r.startSnapshot=snap;r.activeAt=now
+     r.activeBudgetReference={initialWallet=snap.coins,initialIncome=result.rate,nominalRunwaySeconds=snap.coins/result.rate}
+     phase("active",180)
+    else
+     r.post=result;r.endSnapshot=snap;r.totalSeconds=now-r.started;r.complete=true
+     C.finish(r)
+     local royal=E.eggs and E.eggs.Royal
+     local rp=royal and C.finite(royal.price)
+     if rp and rp>0 then r.royalIncomeReference={baseConfigBatchCost=rp*3,
+      preBatchesPerMinute=r.pre.rate*60/(rp*3),postBatchesPerMinute=r.post.rate*60/(rp*3),
+      note="По базовой цене конфига, без учёта доступа/скидок/будущего роста; не live-цена покупки"}end
+     export();nextTrial(snap)
+    end
+   end
+  end
+  if not D.finished and (D.phase=="pre_measure"or D.phase=="post_measure") and now>=D.phaseEnd then
+   r.incompleteReason="не получил10с положительного наблюдаемого притока за35с";r.failedPhase=D.phase;r.timeoutSnapshot=snap;measureNote("timeout");r.valid=false;r.complete=true
+   export();nextTrial(snap)
+  end
+ end
+ D.lastTick=now
+end
+function E.start(P,cycle)
+ local snap=snapshot(P)
+ D={version="LIVE-AUTO-13",P=P,account=Env.LocalPlayer.Name,userId=Env.LocalPlayer.UserId,
+  started=os.clock(),deadline=os.clock()+720,rows={},eggByToken={},plan=C.order(Env.LocalPlayer.UserId,cycle),position=0,
+  phase="warmup",phaseEnd=os.clock(),status="running",initial=snap,lastSnapshot=snap,quoteProvider=E.quoteProvider}
+ P.autoCompareRun=D
+ local g=Env.genv or _G
+ g.copyFarmAutoReport=function()
+  local text=(D and D.P==P and export())or P.autoCompareLastReport
+  if text and type(setclipboard)=="function"then setclipboard(text)end
+  return text
+ end
+ log("Автосравнение: RB_ONLY → EGGS_ONLY → MIXED; подготовительные rebirth настоящие, предел12мин")
+ return D
+end
+function E.owns(P)return P.worldName=="TimeRift" and D~=nil and D.P==P and not D.finished end
+local function finalGoal(P)return P.worldName~="TimeRift" or P.royalFinal or P.finalizing or P.royalReachedEgg or P.royalRouteAtGoal or P.eggFixed or P.rebirthLocked end
+function E.controls(P)
+ if P.worldName~="TimeRift"then return false end
+ if E.owns(P)then return true end
+ return not finalGoal(P) and P.autoComparePolicy and P.autoComparePolicy.mode~=nil
+end
+function E.policyHold(P,data)
+ if E.owns(P)then return E.rebirthHold(P,data)end
+ local s=P.autoComparePolicy
+ if finalGoal(P)or not s or not s.mode then return nil end
+ if s.mode=="EGGS_ONLY"then return true,"автовыбор: яйца; rebirth временно выключен до переоценки/приоритета портала"end
+ if s.mode=="RB_ONLY"then return false,"автовыбор: только rebirth до переоценки/приоритета портала"end
+ return nil
+end
+function E.policyEgg(P,data,cost,unit,egg,count)
+ if E.owns(P)then return E.eggAllowed(P,data,cost,unit,egg,count)end
+ local s=P.autoComparePolicy
+ if finalGoal(P)or not s or not s.mode then return nil end
+ if s.mode=="RB_ONLY"then return false,"автовыбор: только rebirth"end
+ if s.mode=="EGGS_ONLY"then return true end
+ if s.mode=="MIXED" and cost then
+  local gross=P.portalPositiveFlow and P.portalPositiveFlow.positive or s.modeGross or 0
+  local cap=.4*((s.modeBalance or 0)+math.max(0,gross-(s.modeGross or 0)))-(s.modeSpent or 0)
+  if cost>math.max(0,cap)then return false,"автовыбор MIXED:40% бюджета исчерпаны"end
+ end
+ return nil
+end
+function E.policyCraft(P)
+ if E.owns(P)then return E.craftAllowed()end
+ local s=P.autoComparePolicy
+ return not (not finalGoal(P) and s and s.mode=="RB_ONLY")
+end
+function E.policyClean(P)
+ if E.owns(P)then return E.cleanAllowed() and (not row()or row().strategy~="RB_ONLY")end
+ return true
+end
+function E.policyReady(P,now)
+ if E.owns(P)then return E.rebirthReady(P,now)end
+ if finalGoal(P)then return nil end
+ local mode=P.autoComparePolicy and P.autoComparePolicy.mode
+ if mode=="EGGS_ONLY"then return false elseif mode=="RB_ONLY"then return true end
+ return nil
+end
+local function rate(P,now)
+ local a=P.adaptiveIncome
+ if a and a.rate and a.at and now>=a.at and now-a.at<=20 then return a.rate end
+ local v=P.incomeByMode and P.incomeByMode.Clicks
+ if v and C.finite(v.value) and v.value>0 and v.at and now>=v.at and now-v.at<=20 then return v.value end
+end
+function E.drive(P,data,now)
+ if D and not D.finished and D.P~=P then finish("interrupted","контроллер изменён; запросы не отменяются")end
+ if not Life.alive or Ui.__progressTest~=P or not W.isCurrent(P,data)then return end
+ local state=P.autoComparePolicy
+ if not state or state.island~=P.islandEggVerified then
+  if E.owns(P)then finish("stopped","остров сменился; сравнение прекращено без отмены sent")end
+  if D and D.P==P and D.finished then D.handled=true end
+  state={island=P.islandEggVerified,nextAt=now+15};P.autoComparePolicy=state
+ end
+ if D and D.P==P and D.finished and not D.handled then
+  D.handled=true;state.nextAt=now+1800
+  local v=C.verdict(D.rows);P.autoCompareLastReport=D.json;P.autoCompareLastVerdict=v
+  if v.status=="local_candidate"then
+   if state.candidate==v.strategy then state.confirmations=(state.confirmations or 0)+1 else state.candidate=v.strategy;state.confirmations=1 end
+   if state.confirmations>=2 then
+    state.mode=v.strategy;state.modeBalance=W.coins(data);state.modeSpent=0;state.modeTokens={}
+    state.modeGross=P.portalPositiveFlow and P.portalPositiveFlow.positive or 0
+   end
+  else state.candidate=nil;state.confirmations=0 end
+  local q=P.royalRoute
+  if q then q.at=q.at+math.max(0,now-D.started);q.lastTick=now;q.sample=nil end
+  if type(P.log)=="function"then P.log("автосравнение: "..v.status.."; подтверждений="..tostring(state.confirmations or 0).."; выбран="..tostring(state.mode or "обычная адаптивная ферма").."; новая проверка не раньше30мин")end
+ end
+ if E.owns(P)then
+  local target=P.royalRouteTarget;local r=rate(P,now);local coins=W.coins(data)
+  local near=target and target.world==P.worldName and target.fromIsland==P.islandEggVerified and target.at and now-target.at<=5 and r and coins and (target.price-coins)/r<=3600
+  if P.portalSaving or P.portalModeWaitUntil and now<P.portalModeWaitUntil or P.worldChanging or finalGoal(P) or near then
+   finish("interrupted","приоритет портала/перехода/Royal; новые действия сравнения остановлены, sent не отменены")
+  else E.tick(P,data)end
+  return
+ end
+ if P.worldName~="TimeRift"or finalGoal(P)or P.stopRequested or Ui.__globalStop or Ui.__handoverPaused
+  or P.portalSaving or P.portalModeWaitUntil and now<P.portalModeWaitUntil or P.worldChanging or Ui.travelling or not P.islandEggVerified
+  or not P.riftEggScanReady or now<(state.nextAt or 0) or busy(P)then return end
+ local r=rate(P,now)
+ if not r or not E.quoteProvider then return end
+ state.nextAt=now+60 -- affordable preflight recheck; not a paid trial
+ local ok,price=pcall(E.quoteProvider,P,data);price=ok and C.finite(price)or nil
+ if Ui.__progressTest~=P or not W.isCurrent(P,Env.data())or P.stopRequested or P.worldChanging
+  or P.portalSaving or P.autoComparePolicy~=state or P.islandEggVerified~=state.island then return end
+ now=os.clock();r=rate(P,now);if not r then return end
+ local t=P.royalRouteTarget;local coins=W.coins(Env.data())
+ if t and t.world==P.worldName and t.fromIsland==P.islandEggVerified and t.at and now-t.at<=5 and coins and (t.price-coins)/r<=3600 then return end
+ -- Preparatory rebirth removes the old wallet: eligibility must NOT use it.
+ -- 10 seconds is the conservative post-reset measuring runway, mixed share40%.
+ if not price or price<=0 or .4*r*(180+10)<15*price then
+  if now>=(state.nextSkipLog or 0)and type(P.log)=="function"then state.nextSkipLog=now+300;P.log("автосравнение отложено: за пробу не набрать15 яиц в смешанном режиме; обычный фарм продолжается без расходов на тест")end
+  return
+ end
+ if state.lastStarted and now-state.lastStarted<1800 then return end
+ state.lastStarted=now;state.nextAt=now+1800
+ E.start(P,state.cycle or 0);state.cycle=(state.cycle or 0)+1
+end
+function E.overrideRoute(P)
+ if E.owns(P)then return true end
+ local m=not finalGoal(P)and P.autoComparePolicy and P.autoComparePolicy.mode
+ return m=="RB_ONLY"or m=="EGGS_ONLY"
+end
+function E.report(P)
+ if type(P.log)~="function"then return end
+ local state=P.autoComparePolicy or {}
+ P.log("автовыбор фарма: "..tostring(state.mode or "обычная адаптивная ферма")
+  .."; проверка="..tostring(E.owns(P)and D.phase or "нет")
+  .."; кандидат="..tostring(state.candidate or "нет").."; подтверждений="..tostring(state.confirmations or 0))
+end
+function E.normalizing(P)return E.owns(P)and D.phase=="normalize"end
+function E.safeDrive(P,data,now)
+ local ok,err=pcall(E.drive,P,data,now)
+ if not ok then
+  if E.owns(P)then finish("error","ошибка локального сравнения: "..tostring(err))end
+  if P.autoComparePolicy then P.autoComparePolicy.mode=nil;P.autoComparePolicy.nextAt=now+1800 end
+  if now>=(P.autoCompareErrorLogAt or 0)then
+   P.autoCompareErrorLogAt=now+60
+   if type(P.log)=="function"then P.log("автосравнение отключено до переоценки: "..tostring(err))end
+  end
+ end
+end
+return E
+
+end
 __modules["features/island_egg_focus"] = function(use)
 -- Session-only policy: eggs must belong to the furthest confirmed island in the
 -- current world. A generic Rift flag is only a restrictive hint, never proof of
@@ -4082,6 +4716,7 @@ function F.tickClock(P, data)
 end
 
 function F.publishCatalog(eggs)
+    use("features/auto_compare").catalog(eggs)
     -- Called only after an atomic, successful LaunchEggConfig refresh.
     if type(eggs) == "table" then eggCatalog = eggs end
 end
@@ -4322,6 +4957,7 @@ local function routeNear(P,data,now)
 end
 -- This mutates only local experiment state. It cannot cancel a sent request.
 function F.routeTick(P,data,team)
+    if use("features/auto_compare").overrideRoute(P)then return end
     local q=routeState(P,data)
     if not q then return end
     local now=os.clock()
@@ -4411,7 +5047,12 @@ function F.routeEggAllowed(P,data,egg)
     routeState(P,data)
     return not P.royalRouteAtGoal or egg=="Royal"
 end
-function F.routeHatchAllowed(P,data,cost,unit,egg)
+function F.routeHatchAllowed(P,data,cost,unit,egg,count)
+    local auto=use("features/auto_compare")
+    if auto.controls(P)then
+        local yes,why=auto.policyEgg(P,data,cost,unit,egg,count)
+        if yes~=nil then return yes,why end
+    end
     if Ui.__royalRoutePolicy~=true then return true end
     if not routeLive(P,data) then return false,"путь к Royal: контекст изменился" end
     local q=routeState(P,data)
@@ -4438,6 +5079,7 @@ function F.routeHatchAllowed(P,data,cost,unit,egg)
     return true
 end
 function F.routeRecordSend(P,token,cost,unit,data)
+    if use("features/auto_compare").overrideRoute(P)then return true end
     if Ui.__royalRoutePolicy~=true then return true end
     if not routeLive(P,data) then return false end
     local q=P.royalRoute
@@ -4556,6 +5198,11 @@ function F.rebirthHold(P, data)
         if type(P) == "table" then P.islandEggHoldReason = "остров яиц не определён: " .. tostring(why) end
         return true, "остров яиц не определён: " .. tostring(why)
     end
+    local auto=use("features/auto_compare")
+    if auto.controls(P)then
+        local held,reason=auto.policyHold(P,data)
+        if held~=nil then return held,reason end
+    end
     local trial, island = current.trial, current.verifiedName
     local routeHold,routeReason=F.routeRebirthHold(P,data,current)
     if routeHold~=nil then
@@ -4600,6 +5247,8 @@ function F.rebirthSendReady(P, now)
     if type(P) ~= "table" or type(now) ~= "number" or now ~= now
         or Ui.__progressTest ~= P or not Life.alive or Ui.__globalStop
         or Ui.__handoverPaused or P.stopRequested or P.worldChanging then return false end
+    local auto=use("features/auto_compare")
+    if auto.controls(P)then local ready=auto.policyReady(P,now);if ready~=nil then return ready end end
     local trial, clock = P.islandEggTrial, P.islandEggClock
     if type(trial) ~= "table" or trial.world ~= P.worldName or trial.island ~= P.islandEggVerified
         or type(clock) ~= "table" or clock.worldValid ~= true then return false end
@@ -4640,6 +5289,7 @@ function F.confirmSuccess(P, world, island, token)
         and P.islandEggVerified==name then
         if token ~= nil and trial.lastSuccessToken == token then return true end
         F.routeSuccess(P,world,name,token)
+        use("features/auto_compare").eggSuccess(P,token)
         local clock = P.islandEggClock
         local elapsedClock = sampleClock(P, os.clock(), type(clock)=="table" and clock.worldValid==true)
         trial.startedAt, trial.lastSuccessAt = elapsedClock, elapsedClock
@@ -5498,7 +6148,7 @@ function Router.start(emit)
         log("активна отдельная прогрессия TimeRift: RiftCoins, RiftGems и RiftRebirths; Main больше не фармится")
         return true
     end
-    log("сборка V16-LIVE-FLOW-12: прямой возврат к живому World2Portal, результат только по реплике")
+    log("сборка V16-LIVE-AUTO-13: прямой возврат к живому World2Portal, результат только по реплике")
     local stageName,stageAt="ожидание",os.clock()
     local function stage(name) stageName,stageAt=name,os.clock() end
     -- World-2 purchase is distinct from the already-journaled physical portal touch.
@@ -7181,6 +7831,7 @@ local function request(key, payload, point, lease)
         or not W.isCurrent(P,boundary) or P.worldChanging or P.stopRequested or P.phase ~= "rebirth"
         or P.eggFixed or P.rebirthLocked or P.farmThresholdReached or P.finalizing or P.royalFinal
         or P.disableAutoCraft or P.holdCraft or P.portalSaving
+        or (use("features/auto_compare").controls(P) and not use("features/auto_compare").policyCraft(P))
         or not lease or lease.owner~=P or lease.cancelled or P.portalCraftSlot~=lease or P.portalEpoch~=lease.epoch
         or (P.portalModeWaitUntil and os.clock() < P.portalModeWaitUntil)
         or (P.portalCheckUntil and not P.portalChecked and (os.clock() < P.portalCheckUntil
@@ -7384,6 +8035,7 @@ local function runPass(P,lease)
                         break
                     end
                     total += 1
+                    use("features/auto_compare").goldenSuccess(P)
                     lastNote = key .. ": событие Success=true, Crafted=" .. tostring(result.Crafted)
                         .. "; связь по ID и появление Golden не доказаны"
                     if not validCraftLease(P,lease) then return end
@@ -11836,17 +12488,17 @@ local function hatchCount(data, egg)
         if P.phase == "rebirth" and not targetMode(P) and not P.farmThresholdReached then
             local slots = progressFreeSlots(data)
             local unit=progressBatchPrice(data,egg,1)
-            local function fits(price)
-                return price and price<=coins and IslandEggFocus.routeHatchAllowed(P,data,price,unit,egg)
+            local function fits(price,count)
+                return price and price<=coins and IslandEggFocus.routeHatchAllowed(P,data,price,unit,egg,count)
             end
             if egg ~= "Royal" and slots >= 8 and canOcto(data) then
                 local eight = progressBatchPrice(data, egg, 8)
-                if fits(eight) then return 8 end
+                if fits(eight,8) then return 8 end
             end
             local three = slots >= 3 and progressBatchPrice(data, egg, 3) or nil
-            if fits(three) then return 3 end
+            if fits(three,3) then return 3 end
             local one = slots >= 1 and progressBatchPrice(data, egg, 1) or nil
-            if fits(one) then return 1 end
+            if fits(one,1) then return 1 end
             return nil
         end
         if P.phase == "hatch" and targetMode(P) then
@@ -12328,6 +12980,26 @@ IslandEggFocus.setSavingQuote(function(P,data)
         or not W.isCurrent(P,data) then return nil end
     return lowest,name
 end)
+
+use("features/auto_compare").setQuoteProvider(function(P,data)
+    if Ui.__progressTest~=P or not Life.alive or P.stopRequested or P.worldChanging
+        or not W.isCurrent(P,data) or P.eggFixed or P.rebirthLocked or P.royalFinal
+        or not loadFarmFloor(P) or P.farmEggFloorError or P.farmEggSavePending
+        or progressFreeSlots(data)<1 then return nil end
+    local lowest,name
+    for _,egg in ipairs(eggsByPrice(data)) do
+        local def=EGGS[egg]
+        if def and def.price>=(P.farmEggFloor or 0) and W.coinPricing(def.raw)
+            and IslandEggFocus.allows(P,data,def.island) then
+            local price=progressBatchPrice(data,egg,1)
+            if price and price>0 and (not lowest or price<lowest) then lowest,name=price,egg end
+        end
+    end
+    if Ui.__progressTest~=P or not Life.alive or P.stopRequested or P.worldChanging
+        or not W.isCurrent(P,data) then return nil end
+    return lowest,name
+end)
+
 
 local function chooseByValue(data)
     local best, bestValue = nil, 0
@@ -12868,7 +13540,7 @@ local function hatchDenied(P, egg, count)
     if P.stopRequested then return "нажата остановка" end
     if P.worldChanging or not W.isCurrent(P, snapshot) then return "смена мира / нет подтверждения текущего мира" end
     if P.finalizing then return "закрепляю Royal x3" end
-    local routeAllowed,routeReason=IslandEggFocus.routeHatchAllowed(P,snapshot,nil,nil,egg)
+    local routeAllowed,routeReason=IslandEggFocus.routeHatchAllowed(P,snapshot,nil,nil,egg,count)
     if not routeAllowed then return routeReason end
     if not P.royalFinal and type(P.portalPriorityDue)=="function" then
         local checked,due=pcall(P.portalPriorityDue,P,snapshot)
@@ -13180,7 +13852,7 @@ local function hatch(egg, count, worker)
         local valid=def and IslandEggFocus.allows(P,latest,def.island)
         local unit=def and progressBatchPrice(latest,egg,1)
         slot.routeUnit=unit
-        local routeAllowed=IslandEggFocus.routeHatchAllowed(P,latest,expected,unit,egg)
+        local routeAllowed=IslandEggFocus.routeHatchAllowed(P,latest,expected,unit,egg,count)
         return valid==true and routeAllowed==true and Life.alive and Ui.__progressTest==P and not Ui.__globalStop
             and not P.stopRequested and not P.worldChanging and W.isCurrent(P,latest)
             and P.portalEpoch==hatchEpoch and not slot.cancelled and waiting==slot and P.portalHatchSlot==slot
@@ -13193,6 +13865,9 @@ local function hatch(egg, count, worker)
         return cancelPrepared("последняя проверка острова уступила поток")
     end
     if not checked or focusAllowed~=true then return cancelPrepared("остров яйца изменился перед отправкой") end
+    if use("features/auto_compare").controls(P) and not use("features/auto_compare").reserveEgg(P,finalData,token,egg,count,expected)then
+        return cancelPrepared("автосравнение: бюджет/лимит изменился")
+    end
     if not IslandEggFocus.routeRecordSend(P,token,expected,slot.routeUnit,finalData) then
         return cancelPrepared("бюджет серии изменился перед отправкой")
     end
@@ -23385,6 +24060,11 @@ local TEST_ALLOWED_TOGGLES = {
 local TEST_GEM_AUTOMATION = { AutoUpgrade=true, AutoSkillTree=true }
 -- Toggle value that is safe to read during unload (the library clears Toggles).
 function Ui.on(name)
+    local owner=Ui.__progressTest
+    if owner and (name=="AutoCraft"or name=="AutoEquipBest")then
+        local auto=use("features/auto_compare")
+        if auto.controls(owner) and not auto.policyCraft(owner)then return false end
+    end
     local P = Ui.__progressTest
     if P and not TEST_ALLOWED_TOGGLES[name] then return false end
     local worldAction = name == "AutoTap" or name == "AutoClicker" or name == "AutoHatch"
@@ -36544,6 +37224,7 @@ __modules["features/progress_test"] = function(use)
     local EggRecovery = use("features/egg_recovery")
     local IslandEggFocus = use("features/island_egg_focus")
     local AdaptiveRebirth = use("features/adaptive_rebirth")
+    local AutoCompare = use("features/auto_compare")
 
     local WINDOW = 10 -- informational, no threshold or scheduled pause
     local START_SETTLE = 7
@@ -36807,7 +37488,7 @@ __modules["features/progress_test"] = function(use)
         P.remoteError = nil
 
         local function log(text)
-            emit("progress", "[ПРОГРЕССИЯ v16 LIVE-FLOW-12 " .. world .. "] " .. tostring(text))
+            emit("progress", "[ПРОГРЕССИЯ v16 LIVE-AUTO-13 " .. world .. "] " .. tostring(text))
         end
         P.log = log
         local function parkRiftRebirth(request)
@@ -37080,6 +37761,7 @@ __modules["features/progress_test"] = function(use)
                 P.royalFinal and "замеры выключены" or (P.income and string.format("%.0f", P.income) or "измеряю"),
                 "Royal x3",
                 tostring(P.eggGoal or "ищу"), tostring(P.confirmedBatches or 0), actual, tostring(P.note)))
+            AutoCompare.report(P)
             IslandEggFocus.routeReport(P,Env.data())
             local trial = P.islandEggTrial
             if type(trial) == "table" and (trial.status == "grace" or trial.status == "complete") then
@@ -37725,6 +38407,7 @@ __modules["features/progress_test"] = function(use)
             if data then
                 PortalSavings.observe(P,data,now)
                 AdaptiveRebirth.observe(P,data,now)
+                AutoCompare.safeDrive(P,data,now)
             end
             if Ui.__royalRoutePolicy==true and data and now>=(P.nextRoyalRouteTick or 0) then
                 P.nextRoyalRouteTick=now+1
@@ -38017,7 +38700,7 @@ __modules["features/progress_test"] = function(use)
                     end
                     return
                 end
-                if world=="TimeRift" and AdaptiveRebirth.plan(P,data,os.clock()) then
+                if world=="TimeRift" and not AutoCompare.normalizing(P) and AdaptiveRebirth.plan(P,data,os.clock()) then
                     P.holdHatch, P.holdCraft, P.disableAutoCraft = false, false, false
                     P.holdUpgrades, P.holdSkillTree = false, false
                     return
@@ -38087,7 +38770,7 @@ __modules["features/progress_test"] = function(use)
                             local balance,rb=W.coins(last),W.rebirths(last)
                             local request,result=riftCanonicalRemotes()
                             local connectedOk,connected=pcall(function() return P.riftResultConnection.Connected end)
-                            if not AdaptiveRebirth.ready(P,last,os.clock())
+                            if (not AutoCompare.normalizing(P) and not AdaptiveRebirth.ready(P,last,os.clock()))
                                 or not canRebirth(prepared,last,true) or worldState.rebirthPending~=prepared
                                 or (run.riftRebirthEventSerial or 0)~=prepared.eventSerial
                                 or not P.riftResultReady or not P.riftResultConnection
@@ -38121,6 +38804,7 @@ __modules["features/progress_test"] = function(use)
                             P.directRebirthReason="время попытки яйца истекло или условия изменились перед отправкой"
                             return
                         end
+                        if AutoCompare.owns(P)then AutoCompare.sentRebirth(P,prepared)end
                         P.nextSendAt,lastSends[memKey],run.lastRebirthSendAt=sentAt+currentRebirthGap(),sentAt,sentAt
                         attempted,prepared.dispatched=true,true -- reserve BEFORE the call may re-enter or throw
                         P.note="Rift-ребёрт отправлен: жду прирост счётчика +"..tostring(amount)
@@ -38306,7 +38990,7 @@ __modules["features/progress_test"] = function(use)
             genv.ts30TestState = nil
             genv.ts30TestStop = nil
         end)
-        log("сборка V16-LIVE-FLOW-12: Clicks, ребёрты 20 с, Golden 100%; Ghost Ship исключён")
+        log("сборка V16-LIVE-AUTO-13: Clicks, ребёрты 20 с, Golden 100%; Ghost Ship исключён")
         log("v16: мир=" .. world .. "; всегда Clicks; доступные яйца и максимальная партия без порога дохода")
         log("ребёрт >=20с: TimeRift сравнивает все открытые пакеты по цене/доходу; при равной эффективности выбирает короткое ожидание; отправка только максимального доступного")
         log("яйца — только на наиболее продвинутом подтверждённом острове; старые острова не использую")
@@ -38486,7 +39170,7 @@ do
 	pcall(Ui.set, "AutoReveal", true)
 	if Ui.on("AutoReveal") then logEvent("hold", "Hold to Reveal включён; обработчики яиц не глушатся")
 	else logEvent("warn", "Hold to Reveal не включился: модуль или тумблер не загрузился") end
-	logEvent("farm", "сборка V16-LIVE-FLOW-12: локальные файлы отключены; сайт и Discord включены, цены встроенные")
+	logEvent("farm", "сборка V16-LIVE-AUTO-13: локальные файлы отключены; сайт и Discord включены, цены встроенные")
 	logEvent("farm", "лучшее доступное яйцо: максимальная доступная партия; достигнутый уровень не понижаю; острова приоритетны")
 	pcall(function()
 		local picks = Ui.Options and Ui.Options.UpgradePicks
@@ -39595,6 +40279,8 @@ do
 	-- A potentially sent ToggleLock is never repeated in this execution.
 	local CLEAN_UNLOCKED, CLEAN_DELETED = {}, {}
 	local function cleanAllowed(lease)
+        local auto=use("features/auto_compare")
+        if Ui.__progressTest and not auto.policyClean(Ui.__progressTest)then return false end
 		local P = Ui.__progressTest
 		local snapshot = Env.data()
 		local phase = P and P.phase
@@ -39961,6 +40647,7 @@ do
 	-- Existing cleanup criteria are unchanged. Its team/replica waits are local to this worker:
 	-- neither waiting for an egg nor marking P.cleaning pauses the independent hatch worker.
 	Life.loop("pet:clean", 10, function()
+        if Ui.__progressTest and not use("features/auto_compare").policyClean(Ui.__progressTest)then return end
 		local P = Ui.__progressTest
         local cleanEpoch=P and P.portalEpoch
 		local phase = P and P.phase
