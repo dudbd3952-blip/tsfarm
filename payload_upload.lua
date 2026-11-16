@@ -2695,9 +2695,23 @@ local function noteWait(P,s,reason,now)
         log(P,"замер "..tostring(s.name).." ждёт: "..reason.."; клики продолжаются")
     end
 end
+-- This exact request remains owned by the rebirth controller. Deferring a
+-- local income probe is neither cancellation nor evidence of a server outcome.
+local function deferredRebirth(P)
+    local rb=P.pending
+    return type(rb)=="table" and rb.dispatched==true
+        and (P.portalDeferredRebirth==rb or rb.riftConflict==true)
+end
 local function waitForProbeBlocker(P,s,now,expired)
     local reasons=drainReasons(P)
     if #reasons==0 then return false end
+    -- A pending rebirth must never renew this local reservation forever.
+    -- Remember the exact object, not a timeout-derived success/failure verdict.
+    if P.pending then
+        P.portalDeferredRebirth=P.pending
+        noteWait(P,s,"ребёрт не разрешился за срок замера; снимаю только локальную паузу, запрос сохранён",now)
+        return false
+    end
     s.drainUntil=now+PROBE_LIMIT
     s.sampleAt,s.quietAt=nil,nil
     if expired then s.saveExpired=true; s.state="probe" end
@@ -2836,6 +2850,12 @@ function S.update(P, data, item, portalReady, canStart, owner, allowUnlocated)
     if hazards(P, owner) or not S.eggAllowsIsland(P) then
         local reason=hazardText(P,owner)
         if s then release(P, "чистый замер отменён: "..reason.."; запросы сохранены", RETRY)
+        elseif candidateOK(item) then noteNoProbe(P,reason,now) end
+        return
+    end
+    if not affordable and deferredRebirth(P) then
+        local reason="результат отправленного ребёрта неизвестен; замер отложен, независимые яйца разрешены прежними защитами"
+        if s then release(P,reason.."; запрос сохранён и не повторяется",RETRY)
         elseif candidateOK(item) then noteNoProbe(P,reason,now) end
         return
     end
@@ -3086,6 +3106,12 @@ if type(Life.loop)=="function" then
         local s=type(P)=="table" and P.portalSaving or nil
         if not s or P.stopRequested or P.worldChanging or P.islandInFlight or P.worldPurchaseInFlight then return end
         local now=os.clock()
+        -- Also works when the island observer stopped ticking. Never touch
+        -- dispatched purchases, which retain their own result handling above.
+        if (s.state=="probe" or s.state=="saving") and deferredRebirth(P) then
+            release(P,"результат ребёрта неизвестен; отдельная пауза замера снята, запрос сохранён",RETRY)
+            return
+        end
         S.quiesce(P,s)
         if s.state=="probe" then
             local reasons=drainReasons(P)
@@ -5191,7 +5217,7 @@ function Router.start(emit)
         log("активна отдельная прогрессия TimeRift: RiftCoins, RiftGems и RiftRebirths; Main больше не фармится")
         return true
     end
-    log("сборка V16-LIVE-EGG-CYCLE-6: прямой возврат к живому World2Portal, результат только по реплике")
+    log("сборка V16-LIVE-PORTAL-DEADLOCK-7: прямой возврат к живому World2Portal, результат только по реплике")
     local stageName,stageAt="ожидание",os.clock()
     local function stage(name) stageName,stageAt=name,os.clock() end
     -- World-2 purchase is distinct from the already-journaled physical portal touch.
@@ -36337,7 +36363,7 @@ __modules["features/progress_test"] = function(use)
         P.remoteError = nil
 
         local function log(text)
-            emit("progress", "[ПРОГРЕССИЯ v16 LIVE-EGG-CYCLE-6 " .. world .. "] " .. tostring(text))
+            emit("progress", "[ПРОГРЕССИЯ v16 LIVE-PORTAL-DEADLOCK-7 " .. world .. "] " .. tostring(text))
         end
         P.log = log
         local function parkRiftRebirth(request)
@@ -37824,7 +37850,7 @@ __modules["features/progress_test"] = function(use)
             genv.ts30TestState = nil
             genv.ts30TestStop = nil
         end)
-        log("сборка V16-LIVE-EGG-CYCLE-6: Clicks, ребёрты 20 с, Golden 100%; Ghost Ship исключён")
+        log("сборка V16-LIVE-PORTAL-DEADLOCK-7: Clicks, ребёрты 20 с, Golden 100%; Ghost Ship исключён")
         log("v16: мир=" .. world .. "; всегда Clicks; доступные яйца и максимальная партия без порога дохода")
         log("ребёрт не чаще раза в 20 с до финала Royal; максимальный найденный пакет, неподтверждённый запрос не повторяю")
         log("яйца — только на наиболее продвинутом подтверждённом острове; старые острова не использую")
@@ -38004,7 +38030,7 @@ do
 	pcall(Ui.set, "AutoReveal", true)
 	if Ui.on("AutoReveal") then logEvent("hold", "Hold to Reveal включён; обработчики яиц не глушатся")
 	else logEvent("warn", "Hold to Reveal не включился: модуль или тумблер не загрузился") end
-	logEvent("farm", "сборка V16-LIVE-EGG-CYCLE-6: локальные файлы отключены; сайт и Discord включены, цены встроенные")
+	logEvent("farm", "сборка V16-LIVE-PORTAL-DEADLOCK-7: локальные файлы отключены; сайт и Discord включены, цены встроенные")
 	logEvent("farm", "лучшее доступное яйцо: максимальная доступная партия; достигнутый уровень не понижаю; острова приоритетны")
 	pcall(function()
 		local picks = Ui.Options and Ui.Options.UpgradePicks
