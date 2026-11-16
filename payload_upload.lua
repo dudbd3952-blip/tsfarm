@@ -3982,7 +3982,7 @@ if not mainOk then Main = nil end
 local riftOk, Rift = pcall(use, "features/rift_islands")
 if not riftOk then Rift = nil end
 local F = {}
-local remembered, completed = {}, { Main = {}, TimeRift = {} }
+local remembered = {}
 local eggCatalog
 local FIRST_EGG_TRIAL_SECONDS = 120
 
@@ -4278,7 +4278,8 @@ function F.rebirthHold(P, data)
         return true, "остров яиц не определён: " .. tostring(why)
     end
     local trial, island = current.trial, current.verifiedName
-    if completed[current.world][island] then
+    -- A success grants another ordinary-farm interval, not a permanent exemption.
+    if trial.lastSuccessAt and trial.elapsed < FIRST_EGG_TRIAL_SECONDS then
         trial.status, P.islandEggHoldReason = "complete", nil
         return false
     end
@@ -4292,7 +4293,7 @@ function F.rebirthHold(P, data)
         return false
     end
     trial.status = "hold"
-    local reason = "за 120 с обычного фарма нет подтверждённого Success яйца на " .. island
+    local reason = "за последние 120 с обычного фарма нет подтверждённого Success яйца на " .. island
     if not current.confirmed then reason ..= "; подсказка " .. current.name .. " ещё не подтверждена" end
     if has == nil then reason ..= "; перечитываю каталог яиц" end
     P.islandEggHoldReason = reason
@@ -4312,14 +4313,14 @@ function F.rebirthSendReady(P, now)
     local elapsedClock, running = sampleClock(P, now, true)
     if not running then return false end
     trial.elapsed = math.max(0, elapsedClock - trial.startedAt)
-    if trial.status == "complete" then return completed[trial.world][trial.island] == true end
+    if trial.status == "complete" then return trial.lastSuccessAt ~= nil and trial.elapsed < FIRST_EGG_TRIAL_SECONDS end
     if trial.status == "no_egg" then return true end
     return trial.status == "grace" and trial.elapsed < FIRST_EGG_TRIAL_SECONDS
 end
 
 -- Called only for an exact classified successful Seq, including a late answer.
 -- A previous island's success never clears a newer island's pending hold.
-function F.confirmSuccess(P, world, island)
+function F.confirmSuccess(P, world, island, token)
     if type(P) ~= "table" or Ui.__progressTest ~= P or P.worldName ~= world
         or not Life.alive or P.stopRequested or P.worldChanging or Ui.__globalStop
         or (world ~= "Main" and world ~= "TimeRift") then return false end
@@ -4328,7 +4329,18 @@ function F.confirmSuccess(P, world, island)
     local name = (island == nil or island == "") and "Spawn" or resolve(islands, island)
     if not name or Ui.__progressTest ~= P or P.worldName ~= world or not Life.alive
         or P.stopRequested or P.worldChanging or Ui.__globalStop then return false end
-    completed[world][name] = true
+    -- Only the currently verified island can renew this controller's interval.
+    -- Old-island late evidence stays valid for recovery, never for this clock.
+    local trial = P.islandEggTrial
+    if type(trial)=="table" and trial.world==world and trial.island==name
+        and P.islandEggVerified==name then
+        if token ~= nil and trial.lastSuccessToken == token then return true end
+        local clock = P.islandEggClock
+        local elapsedClock = sampleClock(P, os.clock(), type(clock)=="table" and clock.worldValid==true)
+        trial.startedAt, trial.lastSuccessAt = elapsedClock, elapsedClock
+        trial.elapsed, trial.status, trial.lastSuccessToken = 0, "complete", token
+        P.islandEggHoldReason = nil
+    end
     return true
 end
 return F
@@ -5179,7 +5191,7 @@ function Router.start(emit)
         log("активна отдельная прогрессия TimeRift: RiftCoins, RiftGems и RiftRebirths; Main больше не фармится")
         return true
     end
-    log("сборка V16-LIVE-CPU-IDLE-5: прямой возврат к живому World2Portal, результат только по реплике")
+    log("сборка V16-LIVE-EGG-CYCLE-6: прямой возврат к живому World2Portal, результат только по реплике")
     local stageName,stageAt="ожидание",os.clock()
     local function stage(name) stageName,stageAt=name,os.clock() end
     -- World-2 purchase is distinct from the already-journaled physical portal touch.
@@ -12422,7 +12434,7 @@ local function lateEggCompleted(evidence)
     local saved=pendingEggFloor[evidence.token]
     if evidence.verdict=="success" and saved then
         rememberFarmEgg(P,saved.egg,saved.price,saved.world)
-        pcall(IslandEggFocus.confirmSuccess,P,saved.world,saved.island)
+        pcall(IslandEggFocus.confirmSuccess,P,saved.world,saved.island,evidence.token)
     end
     pendingEggFloor[evidence.token]=nil
     local released=EggRecovery.complete(P,evidence.token)
@@ -12871,7 +12883,7 @@ local function hatch(egg, count, worker)
     if verdict=="success" then
         -- The exact Seq's accepted response raises the floor, never selection or proximity.
         rememberFarmEgg(Ui.__progressTest,egg,slot.basePrice,slot.world)
-        pcall(IslandEggFocus.confirmSuccess,Ui.__progressTest,slot.world,slot.island)
+        pcall(IslandEggFocus.confirmSuccess,Ui.__progressTest,slot.world,slot.island,token)
     end
     if verdict~="unknown" then
         local knownVerdict=verdict
@@ -36325,7 +36337,7 @@ __modules["features/progress_test"] = function(use)
         P.remoteError = nil
 
         local function log(text)
-            emit("progress", "[ПРОГРЕССИЯ v16 LIVE-CPU-IDLE-5 " .. world .. "] " .. tostring(text))
+            emit("progress", "[ПРОГРЕССИЯ v16 LIVE-EGG-CYCLE-6 " .. world .. "] " .. tostring(text))
         end
         P.log = log
         local function parkRiftRebirth(request)
@@ -36599,11 +36611,11 @@ __modules["features/progress_test"] = function(use)
                 "Royal x3",
                 tostring(P.eggGoal or "ищу"), tostring(P.confirmedBatches or 0), actual, tostring(P.note)))
             local trial = P.islandEggTrial
-            if type(trial) == "table" and trial.status == "grace" then
-                log(string.format("первое яйцо %s: %d/120 с обычного фарма; ребёрт дополнительно проверяется перед отправкой",
+            if type(trial) == "table" and (trial.status == "grace" or trial.status == "complete") then
+                log(string.format("цикл яиц %s: %d/120 с обычного фарма без нового Success; ребёрт дополнительно проверяется перед отправкой",
                     tostring(trial.island), math.floor(math.min(120, math.max(0, trial.elapsed or 0)))))
             elseif P.islandEggHoldReason then
-                log("первое яйцо: " .. tostring(P.islandEggHoldReason))
+                log("цикл яиц: " .. tostring(P.islandEggHoldReason))
             end
             log("доход Clicks=" .. incomeText("Clicks") .. "; для переключения режима порог не используется")
             log("яиц на прокачке: партий=" .. tostring(P.farmBatches or 0) .. " | крафт: "
@@ -37465,9 +37477,9 @@ __modules["features/progress_test"] = function(use)
                         return
                     end
                 end
-                -- First give this confirmed island 120 seconds of ordinary
-                -- farming. Then wait for its exact first Success before a new
-                -- rebirth. Portal savings remains an independent priority.
+                -- Give this island a renewable 120-second ordinary-farm interval.
+                -- Every classified current-island Success renews it; expiry holds
+                -- new rebirths. Portal savings remains an independent priority.
                 local focusChecked, focusHold, focusReason = pcall(IslandEggFocus.rebirthHold, P, data)
                 if focusChecked and focusHold == false then
                     local trial = P.islandEggTrial
@@ -37476,9 +37488,9 @@ __modules["features/progress_test"] = function(use)
                     end
                     if type(trial) == "table" and trial.status ~= P.islandEggLastTrialStatus then
                         if trial.status == "grace" then
-                            log("остров яиц " .. trial.island .. ": 120 с обычного фарма с ребёртами; затем пауза до первого подтверждённого открытия; накопление на портал считается отдельно")
+                            log("остров яиц " .. trial.island .. ": 120 с обычного фарма с ребёртами без нового Success; затем пауза до подтверждённого открытия; накопление на портал считается отдельно")
                         elseif trial.status == "complete" then
-                            log("остров яиц " .. trial.island .. ": первое открытие подтверждено; ограничение ребёртов по яйцу снято")
+                            log("остров яиц " .. trial.island .. ": открытие подтверждено; начат новый 120-секундный цикл обычного фарма")
                         end
                         P.islandEggLastTrialStatus = trial.status
                     end
@@ -37812,11 +37824,11 @@ __modules["features/progress_test"] = function(use)
             genv.ts30TestState = nil
             genv.ts30TestStop = nil
         end)
-        log("сборка V16-LIVE-CPU-IDLE-5: Clicks, ребёрты 20 с, Golden 100%; Ghost Ship исключён")
+        log("сборка V16-LIVE-EGG-CYCLE-6: Clicks, ребёрты 20 с, Golden 100%; Ghost Ship исключён")
         log("v16: мир=" .. world .. "; всегда Clicks; доступные яйца и максимальная партия без порога дохода")
         log("ребёрт не чаще раза в 20 с до финала Royal; максимальный найденный пакет, неподтверждённый запрос не повторяю")
         log("яйца — только на наиболее продвинутом подтверждённом острове; старые острова не использую")
-        log("первое яйцо острова: 120 с обычного фарма с ребёртами; если Success нет — пауза новых ребёртов до подтверждённого открытия; портал и защиты отдельно")
+        log("повторяемый цикл яиц: 120 с обычного фарма без нового Success — пауза новых ребёртов до подтверждённого открытия; каждый Success запускает новый цикл; портал и защиты отдельно")
         log("финал: два ответа Royal x3 с сообщённым числом роллов и ростом баланса — эвристика, не гарантия будущей устойчивости; оба кликера остаются включены")
         log("порталы: при оценке до 10 минут временно коплю без яиц и ребёртов; клики остаются включены; иначе обычный фарм")
         log("чистка защищает секретов и команду, но может удалять прочих, включая Godly; сохранённые игровые настройки автоудаления яиц могут действовать")
@@ -37992,7 +38004,7 @@ do
 	pcall(Ui.set, "AutoReveal", true)
 	if Ui.on("AutoReveal") then logEvent("hold", "Hold to Reveal включён; обработчики яиц не глушатся")
 	else logEvent("warn", "Hold to Reveal не включился: модуль или тумблер не загрузился") end
-	logEvent("farm", "сборка V16-LIVE-CPU-IDLE-5: локальные файлы отключены; сайт и Discord включены, цены встроенные")
+	logEvent("farm", "сборка V16-LIVE-EGG-CYCLE-6: локальные файлы отключены; сайт и Discord включены, цены встроенные")
 	logEvent("farm", "лучшее доступное яйцо: максимальная доступная партия; достигнутый уровень не понижаю; острова приоритетны")
 	pcall(function()
 		local picks = Ui.Options and Ui.Options.UpgradePicks
