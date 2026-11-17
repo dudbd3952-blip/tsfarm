@@ -1,4 +1,4 @@
--- V16 LIVE-ROYAL-LUCK-14: Main → TimeRift → Royal x3; финал по измеренному доходу Luck >= цене x3 /1.2с, без запаса.
+-- V16 LIVE-ROYAL-LUCK-16: Main → TimeRift → Royal x3; финал по измеренному доходу Luck >= цене x3 /1.2с, без запаса.
 -- Файловые журналы, архивы, сохранённые фазы и глобальная история не используются.
 -- Сайт и Discord получают данные этого запуска; цены только из встроенной таблицы.
 -- Текущие запросы защищены только в памяти этого запуска. После перезапуска неизвестный
@@ -4479,7 +4479,7 @@ function E.tick(P,data)
 end
 function E.start(P,cycle)
  local snap=snapshot(P)
- D={version="LIVE-ROYAL-LUCK-14",P=P,account=Env.LocalPlayer.Name,userId=Env.LocalPlayer.UserId,
+ D={version="LIVE-ROYAL-LUCK-16",P=P,account=Env.LocalPlayer.Name,userId=Env.LocalPlayer.UserId,
   started=os.clock(),deadline=os.clock()+720,rows={},eggByToken={},plan=C.order(Env.LocalPlayer.UserId,cycle),position=0,
   phase="warmup",phaseEnd=os.clock(),status="running",initial=snap,lastSnapshot=snap,quoteProvider=E.quoteProvider}
  P.autoCompareRun=D
@@ -4665,7 +4665,8 @@ local function eggBudget(P,data,current,trial,now)
         trial.budgetQuoteCache={price=price,egg=egg,at=now,provider=savingQuote,floor=P.farmEggFloor}
     end
     local coins=W.coins(data)
-    local sample=type(P.incomeByMode)=="table" and P.incomeByMode.Clicks
+    local mode=Ui.Options and Ui.Options.EquipMode and Ui.Options.EquipMode.Value
+    local sample=type(P.incomeByMode)=="table" and mode and P.lastEquipMode==mode and P.incomeByMode[mode]
     local rate=type(sample)=="table" and W.finite(sample.value)
     local at=type(sample)=="table" and W.finite(sample.at)
     local eta
@@ -4902,6 +4903,11 @@ local function context(P, data, guard)
     -- or restart a trial; that requires an actual current/unlocked Rift island.
     P.islandEggFocus, P.islandEggFocusWorld = selected, world
     P.islandEggFocusConfirmed, P.islandEggVerified, P.islandEggFocusValid = confirmed, verifiedName, true
+    local royal=type(eggCatalog)=="table" and eggCatalog.Royal
+    local destination=type(royal)=="table" and royal.world=="TimeRift" and resolve(islands,royal.island)
+    if world=="TimeRift" and destination and destination==verifiedName then
+        P.royalIslandConfirmed=true
+    end
     local elapsedClock = F.tickClock(P, data)
     local trial = P.islandEggTrial
     if type(trial) ~= "table" or trial.world ~= world or trial.island ~= verifiedName then
@@ -4935,7 +4941,7 @@ local function routeLive(P,data)
         and not P.worldChanging and W.isCurrent(P,data)
 end
 local function routeGoal(current,P)
-    if P.royalFinal or P.finalizing or P.eggFixed or P.rebirthLocked or P.royalReachedEgg then return true end
+    if P.royalIslandConfirmed or P.royalFinal or P.finalizing or P.eggFixed or P.rebirthLocked or P.royalReachedEgg then return true end
     local royal=type(eggCatalog)=="table" and eggCatalog.Royal
     return current.world=="TimeRift" and type(royal)=="table" and royal.world=="TimeRift" and royal.island~=nil
         and resolve(current.islands,royal.island)==current.verifiedName
@@ -6174,7 +6180,7 @@ function Router.start(emit)
         log("активна отдельная прогрессия TimeRift: RiftCoins, RiftGems и RiftRebirths; Main больше не фармится")
         return true
     end
-    log("сборка V16-LIVE-ROYAL-LUCK-14: прямой возврат к живому World2Portal, результат только по реплике")
+    log("сборка V16-LIVE-ROYAL-LUCK-16: прямой возврат к живому World2Portal, результат только по реплике")
     local stageName,stageAt="ожидание",os.clock()
     local function stage(name) stageName,stageAt=name,os.clock() end
     -- World-2 purchase is distinct from the already-journaled physical portal touch.
@@ -12435,6 +12441,13 @@ local function refreshEggCatalog(requiredWorld, guard)
     for name, def in pairs(fresh) do EGGS[name] = def end
     EggPricing, GamepassPerks, BoostFormula = priceModule, perks, boosts
     IslandEggFocus.publishCatalog(EGGS)
+    local active=Ui.__progressTest
+    local royal=EGGS.Royal
+    if requiredWorld=="TimeRift" and active and royal and os.clock()>=(active.nextRoyalConfigLog or 0)then
+        active.nextRoyalConfigLog=os.clock()+60
+        logEgg("Royal config: Island="..tostring(royal.island).."; Zone="..tostring(royal.zone).."; World="..tostring(royal.world)
+            .."; подтверждённый остров="..tostring(active.islandEggVerified).."; цена x1="..tostring(royal.price))
+    end
     return true, count, type(EggPricing) == "table" and type(EggPricing.GetTotal) == "function"
 end
 refreshEggCatalog(nil)
@@ -16724,7 +16737,7 @@ local function equipAllowed(mode, allowClean)
             or (P.portalCheckUntil and not P.portalChecked and ((type(P.portalGuard)=="function" and P.portalGuard()) or os.clock() < P.portalCheckUntil))
             or not W.isCurrent(P, snapshot) or (P.cleaning and not allowClean)
             or P.craftBusy or P.craftInFlight then return false end
-        local expected = P.worldName=="TimeRift" and (P.royalReachedEgg or P.royalRouteAtGoal or P.royalFinal) and "Luck" or "Clicks"
+        local expected = P.worldName=="TimeRift" and (P.royalIslandConfirmed or P.royalReachedEgg or P.royalRouteAtGoal or P.royalFinal) and "Luck" or "Clicks"
         if mode ~= expected or equipModeNow() ~= expected then return false end
     end
     return true
@@ -16817,7 +16830,7 @@ function Ui.tryEquipBest(mode, allowClean)
         P.lastEquipMode, P.lastEquipAt = requestedMode, now
         if type(P.log) == "function" and now >= (P.nextEquipSentLog or 0) then
             P.nextEquipSentLog = now + 60
-            pcall(P.log, "отправлен EquipBest(Clicks); применение и выбор лучших сервером отдельно не подтверждены")
+            pcall(P.log, "отправлен EquipBest("..tostring(requestedMode).."); применение и выбор лучших сервером отдельно не подтверждены")
         end
     end
     return true, "sent"
@@ -20944,7 +20957,7 @@ local function resumeFarm()
         local P = Ui.__progressTest
         local phaseOK = not P or (P.equipReady == true and not P.stopRequested and not P.cleaning
             and not P.craftBusy and not P.craftInFlight and option
-            and mode == (P.worldName=="TimeRift" and (P.royalReachedEgg or P.royalRouteAtGoal or P.royalFinal) and "Luck" or "Clicks"))
+            and mode == (P.worldName=="TimeRift" and (P.royalIslandConfirmed or P.royalReachedEgg or P.royalRouteAtGoal or P.royalFinal) and "Luck" or "Clicks"))
         if phaseOK and Life.alive and not paused and Ui.on("AutoEquipBest")
             and not (Env.genv and Ui.__handoverPaused) then
             if P and type(Ui.tryEquipBest) == "function" then Ui.tryEquipBest(mode, false)
@@ -37208,7 +37221,7 @@ end
 local function rate(P,now)
  local s=P.adaptiveIncome
  if s and s.rate and s.at and now>=s.at and now-s.at<=20 then return s.rate,"observed quiet windows"end
- local v=P.incomeByMode and P.incomeByMode[(P.royalReachedEgg or P.royalRouteAtGoal) and "Luck" or "Clicks"]
+ local v=P.incomeByMode and P.incomeByMode[(P.royalIslandConfirmed or P.royalReachedEgg or P.royalRouteAtGoal) and "Luck" or "Clicks"]
  if v and C.number(v.value)and v.value>0 and C.number(v.at)and now>=v.at and now-v.at<=20 then
   return v.value,"production Clicks estimate"
  end
@@ -37218,7 +37231,16 @@ function A.plan(P,data,now)
  local item=P.riftPackCandidate
  if not item or item.rebirths~=W.rebirths(data)then P.adaptiveRebirth=nil;return false end
  local r,source=rate(P,now)
- if not r then P.adaptiveRebirth=nil;return false end
+ if not r then
+  local prior=P.adaptiveRebirth
+  if prior and prior.hold and prior.rb==item.rebirths and prior.level==item.buttonsLevel
+   and now>=prior.at and now-prior.at<=20 then
+   P.adaptiveRebirthReason="свежий план накопления сохранён; жду обновления дохода"
+   return true
+  end
+  if prior and prior.hold and type(P.log)=="function"then P.log("адаптивный rebirth: прежний план накопления устарел; возвращаюсь к максимальному доступному, новый доход отсутствует")end
+  P.adaptiveRebirth=nil;return false
+ end
  local horizon=600;local q=P.royalRoute
  if q and q.stage=="farm"then horizon=math.max(0,math.min(horizon,q.at+q.farmFor-now-2))end
  local choice,why=C.choose(item.options,W.coins(data),r,20,horizon)
@@ -37344,7 +37366,7 @@ __modules["features/progress_test"] = function(use)
 
     local function farmEquipMode()
         local owner=Ui.__progressTest
-        return owner and owner.worldName=="TimeRift" and (owner.royalReachedEgg or owner.royalRouteAtGoal or owner.royalFinal) and "Luck" or "Clicks"
+        return owner and owner.worldName=="TimeRift" and (owner.royalIslandConfirmed or owner.royalReachedEgg or owner.royalRouteAtGoal or owner.royalFinal) and "Luck" or "Clicks"
     end
     local function setMode(value)
         local option = Ui.Options and Ui.Options.EquipMode
@@ -37530,7 +37552,7 @@ __modules["features/progress_test"] = function(use)
         P.remoteError = nil
 
         local function log(text)
-            emit("progress", "[ПРОГРЕССИЯ v16 LIVE-ROYAL-LUCK-14 " .. world .. "] " .. tostring(text))
+            emit("progress", "[ПРОГРЕССИЯ v16 LIVE-ROYAL-LUCK-16 " .. world .. "] " .. tostring(text))
         end
         P.log = log
         local function parkRiftRebirth(request)
@@ -37819,7 +37841,9 @@ __modules["features/progress_test"] = function(use)
                     .." (предварительная оценка) | режим="..tostring(trial.status).." | остаток паузы="..left
                     .." | лимит=600 с; портал и защиты отдельно")
             end
-            log("доход Clicks=" .. incomeText(farmEquipMode()) .. "; для переключения режима порог не используется")
+            local selected=Ui.Options and Ui.Options.EquipMode and Ui.Options.EquipMode.Value
+            log("команда: нужна="..farmEquipMode().."; выбрана="..tostring(selected).."; последний EquipBest="..tostring(P.lastEquipMode)
+                .."; Royal подтверждён="..tostring(P.royalIslandConfirmed==true).."; доход "..farmEquipMode().."="..incomeText(farmEquipMode()))
             log("яиц на прокачке: партий=" .. tostring(P.farmBatches or 0) .. " | крафт: "
                 .. tostring(P.craftInfo or "модуль или формулы ещё не готовы"))
             local data = Env.data()
@@ -38336,12 +38360,12 @@ __modules["features/progress_test"] = function(use)
 
         local RoyalSustain=use("features/royal_sustain")
         P.tickRoyalIncome=function(data,now)
-            if world~="TimeRift" or not (P.royalReachedEgg or P.royalRouteAtGoal) or P.royalFinal or P.finalizing
+            if world~="TimeRift" or not (P.royalIslandConfirmed or P.royalReachedEgg or P.royalRouteAtGoal) or P.royalFinal or P.finalizing
                 or P.stopRequested or Ui.__progressTest~=P or not W.isCurrent(P,data)then return end
             if farmEquipMode()~="Luck"then return end
             local option=Ui.Options and Ui.Options.EquipMode
             if not option or option.Value~="Luck"then
-                setMode("Luck");P.royalLuckObserved=nil;P.adaptiveIncome=nil;return
+                setMode("Luck");P.royalLuckObserved=nil;P.royalIncomeReady=false;P.adaptiveIncome=nil;return
             end
             local coins,rb,team=W.coins(data),W.rebirths(data),teamSignature(data)
             if not coins or not rb or not team then return end
@@ -38351,7 +38375,14 @@ __modules["features/progress_test"] = function(use)
                 and not pausedForTrade() and not P.holdTap
             local yes,v=RoyalSustain.step(P,now,coins,rb,team,ready,price)
             P.royalIncomeReady=yes==true
-            if v and v.valid then
+            if now>=(P.nextRoyalIncomeLog or 0)then
+                P.nextRoyalIncomeLog=now+30
+                log("Royal Luck: доход="..tostring(v and v.rate).."; замер пригоден="..tostring(v and v.valid)
+                    .."; цена x3="..tostring(price).."; нужно/с="..tostring(price and price/1.2)
+                    .."; дополнительный запас=0")
+            end
+            if v and v.valid and ready and v.team==team and v.rb==rb and now-v.at<=15
+                and option.Value=="Luck" and P.lastEquipMode=="Luck"then
                 P.incomeByMode.Luck={value=v.rate,at=v.at,kind="positive observed Luck flow, minimum of two5s windows"}
             end
             if not yes or P.phase~="rebirth" or actionsOutstanding() or P.ambiguousRiftRebirth
@@ -39046,7 +39077,7 @@ __modules["features/progress_test"] = function(use)
             genv.ts30TestState = nil
             genv.ts30TestStop = nil
         end)
-        log("сборка V16-LIVE-ROYAL-LUCK-14: Clicks, ребёрты 20 с, Golden 100%; Ghost Ship исключён")
+        log("сборка V16-LIVE-ROYAL-LUCK-16: Clicks, ребёрты 20 с, Golden 100%; Ghost Ship исключён")
         log("v16: мир=" .. world .. "; Clicks до Royal; на Royal Luck, доступные яйца и ребёрты до дохода x3/1.2с")
         log("ребёрт >=20с: TimeRift сравнивает все открытые пакеты по цене/доходу; при равной эффективности выбирает короткое ожидание; отправка только максимального доступного")
         log("яйца — только на наиболее продвинутом подтверждённом острове; старые острова не использую")
@@ -39226,7 +39257,7 @@ do
 	pcall(Ui.set, "AutoReveal", true)
 	if Ui.on("AutoReveal") then logEvent("hold", "Hold to Reveal включён; обработчики яиц не глушатся")
 	else logEvent("warn", "Hold to Reveal не включился: модуль или тумблер не загрузился") end
-	logEvent("farm", "сборка V16-LIVE-ROYAL-LUCK-14: локальные файлы отключены; сайт и Discord включены, цены встроенные")
+	logEvent("farm", "сборка V16-LIVE-ROYAL-LUCK-16: локальные файлы отключены; сайт и Discord включены, цены встроенные")
 	logEvent("farm", "лучшее доступное яйцо: максимальная доступная партия; достигнутый уровень не понижаю; острова приоритетны")
 	pcall(function()
 		local picks = Ui.Options and Ui.Options.UpgradePicks
@@ -39278,7 +39309,7 @@ do
 	local function applyEquipMode()
 		local option = Ui.Options and Ui.Options.EquipMode
 		local desired = option and option.Value or "Clicks"
-		if Ui.__progressTest then local p=Ui.__progressTest;desired=p.worldName=="TimeRift" and (p.royalReachedEgg or p.royalRouteAtGoal or p.royalFinal) and "Luck" or "Clicks"
+		if Ui.__progressTest then local p=Ui.__progressTest;desired=p.worldName=="TimeRift" and (p.royalIslandConfirmed or p.royalReachedEgg or p.royalRouteAtGoal or p.royalFinal) and "Luck" or "Clicks"
 		elseif desired ~= "Luck" and desired ~= "Clicks" and desired ~= "Gems" then desired = "Clicks" end
 		if Ui.__progressTest then
 			-- Mode уже идёт прямо в EquipBest. Не угадываем и не перезаписываем игровые Settings.
@@ -39406,7 +39437,7 @@ do
 	local function phaseModeMatches(mode)
 		local P = Ui.__progressTest
 		if not P then return true end
-		local expected = P.worldName=="TimeRift" and (P.royalReachedEgg or P.royalRouteAtGoal or P.royalFinal) and "Luck" or "Clicks"
+		local expected = P.worldName=="TimeRift" and (P.royalIslandConfirmed or P.royalReachedEgg or P.royalRouteAtGoal or P.royalFinal) and "Luck" or "Clicks"
 		return P.equipReady == true and mode == expected and preferredEquipMode() == expected
 	end
 	local function testSendEquip(mode)
@@ -40738,10 +40769,10 @@ do
 		local ok, err = pcall(function()
 			if not cleanAllowed(lease) then return end
 			local opt = Ui.Options and Ui.Options.EquipMode
-			local desired = P.worldName=="TimeRift" and (P.royalReachedEgg or P.royalRouteAtGoal or P.royalFinal) and "Luck" or "Clicks"
+			local desired = P.worldName=="TimeRift" and (P.royalIslandConfirmed or P.royalReachedEgg or P.royalRouteAtGoal or P.royalFinal) and "Luck" or "Clicks"
 			local function canEquipForClean()
 				return P.equipReady == true and cleanAllowed(lease) and opt and opt.Value == desired
-					and desired == (P.worldName=="TimeRift" and (P.royalReachedEgg or P.royalRouteAtGoal or P.royalFinal) and "Luck" or "Clicks") and Ui.on("AutoEquipBest")
+					and desired == (P.worldName=="TimeRift" and (P.royalIslandConfirmed or P.royalReachedEgg or P.royalRouteAtGoal or P.royalFinal) and "Luck" or "Clicks") and Ui.on("AutoEquipBest")
 			end
             if not P.royalFinal then
                 if not canEquipForClean() or type(Ui.tryEquipBest) ~= "function" then return end
