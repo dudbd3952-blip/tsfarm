@@ -1,4 +1,4 @@
--- V16 LIVE-ROYAL-TIERS-LUCK-19: Main → TimeRift → Royal x3; финал по измеренному доходу Luck >= цене x3 /1.2с, без запаса.
+-- V16 LIVE-ROYAL-TIERS-LUCK-22: Main → TimeRift → Royal x3; финал по измеренному доходу Luck >= цене x3 /1.2с, без запаса.
 -- Файловые журналы, архивы, сохранённые фазы и глобальная история не используются.
 -- Сайт и Discord получают данные этого запуска; цены только из встроенной таблицы.
 -- Текущие запросы защищены только в памяти этого запуска. После перезапуска неизвестный
@@ -248,6 +248,7 @@ __modules["features/operation_journal"] = function(use)
 -- until this run observes the exact response (or until this execution stops).
 local W=use("features/world_data")
 local slots={}
+local detached={}
 local J={}
 function J.new(kind,userId)
     local id=W.finite(userId)
@@ -255,6 +256,19 @@ function J.new(kind,userId)
         or id>9007199254740991 or id~=math.floor(id) then return nil,"неверный тип операции или UserId" end
     local key=kind..":"..string.format("%.0f",id)
     local api={}
+    function api.detachUnknown(token)
+        if kind~="egg" or type(token)~="string" or slots[key]~=token then return false end
+        detached[key]=detached[key]or{}
+        detached[key][token]=true
+        slots[key]=nil
+        return true
+    end
+    function api.resolveDetached(token)
+        local entries=detached[key]
+        if not entries or not entries[token]then return false end
+        entries[token]=nil
+        return true
+    end
     function api.check()
         if slots[key]~=nil then return false,"уже ожидается запрос этого запуска" end
         return true
@@ -297,6 +311,28 @@ function J.new(kind,userId)
     return api
 end
 return J
+end
+
+__modules["features/egg_continuity"] = function(use)
+local C={}
+function C.resume(P)
+    if type(P)~="table"then return false end
+    local fault=P.controllerErrorContinuation or P.unknownEggContinuation or P.craftUncertain
+        or P.previousCraftPending or P.previousRebirthPending or P.previousOtherWorldRebirthPending
+    if not fault then return false end
+    if P.stopRequested or P.worldChanging or P.phase=="stopped" or P.finalizing
+        or P.portalSaving or P.islandUncertain or P.islandTravelUncertain or P.previousIslandPending
+        or P.worldTravelUncertain or P.upgradeUncertain or P.skillUncertain then return false end
+    P.rebirthDisabled=true -- unknown old operations are not permission to repeat them
+    P.holdCraft,P.disableAutoCraft=true,true
+    P.holdUpgrades,P.holdSkillTree=true,true
+    P.holdHatch=false
+    if P.phase=="blocked" or P.phase=="uncertain" or P.phase=="hatch_uncertain" or P.phase=="check"then
+        P.phase=P.royalFinal and "hatch"or"rebirth"
+    end
+    return true
+end
+return C
 end
 
 __modules["features/hatch_result"] = function(use)
@@ -4480,7 +4516,7 @@ function E.tick(P,data)
 end
 function E.start(P,cycle)
  local snap=snapshot(P)
- D={version="LIVE-ROYAL-TIERS-LUCK-19",P=P,account=Env.LocalPlayer.Name,userId=Env.LocalPlayer.UserId,
+ D={version="LIVE-ROYAL-TIERS-LUCK-22",P=P,account=Env.LocalPlayer.Name,userId=Env.LocalPlayer.UserId,
   started=os.clock(),deadline=os.clock()+720,rows={},eggByToken={},plan=C.order(Env.LocalPlayer.UserId,cycle),position=0,
   phase="warmup",phaseEnd=os.clock(),status="running",initial=snap,lastSnapshot=snap,quoteProvider=E.quoteProvider}
  P.autoCompareRun=D
@@ -4678,10 +4714,7 @@ function M.allow(P,data,cost,egg)
   or P.portalSaving or P.royalIncomeReady then return false,"ступенчатый фарм на паузе"end
  if egg and egg~="" and not M.selected(P,egg)then return false,"открываю только текущую ступень "..tostring(P.tierEgg or "Permafrost")end
  local b=P.glitchedBudget
- -- Reuse the production20second minimum as an explicit rebirth opportunity.
- -- Once due, new eggs pause while the normal max-affordable/adaptive scheduler
- -- accumulates and sends; only replica counter change starts the next egg phase.
- if b and b.at-b.rbAt>=20 then return false,"окно ребёрта: новые яйца на паузе до подтверждения; отправленные не отменяются"end
+ -- No timed rebirth opportunity blocks eggs. Rebirth dispatch safety stays in its controller.
  if cost then
   local coins=W.coins(data)
   if type(cost)~="number"or cost<=0 or not coins or coins<cost then return false,"нет фактического баланса на партию"end
@@ -6282,7 +6315,7 @@ function Router.start(emit)
         log("активна отдельная прогрессия TimeRift: RiftCoins, RiftGems и RiftRebirths; Main больше не фармится")
         return true
     end
-    log("сборка V16-LIVE-ROYAL-TIERS-LUCK-19: прямой возврат к живому World2Portal, результат только по реплике")
+    log("сборка V16-LIVE-ROYAL-TIERS-LUCK-22: прямой возврат к живому World2Portal, результат только по реплике")
     local stageName,stageAt="ожидание",os.clock()
     local function stage(name) stageName,stageAt=name,os.clock() end
     -- World-2 purchase is distinct from the already-journaled physical portal touch.
@@ -7884,9 +7917,10 @@ Life.spawn("craft:results", function()
 end)
 local function failClosed(P, message)
     P.craftUncertain, P.holdCraft, P.disableAutoCraft = true, true, true
-    P.holdHatch, P.holdUpgrades, P.holdSkillTree = true, true, true
+    P.holdUpgrades, P.holdSkillTree = true, true
     P.phase, P.note = "blocked", message
-    if type(P.log) == "function" then pcall(P.log, message .. "; яйца, крафт и новые ребёрты остановлены") end
+    use("features/egg_continuity").resume(P)
+    if type(P.log) == "function" then pcall(P.log, message .. "; крафт не повторяю; независимые яйца продолжаются при доступе и балансе") end
 end
 local function validCraftLease(P,lease)
     return type(P)=="table" and Life.alive and Ui.__progressTest==P and not Ui.__globalStop and not P.stopRequested
@@ -12506,6 +12540,9 @@ local function excludedGhostShip(name, def)
     return matches(name) or (type(def)=="table" and (matches(def.DisplayName) or matches(def.Name) or matches(def.display)))
 end
 local EggPricing, GamepassPerks, BoostFormula
+local function logEgg(text)
+    print("[TAPSIM] яйцо | " .. text)
+end
 local function loadEggPath(path)
     local found, module = Env.call(function()
         local node = RS
@@ -12918,9 +12955,6 @@ local UPGRADE_BUFFER = 5
 -- самому по выгоде (см. ниже). Смена яйца обнуляет засуху (Eggs.SecretDroughtSeconds).
 local LOCK_EGG = ""
 local lockNote = nil
-local function logEgg(text)
-    print("[TAPSIM] яйцо | " .. text)
-end
 
 -- Diagnostic messages are part of the main script, not a separate probe. Suppress repeated
 -- lines per category; distinguish selection, a sent request and a confirmed server response.
@@ -13209,18 +13243,7 @@ local function chooseEggUnchecked(data, selectionToken)
             return nil
         end
         if use("features/glitched_mixed").active(P)then
-            -- Refresh actual discounted Royal x3 price without buying or requiring its wallet.
-            if EGGS.Royal and hatchable(data,"Royal")then
-                local quote=progressBatchPrice(data,"Royal",3)
-                if quote and quote>0 then P.royalTripleQuote={price=quote,at=os.clock()}end
-            end
-            local quotes={}
-            for _,egg in ipairs({"Permafrost","Glitched Egg","Glitched","Royal"})do
-                if EGGS[egg] and hatchable(data,egg)then
-                    local price=progressBatchPrice(data,egg,3)
-                    if price and price>0 then quotes[egg]={price=price,at=os.clock()}end
-                end
-            end
+            local quotes=P.tierQuotes or {}
             local egg=use("features/glitched_mixed").select(P,data,os.clock(),quotes)
             if egg and EGGS[egg] and hatchable(data,egg) and hatchCount(data,egg) and stageAllowed()then
                 P.glitchedSelectedEgg=egg;P.eggGoal=egg;return egg
@@ -13365,6 +13388,33 @@ local function chooseEgg(data,worker)
     return value
 end
 
+-- Read-only price discovery is independent of egg scheduling/wallet affordability.
+-- No full world scans, no remote calls, and no operation is cancelled or repeated.
+local function refreshTierQuotes(P,data,now)
+    if type(P)~="table"or P.worldName~="TimeRift"or P.royalFinal or P.stopRequested or P.worldChanging
+        or Ui.__progressTest~=P or not Life.alive or Ui.__globalStop or Ui.__handoverPaused
+        or Ui.riftScanInFlight or not P.riftEggScanReady or not W.isCurrent(P,data)then return end
+    local quotes={}
+    for _,egg in ipairs({"Permafrost","Glitched Egg","Glitched","Royal"})do
+        local def=EGGS[egg]
+        if def and hatchable(data,egg)then
+            local price=progressBatchPrice(data,egg,3)
+            if Ui.__progressTest~=P or P.stopRequested or P.worldChanging or Ui.__globalStop
+                or not Life.alive or Ui.riftScanInFlight or not W.isCurrent(P,data)then return end
+            if EGGS[egg]==def and price and price>0 then quotes[egg]={price=price,at=os.clock()}end
+        end
+    end
+    if Ui.__progressTest~=P or P.stopRequested or P.worldChanging or not Life.alive
+        or Ui.riftScanInFlight or not W.isCurrent(P,data)then return end
+    P.tierQuotes=quotes
+    P.royalTripleQuote=quotes.Royal
+    use("features/glitched_mixed").select(P,data,os.clock(),quotes)
+end
+Life.loop("hatch:tier-live-prices",1,function()
+    local P=Ui.__progressTest
+    if P and P.worldName=="TimeRift"then refreshTierQuotes(P,Env.data(),os.clock())end
+end)
+
 -- Moving to the egg ----------------------------------------------------------------------------
 
 local function root()
@@ -13436,15 +13486,15 @@ local function moveBlocked(egg)
         or P.worldChanging or not W.isCurrent(P,snapshot)
         or (Ui.travelling and Ui.travelling~=P.portalMoveSlot)
         or (Env.genv and Ui.__handoverPaused)
-        or P.holdHatch or P.portalSaving or P.previousOtherWorldRebirthPending
+        or P.holdHatch or P.portalSaving
         or islandPriorityBlocked(P,snapshot)
         or (P.worldPortalCheckUntil and os.clock()<P.worldPortalCheckUntil)
         or (P.portalCheckUntil and not P.portalChecked and ((type(P.portalGuard)=="function" and P.portalGuard()) or os.clock() < P.portalCheckUntil))
         or Ui.riftScanInFlight or P.stopRequested or (P.pending and not targetMode(P) and not (type(P.pending)=="table" and P.pending.dispatched))
         or (P.eggFixed and P.targetProbeRequired and not P.rebirthLocked)
         or P.islandTravelUncertain or P.previousIslandPending or P.islandUncertain
-        or P.previousHatchPending or (P.previousRebirthPending and not targetMode(P)) or P.previousCraftPending
-        or P.hatchUncertain or P.craftUncertain or P.craftBusy or P.craftInFlight
+        
+or P.craftInFlight
         or P.farmStorageFull or (P.phase == "rebirth" and P.farmThresholdReached)
 end
 local function goToEgg(egg, expectedP, worker)
@@ -13602,6 +13652,23 @@ end
 local seq = EggRecovery.initialSeq()
 local waiting
 local pendingEggFloor={} -- exact request token -> base price and world; session only
+local detachedEggs={} -- Seq -> exact old context, never resent under that Seq
+local function detachUnknownEgg(P,why)
+    if type(P)~="table" or waiting or Ui.hatchInFlight then return false end
+    local token=P.eggJournalToken or P.hatchUncertainToken or (eggJournal and eggJournal.inspect())
+    if type(token)~="string"then return false end
+    local saved=pendingEggFloor[token]
+    if not saved or not saved.seq or not eggJournal.detachUnknown(token)then return false end
+    saved.token=token;detachedEggs[saved.seq]=saved
+    P.unknownEggContinuation=true
+    P.previousHatchPending,P.hatchUncertain,P.eggJournalPending=false,false,false
+    P.eggJournalToken,P.hatchUncertainToken=nil,nil
+    P.eggSourcesKnown,P.eggOtherUnknown=true,false
+    P.hatchJournalIssue=nil
+    use("features/egg_continuity").resume(P)
+    hatchDiagnostic("detached-unknown", "исход Seq="..tostring(saved.seq).." неизвестен; старый Seq не повторяю, следующая партия будет новой; "..tostring(why),0)
+    return true
+end
 Life.onCleanup(function()
     local slot = waiting
     waiting = nil
@@ -13681,6 +13748,18 @@ Life.spawn("hatch:results", function()
         local ok, err = pcall(function()
             local remote = Env.remote("EggService", "EggHatchResult")
             Life.connect(remote.OnClientEvent, function(payload)
+                local old=type(payload)=="table"and detachedEggs[tonumber(payload.Seq)]or nil
+                if old then
+                    local verdict=HatchResult.classify(payload,old.egg,old.count,old.expected,old.world,old.seq)
+                    if verdict~="unknown" and eggJournal.resolveDetached(old.token)then
+                        detachedEggs[old.seq]=nil;pendingEggFloor[old.token]=nil
+                        if verdict=="success"then
+                            rememberFarmEgg(Ui.__progressTest,old.egg,old.price,old.world)
+                        end
+                        hatchDiagnostic("detached-result","поздний точный ответ Seq="..tostring(old.seq)..": "..tostring(verdict).."; к новой партии не отношу",0)
+                    end
+                    return
+                end
                 if waiting and waiting.sent and type(payload) == "table" then
                     if payload.Seq~=nil and tonumber(payload.Seq)==waiting.seq then
                         local slot = waiting
@@ -13708,6 +13787,7 @@ Life.spawn("hatch:results", function()
 end)
 
 local function hatchFailClosed(P, why)
+    if detachUnknownEgg(P,why)then return end
     if P then
         P.hatchUncertain, P.holdHatch, P.holdCraft = true, true, true
         P.holdUpgrades, P.holdSkillTree = true, true
@@ -13755,19 +13835,15 @@ local function hatchDenied(P, egg, count)
     end
     if Ui.eggRecoveryInFlight then return "проверяется ответ яйца этого запуска" end
     if P.hatchSeqRetryAt and os.clock()<P.hatchSeqRetryAt then return "проверяю сохранение Seq" end
-    if P.hatchUncertain then return "предыдущий запрос яйца не подтверждён" end
-    if P.craftUncertain then return "предыдущий запрос крафта не подтверждён" end
     if P.islandUncertain or P.islandTravelUncertain or P.previousIslandPending then return "остров или переход не подтверждён" end
-    if P.previousHatchPending then return "не подтверждён запрос яйца этого запуска" end
-    if P.previousRebirthPending and not targetMode(P) then return "ожидается ребёрт этого запуска" end
-    if P.previousOtherWorldRebirthPending then return "ожидается ребёрт другого мира" end
-    if P.previousCraftPending then return "ожидается крафт этого запуска" end
     if P.pending and not targetMode(P) and not (type(P.pending)=="table" and P.pending.dispatched) then
         return "подготавливается ребёрт"
     end
     if P.eggFixed and P.targetProbeRequired and not P.rebirthLocked then return "проверка состояния финала" end
     -- Cleanup and target-stage rebirth run independently of hatching.
-    if P.craftBusy or P.craftInFlight then return "идёт крафт" end
+    -- craftBusy spans UI cleanup after the result: it is not an egg lock.
+    -- Only the actual unresolved craft transaction blocks shared inventory operations.
+    if P.craftInFlight then return "жду ответ отправленного крафта" end
     if P.farmStorageFull then return "жду место в рюкзаке" end
     if P.holdHatch then return "пауза контроллера: " .. tostring(P.note or P.phase or "?") end
     local toggle = Ui.Toggles and Ui.Toggles.AutoHatch
@@ -13908,11 +13984,8 @@ local function hatch(egg, count, worker)
         local oldBefore = type(oldPending) == "table" and tonumber(oldPending.before) or nil
         local knownPriorConfirmation = oldBefore ~= nil and oldBefore == P.lockedRebirths and rb > oldBefore
         if (P.rebirthLocked or P.royalFinal) and rb ~= P.lockedRebirths and not knownPriorConfirmation then
-            P.holdHatch, P.holdCraft, P.phase = true, true, "blocked"
-            P.note = "после фиксации Royal x3 изменилось число ребёртов: " .. tostring(P.lockedRebirths)
-                .. " -> " .. tostring(rb) .. "; источник неизвестен"
-            if type(P.log) == "function" then pcall(P.log, P.note .. "; новые яйца остановлены") end
-            return cancel(P.note)
+            P.lockedRebirths=rb
+            if type(P.resetRoyal)=="function"then pcall(P.resetRoyal,"изменился счётчик; замер сброшен без паузы яиц")end
         end
     end
     -- Pricing/pass calls may yield. Recalculate with the latest replica, then re-read money,
@@ -14062,7 +14135,7 @@ local function hatch(egg, count, worker)
         return cancelPrepared("бюджет серии изменился перед отправкой")
     end
     slot.island=EGGS[egg].island
-    pendingEggFloor[token]={egg=egg,price=slot.basePrice,world=slot.world,island=slot.island}
+    pendingEggFloor[token]={egg=egg,price=slot.basePrice,world=slot.world,island=slot.island,seq=slot.seq,count=count,expected=expected}
     slot.sent, slot.sentAt = true, os.clock()
     if worker then worker.dispatching=true; worker.sentOwner=P; worker.sentToken=token end
     P.lastHatchSendAt = slot.sentAt
@@ -14661,6 +14734,12 @@ local function autoLoop(worker)
     local lastWorld
     while Life.alive and hatchWorker==worker and not worker.cancelled do
         local P = Ui.__progressTest
+        if Life.alive and not Ui.__globalStop and not Ui.__handoverPaused then
+            use("features/egg_continuity").resume(P)
+        end
+        if P and (P.previousHatchPending or P.hatchUncertain)then
+            detachUnknownEgg(P,"восстановление независимого открытия")
+        end
         local previous=worker.localLease
         if previous and previous.owner and previous.owner.portalHatchLocal==previous then
             previous.owner.portalHatchLocal=nil
@@ -37696,7 +37775,7 @@ __modules["features/progress_test"] = function(use)
         P.remoteError = nil
 
         local function log(text)
-            emit("progress", "[ПРОГРЕССИЯ v16 LIVE-ROYAL-TIERS-LUCK-19 " .. world .. "] " .. tostring(text))
+            emit("progress", "[ПРОГРЕССИЯ v16 LIVE-ROYAL-TIERS-LUCK-22 " .. world .. "] " .. tostring(text))
         end
         P.log = log
         local function parkRiftRebirth(request)
@@ -37969,6 +38048,14 @@ __modules["features/progress_test"] = function(use)
                 P.royalFinal and "замеры выключены" or (P.income and string.format("%.0f", P.income) or "измеряю"),
                 "Royal x3",
                 tostring(P.eggGoal or "ищу"), tostring(P.confirmedBatches or 0), actual, tostring(P.note)))
+            local pending=P.pending
+            if type(pending)=="table"and pending.dispatched==true then
+                log("ожидающий rebirth: Index="..tostring(pending.index).."; до="..tostring(pending.before)
+                    .."; ожидаю="..tostring(pending.before and pending.amount and pending.before+pending.amount)
+                    .."; сейчас="..tostring(rebirths).."; возраст="..tostring(math.max(0,P.activeClock-(pending.sentAt or P.activeClock)))
+                    .."с; последнее событие="..tostring(pending.lastResultDiagnostic or "не получено")
+                    .."; новый rebirth запрещён, независимые яйца разрешены")
+            end
             AutoCompare.report(P)
             IslandEggFocus.routeReport(P,Env.data())
             local trial = P.islandEggTrial
@@ -38134,6 +38221,10 @@ __modules["features/progress_test"] = function(use)
             run.riftRebirthEventSerial=(run.riftRebirthEventSerial or 0)+1
             local request=P.pending or P.previousRebirthPending
             if type(request)=="table" and request.dispatched==true and request.world=="TimeRift" then
+                request.lastResultDiagnostic=type(payload)=="table" and
+                    ("Success="..tostring(payload.Success).."; Index="..tostring(payload.Index)
+                    .."; Amount="..tostring(payload.Amount).."; Rebirths="..tostring(payload.Rebirths)
+                    .."; Error="..tostring(payload.Error))or "ответ не таблица"
                 if request.riftEvidence or request.riftConflict or not riftEventMatches(request,payload) then
                     request.riftConflict=true
                     if not request.riftConflictNoted then
@@ -38388,7 +38479,7 @@ __modules["features/progress_test"] = function(use)
         local function resyncFarm(rebirths, coins, before, where)
             local now = os.clock()
             P.farmPrevRebirths, P.farmPrevCoins = rebirths, coins
-            P.farmResyncUntil = now + REBIRTH_SYNC_SECONDS
+            P.farmResyncUntil = nil
             P.farmResetGraceUntil = now + 5 -- баланс может реплицироваться вслед за счётчиком
             P.nextSendAt = math.max(P.nextSendAt or 0, now + currentRebirthGap())
             -- Сохраняем защитный интервал и при перезагрузке скрипта в том же клиенте.
@@ -38398,10 +38489,10 @@ __modules["features/progress_test"] = function(use)
             P.sampleCoins, P.sampleAt, P.measureRebirths = nil, nil, nil
             P.farmNextProbeAt = math.huge
             resetFarmWindow()
-            P.holdHatch, P.holdCraft, P.disableAutoCraft = true, true, true
+            P.holdHatch = false
             P.holdUpgrades, P.holdSkillTree = true, true
-            phase("rebirth", "обновился счётчик ребёртов: сверяю данные и продолжу прокачку")
-            log(string.format("счётчик ребёртов %s -> %s (%s), источник неизвестен; сверяю данные 2 с, следующий запрос не раньше %s с",
+            phase("rebirth", "обновился счётчик ребёртов: замер сброшен, яйца продолжаются")
+            log(string.format("счётчик ребёртов %s -> %s (%s), источник неизвестен; яйца не останавливаю, следующий запрос не раньше %s с",
                 tostring(before), tostring(rebirths), tostring(where), tostring(currentRebirthGap())))
         end
         local function farmMode(wanted, why)
@@ -38451,14 +38542,13 @@ __modules["features/progress_test"] = function(use)
                     P.farmThresholdReached, P.goodWindows, P.income = false, 0, nil
                     P.sampleCoins, P.sampleAt, P.measureRebirths = nil, nil, nil
                     P.portalCleanIncome = nil
-                    P.farmResyncUntil = os.clock() + REBIRTH_SYNC_SECONDS
+                    P.farmResyncUntil = nil
                     P.farmResetGraceUntil = os.clock() + 5
-                    P.holdHatch, P.holdCraft, P.disableAutoCraft = true, true, true
-                    P.holdUpgrades, P.holdSkillTree = true, true
-                    P.note = "баланс уменьшился, причина не установлена; коротко сверяю данные"
+                    P.holdHatch = false
+                    P.note = "баланс уменьшился: база замера обновлена; яйца не останавливаю"
                     if os.clock() >= (P.nextUnknownDebitLog or 0) then
                         P.nextUnknownDebitLog = os.clock() + 60
-                        log("баланс уменьшился, источник неизвестен; незавершённый замер сброшен и данные сверяются")
+                        log("баланс уменьшился, источник неизвестен; незавершённый замер сброшен; яйца не останавливаю")
                     end
                     return false
                 end
@@ -38514,7 +38604,7 @@ __modules["features/progress_test"] = function(use)
             local coins,rb,team=W.coins(data),W.rebirths(data),teamSignature(data)
             if not coins or not rb or not team then return end
             local quote=P.royalTripleQuote
-            local price=quote and now>=quote.at and now-quote.at<=5 and quote.price
+            local price=quote and now>=quote.at and now-quote.at<=5 and quote.price or nil
             local ready=modeRequestSeen("Luck") and Ui.on("AutoTap") and Ui.on("AutoClicker")
                 and not pausedForTrade() and not P.holdTap
             local yes,v=RoyalSustain.step(P,now,coins,rb,team,ready,price)
@@ -38793,9 +38883,8 @@ __modules["features/progress_test"] = function(use)
             if P.royalFinal then
                 if P.lockedRebirths == nil then P.lockedRebirths = rebirths end
                 if rebirths ~= P.lockedRebirths then
-                    blocked("счётчик ребёртов изменился после фиксации Royal: "
-                        .. tostring(P.lockedRebirths) .. " -> " .. tostring(rebirths) .. "; источник неизвестен")
-                    return
+                    P.lockedRebirths=rebirths
+                    if type(P.resetRoyal)=="function"then pcall(P.resetRoyal,"изменился счётчик; яйца продолжаются")end
                 end
             end
             if P.upgradeUncertain then
@@ -39189,19 +39278,11 @@ __modules["features/progress_test"] = function(use)
         local function guardedStep()
             local ok, err = pcall(step)
             if ok or Ui.__progressTest~=P or P.routerParkedMainPending then return end
-            if P.pending and P.eggFixed then
-                P.rebirthDisabled = true
-                if not P.controllerErrorWarned then
-                    P.controllerErrorWarned = true
-                    log("ошибка при ожидающем ребёрте: " .. tostring(err) .. "; новые ребёрты остановлены, яйца возможны при снятых блокировках")
-                end
-            elseif P.pending then
-                uncertain("ошибка при ожидающем ребёрте: " .. tostring(err))
-            else
-                P.holdHatch, P.holdCraft, P.disableAutoCraft = true, true, true
-                P.holdUpgrades, P.holdSkillTree = true, true
-                phase("blocked", "ошибка контроллера: " .. tostring(err))
-                log(P.note .. "; яйца и ребёрты не запускаю")
+            P.controllerErrorContinuation=true
+            use("features/egg_continuity").resume(P)
+            if os.clock()>=(P.nextControllerErrorLog or 0)then
+                P.nextControllerErrorLog=os.clock()+30
+                log("ошибка контроллера: "..tostring(err).."; новые ребёрты/крафт отключены, независимые яйца продолжаются")
             end
         end
 
@@ -39221,7 +39302,7 @@ __modules["features/progress_test"] = function(use)
             genv.ts30TestState = nil
             genv.ts30TestStop = nil
         end)
-        log("сборка V16-LIVE-ROYAL-TIERS-LUCK-19: Clicks, ребёрты 20 с, Golden 100%; Ghost Ship исключён")
+        log("сборка V16-LIVE-ROYAL-TIERS-LUCK-22: Clicks, ребёрты 20 с, Golden 100%; Ghost Ship исключён")
         log("v16: мир=" .. world .. "; Clicks до Royal; на Royal Luck, доступные яйца и ребёрты до дохода x3/1.2с")
         log("ребёрт >=20с: TimeRift сравнивает все открытые пакеты по цене/доходу; при равной эффективности выбирает короткое ожидание; отправка только максимального доступного")
         log("яйца — только на наиболее продвинутом подтверждённом острове; старые острова не использую")
@@ -39401,7 +39482,7 @@ do
 	pcall(Ui.set, "AutoReveal", true)
 	if Ui.on("AutoReveal") then logEvent("hold", "Hold to Reveal включён; обработчики яиц не глушатся")
 	else logEvent("warn", "Hold to Reveal не включился: модуль или тумблер не загрузился") end
-	logEvent("farm", "сборка V16-LIVE-ROYAL-TIERS-LUCK-19: локальные файлы отключены; сайт и Discord включены, цены встроенные")
+	logEvent("farm", "сборка V16-LIVE-ROYAL-TIERS-LUCK-22: локальные файлы отключены; сайт и Discord включены, цены встроенные")
 	logEvent("farm", "лучшее доступное яйцо: максимальная доступная партия; достигнутый уровень не понижаю; острова приоритетны")
 	pcall(function()
 		local picks = Ui.Options and Ui.Options.UpgradePicks
